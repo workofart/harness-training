@@ -1,0 +1,79 @@
+// Commented template for config/harness_config.json.
+// The runtime config must be strict JSON, so remove comments before copying.
+{
+  // Unique id for the next manual experiment directory.
+  // Change this before each repeated `uv run exp`.
+  // `uv run auto` overwrites this for supervisor-launched candidates.
+  "experiment_id": "exp-example",
+
+  // Short label for the hypothesis or mechanism being tested.
+  "focus_name": "short-mechanism-label",
+
+  // Terminal-Bench 2 task ids:
+  // https://www.tbench.ai/benchmarks/terminal-bench-2
+  // Local task_overrides/<task_id> directories take precedence over the Harbor registry.
+  // Start with one cheap smoke task; expand only after setup is working.
+  "train_task_names": [
+    "log-summary-date-ranges"
+  ],
+
+  // Maximum policy/environment steps per task trial. Raise this for serious runs.
+  "max_steps": 100,
+
+  // Maximum task trials in flight. Keep this at 1 until Docker and API cost
+  // behavior is understood.
+  "max_concurrency": 1,
+
+  // Wall-clock timeout for one task trial.
+  "task_timeout_sec": 300.0,
+
+  // Retries after invalid model tool/output formatting.
+  "max_output_retries": 2,
+
+  // Independent trials per task. Promotion decisions use majority outcomes.
+  "task_trials": 1,
+
+  "llm_provider_config": {
+    // Only OpenRouter is supported by the current config model.
+    "provider": "openrouter",
+
+    // OpenRouter model identifier.
+    "model_name": "deepseek/deepseek-v4-flash",
+
+    // Completion token cap requested from the provider.
+    "max_output_tokens": 16384,
+
+    // One of: "none", "low", "medium", "high".
+    "reasoning_effort": "low",
+
+    // Per-request LLM timeout.
+    "timeout_seconds": 300.0,
+
+    // OpenRouter-compatible API base URL.
+    "base_url": "https://openrouter.ai/api/v1",
+
+    // Optional sampling/provider fields:
+    // "temperature": 0.0,
+    // "top_p": 1.0,
+    // "seed": 1,
+    // "service_tier": "default",
+
+    "provider_kwargs": {
+      // Ask OpenRouter to reject providers that cannot honor requested params.
+      "require_parameters": true,
+
+      // OpenRouter provider routing used by the checked-in default.
+      // Adjust this if the provider is unavailable in your OpenRouter account.
+      "provider": {
+        "order": ["gmicloud"],
+        "allow_fallbacks": true,
+        "ignore": [
+          "siliconflow",
+          "parasail",
+          "morph",
+          "venice"
+        ]
+      }
+    }
+  }
+}

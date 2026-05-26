@@ -1,0 +1,15 @@
+# Shared Harbor defaults.
+# The caller supplies the task name at runtime.
+experiments_dir = "experiments"
+bootstrap_commands = [
+  "command -v python3 >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y --no-install-recommends python3)",
+]
+bootstrap_timeout_sec = 600
+
+[environment]
+type = "docker"
+force_build = false
+delete = true
+suppress_override_warnings = false
+
+[environment.kwargs]

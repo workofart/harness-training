@@ -1,0 +1,35 @@
+{
+  "experiment_id": "exp-smoke",
+  "focus_name": "local-smoke",
+  "train_task_names": [
+    "log-summary-date-ranges"
+  ],
+  "max_steps": 100,
+  "max_concurrency": 1,
+  "task_timeout_sec": 300.0,
+  "max_output_retries": 2,
+  "task_trials": 1,
+  "llm_provider_config": {
+    "provider": "openrouter",
+    "model_name": "deepseek/deepseek-v4-flash",
+    "max_output_tokens": 16384,
+    "reasoning_effort": "low",
+    "timeout_seconds": 300.0,
+    "base_url": "https://openrouter.ai/api/v1",
+    "provider_kwargs": {
+      "require_parameters": true,
+      "provider": {
+        "order": [
+          "gmicloud"
+        ],
+        "allow_fallbacks": true,
+        "ignore": [
+          "siliconflow",
+          "parasail",
+          "morph",
+          "venice"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["uv_build>=0.8.13,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "harness-experiment"
+description = "An experimental project that explores the possibility of agent-driven self-improving harness."
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+  "pydantic==2.12.5",
+  "harbor==0.1.45",
+  "python-dotenv==1.2.2",
+  "openrouter==0.9.1",
+]
+
+[project.scripts]
+exp = "src.cli:main_exp"
+auto = "src.cli:main_auto"
+
+[dependency-groups]
+dev = [
+  "coverage>=7.13.5",
+  "pytest>=9.0.2",
+  "pytest-cov>=7.1.0",
+  "ruff>=0.12,<0.13",
+]
+
+[tool.uv.build-backend]
+module-root = "."
+module-name = "src"
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+  ".git",
+  ".venv",
+  "experiments",
+  "tmp",
+  "notes",
+  "annotations",
+]
