@@ -383,7 +383,7 @@ def test_task_trials_unfinished_trials_do_not_block_completion_after_padding():
     in_progress = TaskResult(
         task_name="t",
         reward=None,
-        solved=None,
+        solved=False,
         error=None,
         steps_used=0,
         started_at="2026-05-05T00:00:00+00:00",

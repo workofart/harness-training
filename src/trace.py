@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.adapters.llm_base import LlmCompletion, LlmUsage
+from src.adapters.llm_base import LlmCompletion
 from src.harness.contracts import RawState
-from src.metrics import TaskMetrics
+from src.metrics import FailureMode, TaskMetrics
 from src.serialization import json_safe
 
 STEP_TRACE_FILENAME = "steps.jsonl"
@@ -41,84 +41,6 @@ class TraceEvent:
     ts: str
     event: str
     fields: dict[str, Any]
-
-
-class TaskMetricsBuilder:
-    def __init__(self) -> None:
-        self.steps_total = 0
-        self.run_count = 0
-        self.verify_count = 0
-        self.action_parse_failure_count = 0
-        self.token_input_total = 0
-        self.token_output_total = 0
-        self.token_reasoning_total = 0
-        self.token_cached_input_total = 0
-        self.rule_fires: dict[str, int] = {}
-        self.final_action_passed: bool | None = None
-        self.verifier_passed: bool | None = None
-        self.failure_mode: str | None = None
-
-    def record_action(self, step_index: int, action_name: str) -> None:
-        self.steps_total = step_index
-        self.final_action_passed = None
-        if action_name == "run":
-            self.run_count += 1
-        if action_name == "verify":
-            self.verify_count += 1
-
-    def record_action_parse_failure(self) -> None:
-        self.action_parse_failure_count += 1
-
-    def record_completion_usage(self, usage: LlmUsage) -> None:
-        if usage.prompt_tokens is not None:
-            self.token_input_total += usage.prompt_tokens
-        if usage.completion_tokens is not None:
-            self.token_output_total += usage.completion_tokens
-        if usage.reasoning_tokens is not None:
-            self.token_reasoning_total += usage.reasoning_tokens
-        if usage.cached_input_tokens is not None:
-            self.token_cached_input_total += usage.cached_input_tokens
-
-    def record_step_passed(self, raw_state: RawState) -> None:
-        """Attribute the env outcome to the most recent agent-chosen
-        action. Called only from `env_step_completed` (in-loop) — the
-        forced final verify uses a different code path so its rejection
-        does not get attributed to the last in-loop action."""
-        if isinstance(raw_state.passed, bool):
-            self.final_action_passed = raw_state.passed
-
-    def record_rule_fire(self, rule_name: str) -> None:
-        self.rule_fires[rule_name] = self.rule_fires.get(rule_name, 0) + 1
-
-    def set_trial_outcome(
-        self,
-        *,
-        verifier_passed: bool | None,
-        failure_mode: str | None,
-    ) -> None:
-        self.verifier_passed = verifier_passed
-        self.failure_mode = failure_mode
-
-    def build(self) -> TaskMetrics:
-        return TaskMetrics(
-            steps_total=self.steps_total,
-            run_count=self.run_count,
-            verify_count=self.verify_count,
-            action_parse_failure_count=self.action_parse_failure_count,
-            token_input_total=self.token_input_total,
-            token_output_total=self.token_output_total,
-            token_reasoning_total=self.token_reasoning_total,
-            token_cached_input_total=self.token_cached_input_total,
-            rule_fires=dict(self.rule_fires),
-            final_action_passed=self.final_action_passed,
-            verifier_passed=self.verifier_passed,
-            failure_mode=self.failure_mode,
-        )
-
-    def write(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = asdict(self.build())
-        path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def _tool_name(entry: Any) -> str | None:
@@ -242,7 +164,7 @@ def _completion_trace_fields(
 @dataclass(slots=True)
 class StepRecorder:
     trace: TraceWriter | None = None
-    metrics: TaskMetricsBuilder | None = None
+    metrics: TaskMetrics | None = None
     step_index: int | None = None
 
     def _write(self, event: str, **fields: Any) -> None:
@@ -325,7 +247,7 @@ class StepRecorder:
 @dataclass(slots=True)
 class HarnessRecorder:
     trace: TraceWriter | None = None
-    metrics: TaskMetricsBuilder | None = None
+    metrics: TaskMetrics | None = None
     metrics_path: Path | None = None
 
     @classmethod
@@ -341,7 +263,7 @@ class HarnessRecorder:
             resolved_metrics_path = Path(metrics_path)
         return cls(
             trace=writer,
-            metrics=TaskMetricsBuilder(),
+            metrics=TaskMetrics(),
             metrics_path=resolved_metrics_path,
         )
 
@@ -439,13 +361,13 @@ class HarnessRecorder:
     def build_metrics(self) -> TaskMetrics:
         if self.metrics is None:
             return TaskMetrics()
-        return self.metrics.build()
+        return self.metrics
 
     def set_trial_outcome(
         self,
         *,
         verifier_passed: bool | None,
-        failure_mode: str | None,
+        failure_mode: FailureMode | None,
     ) -> None:
         if self.metrics is None:
             return

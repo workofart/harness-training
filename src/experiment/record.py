@@ -70,7 +70,7 @@ class TaskTrials:
 
     @property
     def solved_count(self) -> int:
-        return sum(1 for trial in self.valid_trials if trial.solved is True)
+        return sum(1 for trial in self.valid_trials if trial.solved)
 
     @property
     def majority_solved(self) -> bool | None:
@@ -88,7 +88,7 @@ class TaskTrials:
         valid = self.valid_trials
         if not valid:
             return False
-        return all(trial.solved is True for trial in valid)
+        return all(trial.solved for trial in valid)
 
     @property
     def representative(self) -> TaskResult | None:

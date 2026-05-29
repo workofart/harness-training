@@ -178,7 +178,7 @@ def make_unfinished_record(
         TaskResult(
             task_name="task-a",
             reward=None,
-            solved=None,
+            solved=False,
             steps_used=3,
             error=None,
             trial_dir=f"/tmp/{experiment_id}/task-a",

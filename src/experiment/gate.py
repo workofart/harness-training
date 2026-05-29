@@ -220,7 +220,7 @@ def build_pooled_control_samples(
         if baseline_trials is None:
             continue
         for trial in baseline_trials.valid_trials:
-            _add(task_id, trial.solved is True)
+            _add(task_id, trial.solved)
 
     for record in recent_candidates:
         # The active baseline is itself a concluded candidate with a parent
@@ -241,7 +241,7 @@ def build_pooled_control_samples(
             for trial in trials.valid_trials:
                 if touched_by_new_rules(trial, new_rules):
                     continue
-                _add(task_id, trial.solved is True)
+                _add(task_id, trial.solved)
 
     return pool
 

@@ -8,6 +8,7 @@ import src.trace as trace_module
 from src.adapters.llm_base import BaseLlm
 from src.harness.contracts import HarnessEnv, TaskResult
 from src.harness.core import TaskLoopProgress, run_task_loop
+from src.metrics import FailureMode
 
 
 def _failure_mode(
@@ -16,7 +17,7 @@ def _failure_mode(
     final_passed: bool | None,
     steps_used: int,
     max_steps: int,
-) -> str | None:
+) -> FailureMode | None:
     # Classifies a trial that completed its loop without an infrastructure
     # failure. Infra failures (`error is not None`) are labeled "crash" where
     # they are caught, not here.

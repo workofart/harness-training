@@ -19,17 +19,16 @@ def test_trace_artifact_paths_are_canonical():
 
 def test_trace_module_owns_recording_types():
     assert trace_module.task_artifact_paths.__module__ == "src.trace"
-    assert trace_module.TaskMetricsBuilder.__module__ == "src.trace"
     assert trace_module.HarnessRecorder.__module__ == "src.trace"
 
 
-def test_task_metrics_builder_records_actions_usage_rules_and_outcome(tmp_path):
-    builder = trace_module.TaskMetricsBuilder()
+def test_task_metrics_records_actions_usage_rules_and_outcome(tmp_path):
+    metrics = TaskMetrics()
 
-    builder.record_action(1, "run")
-    builder.record_action(2, "verify")
-    builder.record_action_parse_failure()
-    builder.record_completion_usage(
+    metrics.record_action(1, "run")
+    metrics.record_action(2, "verify")
+    metrics.record_action_parse_failure()
+    metrics.record_completion_usage(
         LlmUsage(
             prompt_tokens=10,
             completion_tokens=4,
@@ -37,13 +36,12 @@ def test_task_metrics_builder_records_actions_usage_rules_and_outcome(tmp_path):
             cached_input_tokens=3,
         )
     )
-    builder.record_completion_usage(LlmUsage(prompt_tokens=None, completion_tokens=5))
-    builder.record_step_passed(RawState(passed=True))
-    builder.record_rule_fire("direct_literal_rule")
-    builder.record_rule_fire("direct_literal_rule")
-    builder.set_trial_outcome(verifier_passed=False, failure_mode="verified_rejected")
+    metrics.record_completion_usage(LlmUsage(prompt_tokens=None, completion_tokens=5))
+    metrics.record_step_passed(RawState(passed=True))
+    metrics.record_rule_fire("direct_literal_rule")
+    metrics.record_rule_fire("direct_literal_rule")
+    metrics.set_trial_outcome(verifier_passed=False, failure_mode="verified_rejected")
 
-    metrics = builder.build()
     assert metrics == TaskMetrics(
         steps_total=2,
         run_count=1,
@@ -60,7 +58,7 @@ def test_task_metrics_builder_records_actions_usage_rules_and_outcome(tmp_path):
     )
 
     metrics_path = tmp_path / "agent" / "metrics.json"
-    builder.write(metrics_path)
+    metrics.write(metrics_path)
     payload = json.loads(metrics_path.read_text())
     assert payload["rule_fires"] == {"direct_literal_rule": 2}
     assert payload["failure_mode"] == "verified_rejected"
@@ -69,7 +67,7 @@ def test_task_metrics_builder_records_actions_usage_rules_and_outcome(tmp_path):
 def test_step_recorder_writes_sanitized_completion_jsonl_and_tool_registry(tmp_path):
     trace_path = tmp_path / "agent" / "steps.jsonl"
     writer = trace_module.TraceWriter(trace_path)
-    metrics = trace_module.TaskMetricsBuilder()
+    metrics = TaskMetrics()
     recorder = trace_module.StepRecorder(trace=writer, metrics=metrics, step_index=3)
     request_tools = [
         {"function": {"name": "verify"}, "schema_path": tmp_path / "tool.json"},
@@ -121,4 +119,4 @@ def test_step_recorder_writes_sanitized_completion_jsonl_and_tool_registry(tmp_p
     assert events[2]["fields"]["request_messages_delta"] == [
         {"role": "assistant", "content": "continuing"}
     ]
-    assert metrics.build().token_output_total == 10
+    assert metrics.token_output_total == 10

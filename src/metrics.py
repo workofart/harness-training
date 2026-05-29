@@ -1,12 +1,39 @@
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from src.adapters.llm_base import LlmUsage
+    from src.harness.contracts import RawState
+
+# Single source of truth for the per-trial terminal-state bucket persisted as
+# `metrics.json.failure_mode` (mirrored in program.md "Post-Run Diagnosis").
+# `crash` is an infra failure that exhausted within-trial retries and is
+# excluded from evidence; `None` means the trial reached no terminal outcome.
+FailureMode = Literal[
+    "solved",
+    "never_verified",
+    "verified_rejected",
+    "hit_step_cap",
+    "hit_timeout",
+    "crash",
+]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class TaskMetrics:
+    """Per-trial counters and terminal-state summary.
+
+    Mutated in place over a trial by the recorders in ``trace.py`` (which own
+    a single instance), then frozen into the persisted ``metrics.json`` and
+    carried on ``TaskResult.metrics``. Not hashed anywhere, so it is a plain
+    mutable dataclass rather than a frozen target fronted by a builder.
+    """
+
     steps_total: int = 0
     run_count: int = 0
     verify_count: int = 0
@@ -25,7 +52,52 @@ class TaskMetrics:
     # did not produce a terminal outcome.
     final_action_passed: bool | None = None
     verifier_passed: bool | None = None
-    failure_mode: str | None = None
+    failure_mode: FailureMode | None = None
+
+    def record_action(self, step_index: int, action_name: str) -> None:
+        self.steps_total = step_index
+        self.final_action_passed = None
+        if action_name == "run":
+            self.run_count += 1
+        if action_name == "verify":
+            self.verify_count += 1
+
+    def record_action_parse_failure(self) -> None:
+        self.action_parse_failure_count += 1
+
+    def record_completion_usage(self, usage: LlmUsage) -> None:
+        if usage.prompt_tokens is not None:
+            self.token_input_total += usage.prompt_tokens
+        if usage.completion_tokens is not None:
+            self.token_output_total += usage.completion_tokens
+        if usage.reasoning_tokens is not None:
+            self.token_reasoning_total += usage.reasoning_tokens
+        if usage.cached_input_tokens is not None:
+            self.token_cached_input_total += usage.cached_input_tokens
+
+    def record_step_passed(self, raw_state: RawState) -> None:
+        """Attribute the env outcome to the most recent agent-chosen action.
+        Called only from `env_step_completed` (in-loop) — the forced final
+        verify uses a different code path so its rejection does not get
+        attributed to the last in-loop action."""
+        if isinstance(raw_state.passed, bool):
+            self.final_action_passed = raw_state.passed
+
+    def record_rule_fire(self, rule_name: str) -> None:
+        self.rule_fires[rule_name] = self.rule_fires.get(rule_name, 0) + 1
+
+    def set_trial_outcome(
+        self,
+        *,
+        verifier_passed: bool | None,
+        failure_mode: FailureMode | None,
+    ) -> None:
+        self.verifier_passed = verifier_passed
+        self.failure_mode = failure_mode
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(asdict(self), indent=2) + "\n")
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TaskMetrics":
