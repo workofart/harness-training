@@ -341,3 +341,27 @@ def test_run_docker_cli_reports_combined_output_on_failure(tmp_path: Path) -> No
     message = str(exc_info.value)
     assert "Output:" in message
     assert "Stderr: None" not in message
+
+
+def test_bootstrap_script_recovers_stale_apt_lock_before_commands(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A bootstrap attempt orphaned by an exec timeout leaves its in-container
+    # apt-get holding /var/lib/apt/lists/lock (Harbor's timeout kills the host
+    # docker client, not the in-container process), so a retried bootstrap fails
+    # with "Could not get lock ... (apt-get)" -> exit 100. The generated script
+    # must clear that stale lock *before* the user commands so the retry can
+    # proceed, and cap apt's network wait so an unreachable mirror fails fast
+    # instead of hanging until the bootstrap timeout.
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    harbor = _stub_harbor_for_bootstrap(
+        tmp_path,
+        exec_side_effect=[ExecResult(return_code=0, stdout="", stderr="")],
+    )
+
+    asyncio.run(harbor._bootstrap_environment())
+
+    script = (tmp_path / "trial" / "bootstrap" / "bootstrap.sh").read_text()
+    assert "/var/lib/apt/lists/lock" in script
+    assert script.index("rm -f") < script.index("apt-get update")
+    assert "Acquire::http::Timeout" in script
