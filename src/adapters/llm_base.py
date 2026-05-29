@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
 ReasoningEffort = Literal["none", "low", "medium", "high"]
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,14 +64,20 @@ class BaseLlm(ABC):
     ) -> LlmCompletion:
         pass
 
-    @abstractmethod
     def get_token_count(
         self,
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
-        pass
+        """Provider-agnostic token estimate (~3 serialized chars per token).
+
+        Concrete because every provider's heuristic was byte-identical; a
+        provider with a real tokenizer may override it.
+        """
+        payload = {"messages": messages, "tools": tools or []}
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return max(1, (len(serialized) + 2) // 3)
 
     async def close(self) -> None:
         pass

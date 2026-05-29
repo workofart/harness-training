@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -20,7 +19,9 @@ from src.adapters.llm_base import (
     LlmToolCall,
     LlmUsage,
     ReasoningEffort,
+    _int_or_none,
 )
+from src.serialization import json_safe
 
 if TYPE_CHECKING:
     from src.harness.config import OpenRouterConfig
@@ -95,59 +96,22 @@ def _is_retryable_openrouter_error(exc: Exception) -> bool:
     ) and getattr(exc, "status_code", 500) in {408, 429, 500, 502, 503, 524, 529}
 
 
-def _estimate_openrouter_token_count(
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-) -> int:
-    payload = {"messages": messages, "tools": tools or []}
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return max(1, (len(serialized) + 2) // 3)
-
-
-def _int_or_none(value: Any) -> int | None:
-    return value if isinstance(value, int) else None
-
-
-def _json_safe(value: Any, *, depth: int = 0) -> Any:
-    if depth >= 12:
-        return repr(value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe(item, depth=depth + 1) for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(item, depth=depth + 1) for item in value]
-    if hasattr(value, "model_dump"):
-        try:
-            dumped = value.model_dump(mode="json")
-        except TypeError:
-            dumped = value.model_dump()
-        return _json_safe(dumped, depth=depth + 1)
-    if hasattr(value, "__dict__"):
-        return _json_safe(vars(value), depth=depth + 1)
-    return repr(value)
-
-
 def _extract_reasoning_payload(message: Any) -> Any:
     if message is None:
         return None
     reasoning_content = _field(message, "reasoning_content")
     if reasoning_content is not None:
-        return _json_safe(reasoning_content)
+        return json_safe(reasoning_content)
 
     thinking_blocks = _field(message, "thinking_blocks")
     if thinking_blocks is not None:
-        return _json_safe(thinking_blocks)
+        return json_safe(thinking_blocks)
 
     provider_specific_fields = _field(message, "provider_specific_fields")
     if isinstance(provider_specific_fields, dict):
         for key in ("reasoning_content", "thinking", "reasoning"):
             if key in provider_specific_fields:
-                return _json_safe(provider_specific_fields[key])
+                return json_safe(provider_specific_fields[key])
 
     return None
 
@@ -159,9 +123,9 @@ def _build_response_envelope(completion: Any, message: Any) -> dict[str, Any]:
     provider-side ids when present.
     """
     if message is None:
-        return _json_safe(completion) if isinstance(completion, dict) else {}
+        return json_safe(completion) if isinstance(completion, dict) else {}
 
-    raw_message = _json_safe(message)
+    raw_message = json_safe(message)
     if not isinstance(raw_message, dict):
         return {}
 
@@ -195,7 +159,7 @@ def _build_response_envelope(completion: Any, message: Any) -> dict[str, Any]:
         if value is None and isinstance(completion, dict):
             value = completion.get(envelope_key)
         if value is not None:
-            response[envelope_key] = _json_safe(value)
+            response[envelope_key] = json_safe(value)
     return response
 
 
@@ -462,11 +426,3 @@ class OpenRouter(BaseLlm):
     async def close(self) -> None:
         await self._client.__aexit__(None, None, None)
         self._client.__exit__(None, None, None)
-
-    def get_token_count(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> int:
-        return _estimate_openrouter_token_count(messages, tools)

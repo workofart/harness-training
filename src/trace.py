@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +10,7 @@ from typing import Any
 from src.adapters.llm_base import LlmCompletion, LlmUsage
 from src.harness.contracts import RawState
 from src.metrics import TaskMetrics
+from src.serialization import json_safe
 
 STEP_TRACE_FILENAME = "steps.jsonl"
 TASK_METRICS_FILENAME = "metrics.json"
@@ -192,7 +193,7 @@ class TraceWriter:
     ) -> str | None:
         if not request_tools:
             return None
-        safe_tools = _json_safe(request_tools)
+        safe_tools = json_safe(request_tools)
         fingerprint = hashlib.sha1(
             json.dumps(safe_tools, sort_keys=True).encode("utf-8")
         ).hexdigest()[:12]
@@ -215,38 +216,6 @@ class TraceWriter:
         return fingerprint
 
 
-def _json_safe(value: Any, *, depth: int = 0) -> Any:
-    if depth >= 12:
-        return repr(value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe(item, depth=depth + 1) for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(item, depth=depth + 1) for item in value]
-    if is_dataclass(value) and not isinstance(value, type):
-        return _json_safe(asdict(value), depth=depth + 1)
-    if hasattr(value, "model_dump"):
-        try:
-            dumped = value.model_dump(mode="json")
-        except TypeError:
-            dumped = value.model_dump()
-        return _json_safe(dumped, depth=depth + 1)
-    if hasattr(value, "dict"):
-        try:
-            dumped = value.dict()
-        except TypeError:
-            dumped = value.dict
-        return _json_safe(dumped, depth=depth + 1)
-    if hasattr(value, "__dict__"):
-        return _json_safe(vars(value), depth=depth + 1)
-    return repr(value)
-
-
 def _completion_trace_fields(
     completion: LlmCompletion,
     *,
@@ -260,7 +229,7 @@ def _completion_trace_fields(
         "token_output": completion.usage.completion_tokens,
         "token_reasoning": completion.usage.reasoning_tokens,
         "token_cached_input": completion.usage.cached_input_tokens,
-        "request_messages_delta": _json_safe(request_messages_delta or []),
+        "request_messages_delta": json_safe(request_messages_delta or []),
         "request_messages_delta_reuse": request_messages_delta_reuse,
         "request_tools_fp": request_tools_fp,
         "response": completion.response,

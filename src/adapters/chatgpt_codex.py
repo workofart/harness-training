@@ -18,6 +18,7 @@ from src.adapters.llm_base import (
     LlmToolCall,
     LlmUsage,
     ReasoningEffort,
+    _int_or_none,
 )
 
 if TYPE_CHECKING:
@@ -196,16 +197,6 @@ class ChatGptCodex(BaseLlm):
         except ChatGptCodexUnauthorizedError:
             auth = await self._auth_store.refresh(http_client=self._client)
             return await self._post_completion(body=body, auth=auth)
-
-    def get_token_count(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> int:
-        payload = {"messages": messages, "tools": tools or []}
-        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return max(1, (len(serialized) + 2) // 3)
 
     async def close(self) -> None:
         if self._owns_client:
@@ -561,10 +552,6 @@ def _response_envelope(response: dict[str, Any] | None) -> dict[str, Any]:
 
 def _is_reasoning_item(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "reasoning"
-
-
-def _int_or_none(value: Any) -> int | None:
-    return value if isinstance(value, int) else None
 
 
 def _token_expires_soon(token: str) -> bool:
