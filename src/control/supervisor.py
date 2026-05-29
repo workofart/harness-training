@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, replace
@@ -16,15 +14,22 @@ from src.control.agent_backend import (
     AgentBackend,
     MissingThreadRollout,
     TurnTimeout,
-    color_enabled,
-    compact_paths,
     create_backend,
-    format_line,
-    print_terminal_lines,
-    supervisor_root_for_repo,
-    truncate,
 )
-from src.experiment.gate import load_recent_candidate_records
+from src.control.gates import (
+    SUPERVISOR_EDITABLE_PATHS,
+    build_mechanism_novelty_rejection,
+    validate_candidate_config_patch,
+    validate_candidate_editable_paths,
+    validate_learning_memo_update,
+    validate_no_task_ids_in_workspace_diff,
+)
+from src.control.supervisor_state import (
+    DEFAULT_SUPERVISOR_ROOT,
+    SupervisorState,
+    append_supervisor_event,
+    repo_fingerprint,
+)
 from src.experiment.record import (
     ExperimentRecord,
     ExperimentState,
@@ -35,26 +40,11 @@ from src.experiment.runner import ExperimentRunner
 from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
 from src.harness.contracts import TaskResult
 
-SUPERVISOR_STATE_FILENAME = "state.json"
-DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SUPERVISOR_ROOT = supervisor_root_for_repo(DEFAULT_REPO_ROOT)
 DEFAULT_SUPERVISOR_WORKTREE_PARENT = DEFAULT_SUPERVISOR_ROOT
-SUPERVISOR_EVENTS_FILENAME = "events.jsonl"
-Phase = Literal["prelaunch", "launch", "postrun"]
-SUPERVISOR_EDITABLE_PATHS = (
-    "config/harness_config.json",
-    "src/harness/core.py",
-    "tests/harness/test_core.py",
-)
 # The candidate may write harness_config.json, but only these proposal fields
 # may differ from HEAD during prelaunch.
-CANDIDATE_EDITABLE_CONFIG_FIELDS: frozenset[str] = frozenset({"focus_name"})
 # Config is structurally validated; only behavior/test diffs are scanned as
 # mechanism text for task ids and novelty.
-CANDIDATE_DIFF_SCAN_PATHS: tuple[str, ...] = (
-    "src/harness/core.py",
-    "tests/harness/test_core.py",
-)
 SUPERVISOR_VISIBLE_TRACKED_PATHS = (
     "program.md",
     "pyproject.toml",
@@ -68,61 +58,6 @@ SUPERVISOR_VISIBLE_TRACKED_PATHS = (
     *SUPERVISOR_EDITABLE_PATHS,
 )
 ABANDONED_EXPERIMENT_REASON = "abandoned after supervisor restart"
-
-
-@dataclass(frozen=True, slots=True)
-class SupervisorState:
-    phase: Phase
-    thread_id: str | None
-    updated_at: str
-    postrun_original_payload: dict[str, object] | None = None
-    postrun_original_learning: str | None = None
-    postrun_completed_experiment_id: str | None = None
-    launch_experiment_id: str | None = None
-    launch_baseline_commit: str | None = None
-
-    @classmethod
-    def path(
-        cls,
-        *,
-        repo_root: Path,
-        root: Path = DEFAULT_SUPERVISOR_ROOT,
-    ) -> Path:
-        return root / repo_fingerprint(repo_root) / SUPERVISOR_STATE_FILENAME
-
-    @classmethod
-    def maybe_load(
-        cls,
-        *,
-        repo_root: Path,
-        root: Path = DEFAULT_SUPERVISOR_ROOT,
-    ) -> "SupervisorState | None":
-        path = cls.path(repo_root=repo_root, root=root)
-        if not path.exists():
-            return None
-        return cls(**json.loads(path.read_text()))
-
-    def save(
-        self,
-        *,
-        repo_root: Path,
-        root: Path = DEFAULT_SUPERVISOR_ROOT,
-    ) -> None:
-        write_json_atomic(
-            self.path(repo_root=repo_root, root=root),
-            asdict(self),
-        )
-
-    @classmethod
-    def clear(
-        cls,
-        *,
-        repo_root: Path,
-        root: Path = DEFAULT_SUPERVISOR_ROOT,
-    ) -> None:
-        path = cls.path(repo_root=repo_root, root=root)
-        if path.exists():
-            path.unlink()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,74 +76,6 @@ class PreparedCandidate:
     experiment_id: str
     changed_paths: tuple[str, ...]
     harness_config: HarnessConfig
-
-
-def repo_fingerprint(repo_root: Path) -> str:
-    resolved = repo_root.resolve()
-    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:12]
-    return f"{resolved.name}-{digest}"
-
-
-def supervisor_events_path(
-    *,
-    repo_root: Path,
-    root: Path = DEFAULT_SUPERVISOR_ROOT,
-) -> Path:
-    return root / repo_fingerprint(repo_root) / SUPERVISOR_EVENTS_FILENAME
-
-
-def append_supervisor_event(
-    *,
-    repo_root: Path,
-    event: str,
-    root: Path = DEFAULT_SUPERVISOR_ROOT,
-    **fields: object,
-) -> None:
-    path = supervisor_events_path(repo_root=repo_root, root=root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "event": event,
-        "fields": fields,
-    }
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
-    print_terminal_lines(
-        [_format_supervisor_event(event=event, fields=fields)],
-        use_stderr=False,
-    )
-
-
-def _format_supervisor_event(*, event: str, fields: dict[str, object]) -> str:
-    enabled = color_enabled()
-    details: list[str] = []
-    for key in (
-        "phase",
-        "experiment_id",
-        "status",
-        "thread_id",
-        "baseline_experiment_id",
-        "experiment_json_path",
-    ):
-        value = fields.get(key)
-        if isinstance(value, str) and value:
-            details.append(f"{key}={value}")
-    error = fields.get("error")
-    if isinstance(error, str) and error:
-        details.append(f"error={truncate(error, limit=160)}")
-    note = fields.get("note")
-    if isinstance(note, str) and note:
-        details.append(f"note={truncate(note, limit=160)}")
-    session_count = fields.get("session_count")
-    if isinstance(session_count, int):
-        details.append(f"session_count={session_count}")
-    changed_paths_value = fields.get("changed_paths")
-    if isinstance(changed_paths_value, list):
-        rendered_paths = [path for path in changed_paths_value if isinstance(path, str)]
-        if rendered_paths:
-            details.append(f"paths={compact_paths(rendered_paths)}")
-    message = event if not details else f"{event} {' '.join(details)}"
-    return format_line("supervisor", message, enabled=enabled)
 
 
 def load_runtime_snapshot(*, repo_root: Path | None = None) -> RuntimeSnapshot:
@@ -446,87 +313,6 @@ def build_experiment_diagnosis_prompt(
     return "\n".join(lines)
 
 
-def validate_candidate_editable_paths(
-    *,
-    changed_paths: tuple[str, ...],
-) -> None:
-    allowed_paths = set(SUPERVISOR_EDITABLE_PATHS)
-    invalid_paths = sorted(path for path in changed_paths if path not in allowed_paths)
-    if invalid_paths:
-        raise RuntimeError(
-            "candidate modified paths outside supervisor editable paths "
-            "(program.md Source-of-truth boundary): "
-            + ", ".join(invalid_paths)
-            + ". Visible support files are read-only context; express harness "
-            "behavior changes through src/harness/core.py with focused tests."
-        )
-
-
-def _validate_no_task_ids_in_added_lines(
-    *,
-    added_lines: list[str],
-    task_ids: tuple[str, ...],
-) -> None:
-    if not task_ids or not added_lines:
-        return
-    offenders: dict[str, list[str]] = {}
-    for task_id in task_ids:
-        pattern = re.compile(r"\b" + re.escape(task_id) + r"\b")
-        for line in added_lines:
-            if pattern.search(line):
-                offenders.setdefault(task_id, []).append(line.strip()[:120])
-                break
-    if offenders:
-        details = "; ".join(
-            f"{task_id} -> {samples[0]!r}"
-            for task_id, samples in sorted(offenders.items())
-        )
-        raise RuntimeError(
-            "candidate diff embeds literal task ids in harness paths "
-            "(program.md Evidence task-agnostic rule; use a generic mechanism "
-            f"instead): {details}"
-        )
-
-
-def validate_no_task_ids_in_workspace_diff(
-    *,
-    workspace_root: Path,
-    task_ids: tuple[str, ...],
-) -> None:
-    if not (workspace_root / ".git").exists():
-        return
-    _validate_no_task_ids_in_added_lines(
-        added_lines=_git_diff_added_lines(
-            workspace_root=workspace_root,
-            paths=CANDIDATE_DIFF_SCAN_PATHS,
-        ),
-        task_ids=task_ids,
-    )
-
-
-def validate_learning_memo_update(
-    *,
-    before_payload: dict[str, object],
-    after_payload: dict[str, object],
-    before_learning: str,
-    after_learning: str,
-) -> None:
-    changed_keys = sorted(
-        key
-        for key in set(before_payload) | set(after_payload)
-        if before_payload.get(key) != after_payload.get(key)
-    )
-    if changed_keys:
-        raise RuntimeError(
-            "diagnosis turn modified experiment.json; update only "
-            "`experiments/learning.md`: " + ", ".join(changed_keys)
-        )
-    if not after_learning.strip():
-        raise RuntimeError("learning memo must be non-empty")
-    if after_learning == before_learning:
-        raise RuntimeError("learning memo was not updated")
-
-
 def default_sparse_workspace_root(*, repo_root: Path) -> Path:
     return (
         DEFAULT_SUPERVISOR_WORKTREE_PARENT / repo_fingerprint(repo_root) / "workspace"
@@ -593,53 +379,6 @@ def commit_candidate(*, workspace_root: Path, experiment_id: str) -> str:
     return control_repo.commit_all(f"candidate {experiment_id}", cwd=workspace_root)
 
 
-def _load_head_harness_config_for_repo(repo_root: Path) -> HarnessConfig:
-    completed = subprocess.run(
-        ["git", "show", "HEAD:config/harness_config.json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=repo_root,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "failed to read HEAD harness config:\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
-    return HarnessConfig.model_validate_json(completed.stdout)
-
-
-def validate_candidate_config_patch(
-    *,
-    workspace_root: Path,
-    harness_config: HarnessConfig,
-) -> None:
-    head_harness_config = _load_head_harness_config_for_repo(workspace_root)
-    candidate_payload = harness_config.model_dump(mode="json")
-    head_payload = head_harness_config.model_dump(mode="json")
-    changed_fields = sorted(
-        key
-        for key in set(head_payload) | set(candidate_payload)
-        if head_payload.get(key) != candidate_payload.get(key)
-    )
-    contract_fields = [
-        key for key in changed_fields if key not in CANDIDATE_EDITABLE_CONFIG_FIELDS
-    ]
-    if contract_fields:
-        raise RuntimeError(
-            "candidate changed supervisor-owned harness config fields "
-            "(program.md Source-of-truth boundary); config/harness_config.json "
-            "candidate edits are limited to focus_name. "
-            "Changed contract fields: " + ", ".join(contract_fields)
-        )
-    if harness_config.focus_name == head_harness_config.focus_name:
-        raise RuntimeError(
-            "candidate must set config/harness_config.json focus_name to a short "
-            "mechanism label for this experiment"
-        )
-
-
 def _assign_candidate_experiment_id(
     *,
     workspace_root: Path,
@@ -656,87 +395,6 @@ def _assign_candidate_experiment_id(
     payload["experiment_id"] = experiment_id
     write_json_atomic(config_path, payload)
     return harness_config.model_copy(update={"experiment_id": experiment_id})
-
-
-def _git_diff_added_lines(*, workspace_root: Path, paths: tuple[str, ...]) -> list[str]:
-    completed = subprocess.run(
-        ["git", "diff", "--unified=0", "--", *paths],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=workspace_root,
-    )
-    if completed.returncode != 0:
-        return []
-    return [
-        line[1:]
-        for line in completed.stdout.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    ]
-
-
-def _mechanism_added_lines(lines: list[str]) -> set[str]:
-    return {
-        normalized
-        for line in lines
-        if (normalized := " ".join(line.strip().split()))
-        and len(normalized) >= 12
-        and not normalized.startswith("#")
-        and any(character.isalpha() for character in normalized)
-    }
-
-
-def build_mechanism_novelty_rejection(
-    *,
-    workspace_root: Path,
-    experiments_root: Path,
-    changed_paths: tuple[str, ...],
-    window: int = 10,
-) -> str | None:
-    if "src/harness/core.py" not in changed_paths:
-        return None
-    if not (workspace_root / ".git").exists():
-        return None
-    candidate_lines = _mechanism_added_lines(
-        _git_diff_added_lines(
-            workspace_root=workspace_root,
-            paths=CANDIDATE_DIFF_SCAN_PATHS,
-        )
-    )
-    if not candidate_lines:
-        return None
-    recent_discards = [
-        r
-        for r in load_recent_candidate_records(
-            experiments_root=experiments_root,
-            window=window,
-        )
-        if r.status == "discard"
-    ]
-    for record in recent_discards:
-        parent_ref = None
-        if record.evidence is not None:
-            parent_ref = record.evidence.candidate_change.parent_baseline_commit
-        if parent_ref is None:
-            continue
-        discard_lines = _mechanism_added_lines(
-            control_repo.git_diff_added_lines_between(
-                cwd=workspace_root,
-                base_ref=parent_ref,
-                head_ref=record.git_commit_hash,
-                paths=CANDIDATE_DIFF_SCAN_PATHS,
-            )
-        )
-        if not discard_lines:
-            continue
-        if candidate_lines == discard_lines or candidate_lines.issubset(discard_lines):
-            return (
-                f"Candidate mechanism is identical to recently discarded "
-                f"{record.experiment_id} (reason: {record.decision_reason}). "
-                f"You must use a structurally different approach — do not "
-                f"redeploy the same mechanism with only a label change."
-            )
-    return None
 
 
 def _abandoned_task_result(

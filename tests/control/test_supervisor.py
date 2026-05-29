@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.control import supervisor
+from src.control import gates, supervisor, supervisor_state
 from src.control.agent_backend import (
     MissingThreadRollout,
     TurnResult,
@@ -192,14 +192,14 @@ def make_unfinished_record(
 
 
 def test_validate_candidate_editable_paths_allows_config_and_editable_paths() -> None:
-    supervisor.validate_candidate_editable_paths(
+    gates.validate_candidate_editable_paths(
         changed_paths=("config/harness_config.json", "src/harness/core.py"),
     )
 
 
 def test_validate_candidate_editable_paths_rejects_out_of_scope_paths() -> None:
     with pytest.raises(RuntimeError, match="outside supervisor editable paths"):
-        supervisor.validate_candidate_editable_paths(
+        gates.validate_candidate_editable_paths(
             changed_paths=("src/experiment/runner.py",),
         )
 
@@ -210,14 +210,14 @@ def test_append_supervisor_event_writes_jsonl_under_supervisor_root(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
-    supervisor.append_supervisor_event(
+    supervisor_state.append_supervisor_event(
         repo_root=repo_root,
         root=tmp_path / "supervisor",
         event="loop_started",
         phase="prelaunch",
     )
 
-    event_path = supervisor.supervisor_events_path(
+    event_path = supervisor_state.supervisor_events_path(
         repo_root=repo_root,
         root=tmp_path / "supervisor",
     )
@@ -233,7 +233,7 @@ def test_append_supervisor_event_prints_terminal_log(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
-    supervisor.append_supervisor_event(
+    supervisor_state.append_supervisor_event(
         repo_root=repo_root,
         root=tmp_path / "supervisor",
         event="loop_iteration_started",
@@ -486,7 +486,7 @@ def test_validate_no_task_ids_in_workspace_diff_rejects_literal_task_id(
     )
 
     with pytest.raises(RuntimeError, match="literal task ids"):
-        supervisor.validate_no_task_ids_in_workspace_diff(
+        gates.validate_no_task_ids_in_workspace_diff(
             workspace_root=workspace_root,
             task_ids=("count-dataset-tokens", "regex-log"),
         )
@@ -508,7 +508,7 @@ def test_validate_no_task_ids_in_workspace_diff_accepts_generic_change(
         )
     )
 
-    supervisor.validate_no_task_ids_in_workspace_diff(
+    gates.validate_no_task_ids_in_workspace_diff(
         workspace_root=workspace_root,
         task_ids=("count-dataset-tokens", "regex-log"),
     )
@@ -601,7 +601,7 @@ def test_validate_learning_memo_update_allows_only_learning_change() -> None:
     before = {"experiment_id": "exp-1", "status": "discard"}
     after = dict(before)
 
-    supervisor.validate_learning_memo_update(
+    gates.validate_learning_memo_update(
         before_payload=before,
         after_payload=after,
         before_learning="# Learnings\n",
@@ -614,7 +614,7 @@ def test_validate_learning_memo_update_rejects_experiment_record_changes() -> No
     after = {"experiment_id": "exp-1", "status": "keep"}
 
     with pytest.raises(RuntimeError, match="modified experiment.json"):
-        supervisor.validate_learning_memo_update(
+        gates.validate_learning_memo_update(
             before_payload=before,
             after_payload=after,
             before_learning="# Learnings\n",
@@ -626,7 +626,7 @@ def test_validate_learning_memo_update_rejects_unchanged_learning() -> None:
     payload = {"experiment_id": "exp-1", "status": "discard"}
 
     with pytest.raises(RuntimeError, match="learning memo was not updated"):
-        supervisor.validate_learning_memo_update(
+        gates.validate_learning_memo_update(
             before_payload=payload,
             after_payload=dict(payload),
             before_learning="# Learnings\n",
@@ -733,7 +733,7 @@ def test_run_prelaunch_phase_reruns_with_feedback_until_workspace_is_valid(
     )
     assert "program.md Prelaunch" in feedback_notes[1]
 
-    events_path = supervisor.supervisor_events_path(
+    events_path = supervisor_state.supervisor_events_path(
         repo_root=repo_root,
         root=supervisor_root,
     )
@@ -816,7 +816,7 @@ def test_run_supervisor_loop_prelaunch_save_preserves_postrun_completion_marker(
         evidence_artifact_paths=(),
         thread_id=None,
         backend=TrackingBackend(),
-        on_turn_complete=lambda current_thread_id: supervisor.SupervisorState(
+        on_turn_complete=lambda current_thread_id: supervisor_state.SupervisorState(
             phase="prelaunch",
             thread_id=current_thread_id,
             updated_at="2026-05-17T00:00:01+00:00",
@@ -825,7 +825,7 @@ def test_run_supervisor_loop_prelaunch_save_preserves_postrun_completion_marker(
         supervisor_root=supervisor_root,
     )
 
-    reloaded = supervisor.SupervisorState.maybe_load(
+    reloaded = supervisor_state.SupervisorState.maybe_load(
         repo_root=repo_root, root=supervisor_root
     )
     assert reloaded is not None
@@ -1326,7 +1326,7 @@ def test_run_supervisor_loop_reuses_same_thread_until_candidate_changes_then_lau
     assert synced_commits == ["base123", "candidate123", "base123"]
     assert hard_reset_calls == ["candidate123"]
     assert commit_messages == ["exp-20260525-182647"]
-    assert not supervisor.SupervisorState.path(
+    assert not supervisor_state.SupervisorState.path(
         repo_root=snapshot.repo_root,
         root=tmp_path / "supervisor",
     ).exists()
@@ -1379,7 +1379,7 @@ def test_run_supervisor_loop_logs_failure_before_raising(
 
     event_payloads = [
         json.loads(line)
-        for line in supervisor.supervisor_events_path(
+        for line in supervisor_state.supervisor_events_path(
             repo_root=snapshot.repo_root,
             root=supervisor_root,
         )
@@ -1710,7 +1710,7 @@ def test_run_supervisor_loop_resets_to_baseline_after_failed_candidate(
 
     assert hard_reset_calls == ["candidate123", "base123"]
     assert synced_commits == ["base123", "base123", "base123"]
-    state = supervisor.SupervisorState.maybe_load(
+    state = supervisor_state.SupervisorState.maybe_load(
         repo_root=snapshot.repo_root,
         root=tmp_path / "supervisor",
     )
@@ -1744,7 +1744,7 @@ def test_run_supervisor_loop_resumes_postrun_phase_before_prelaunch(
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="postrun",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -1828,7 +1828,7 @@ def test_run_supervisor_loop_resumes_postrun_after_keep_advances_baseline(
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    state_path = supervisor.SupervisorState.path(
+    state_path = supervisor_state.SupervisorState.path(
         repo_root=snapshot.repo_root,
         root=tmp_path / "supervisor",
     )
@@ -1921,7 +1921,7 @@ def test_run_supervisor_loop_recovers_postrun_from_concluded_record(
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="prelaunch",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2080,7 +2080,7 @@ def test_run_supervisor_loop_restarts_prelaunch_when_learning_memo_already_updat
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="prelaunch",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2164,7 +2164,7 @@ def test_run_supervisor_loop_preserves_completed_postrun_marker_across_iteration
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="prelaunch",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2260,7 +2260,7 @@ def test_run_supervisor_loop_restores_stale_postrun_cache_before_resuming_diagno
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="postrun",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2352,7 +2352,7 @@ def test_run_supervisor_loop_abandons_unfinished_candidate_and_restarts_prelaunc
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="postrun",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2450,7 +2450,7 @@ def test_run_supervisor_loop_abandons_unfinished_candidate_and_restarts_prelaunc
     assert state.active_baseline_experiment_id == "baseline"
     assert state.current_experiment_id == "exp-next"
     assert (
-        supervisor.SupervisorState.maybe_load(
+        supervisor_state.SupervisorState.maybe_load(
             repo_root=snapshot.repo_root,
             root=tmp_path / "supervisor",
         )
@@ -2513,7 +2513,7 @@ def test_run_supervisor_loop_prelaunch_state_keeps_only_failed_candidate_referen
             supervisor_root=tmp_path / "supervisor",
         )
 
-    state = supervisor.SupervisorState.maybe_load(
+    state = supervisor_state.SupervisorState.maybe_load(
         repo_root=snapshot.repo_root,
         root=tmp_path / "supervisor",
     )
@@ -2537,7 +2537,7 @@ def test_run_supervisor_loop_discards_sparse_workspace_and_reuses_only_prelaunch
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="prelaunch",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2788,7 +2788,7 @@ def test_run_supervisor_loop_syncs_workspace_after_postrun_diagnosis(
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="postrun",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -2916,7 +2916,7 @@ def test_ensure_baseline_at_head_runs_baseline_when_head_advanced(
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="prelaunch",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",
@@ -3000,7 +3000,7 @@ def test_ensure_baseline_at_head_runs_baseline_when_head_advanced(
     assert f"experiment_json_path={expected_experiment_json_path}" in captured.out
     event_payloads = [
         json.loads(line)
-        for line in supervisor.supervisor_events_path(
+        for line in supervisor_state.supervisor_events_path(
             repo_root=snapshot.repo_root,
             root=tmp_path / "supervisor",
         )
@@ -3017,7 +3017,7 @@ def test_ensure_baseline_at_head_runs_baseline_when_head_advanced(
         started_event["fields"]["experiment_json_path"] == expected_experiment_json_path
     )
     assert (
-        supervisor.SupervisorState.maybe_load(
+        supervisor_state.SupervisorState.maybe_load(
             repo_root=snapshot.repo_root,
             root=tmp_path / "supervisor",
         )
@@ -3092,7 +3092,7 @@ def test_ensure_baseline_at_head_rejects_crashed_baseline_run(
 
     assert synced_commits == []
     assert (
-        supervisor.SupervisorState.maybe_load(
+        supervisor_state.SupervisorState.maybe_load(
             repo_root=snapshot.repo_root,
             root=tmp_path / "supervisor",
         )
@@ -3159,7 +3159,7 @@ def test_run_supervisor_loop_syncs_workspace_before_resuming_postrun_diagnosis(
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
 
-    supervisor.SupervisorState(
+    supervisor_state.SupervisorState(
         phase="postrun",
         thread_id="thread-1",
         updated_at="2026-04-11T00:00:00+00:00",

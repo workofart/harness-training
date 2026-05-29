@@ -57,6 +57,16 @@ def git_ref_exists(*, cwd: Path | None = None, ref: str) -> bool:
     return completed.returncode == 0
 
 
+def _added_lines(diff_stdout: str) -> list[str]:
+    """Extract the added (`+`) source lines from `git diff --unified=0` output,
+    stripping the leading `+` and skipping the `+++` file header."""
+    return [
+        line[1:]
+        for line in diff_stdout.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+
+
 def git_diff_added_lines_between(
     *,
     cwd: Path | None = None,
@@ -77,11 +87,51 @@ def git_diff_added_lines_between(
     )
     if completed.returncode != 0:
         return []
-    return [
-        line[1:]
-        for line in completed.stdout.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    ]
+    return _added_lines(completed.stdout)
+
+
+def git_diff_added_lines_worktree(
+    *,
+    cwd: Path | None = None,
+    paths: tuple[str, ...],
+) -> list[str]:
+    """Added (`+`) lines in the uncommitted working-tree diff for `paths`.
+
+    The working-tree sibling of `git_diff_added_lines_between` (which diffs two
+    commits): used to scan a candidate's not-yet-committed edits.
+    """
+    completed = subprocess.run(
+        ["git", "diff", "--unified=0", "--", *paths],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    if completed.returncode != 0:
+        return []
+    return _added_lines(completed.stdout)
+
+
+def git_show_at_head(path: str, *, cwd: Path | None = None) -> str:
+    """Return the contents of `path` as of HEAD (`git show HEAD:<path>`).
+
+    Uses `check=False` so a missing/unreadable blob raises a RuntimeError that
+    carries the captured stdout+stderr, rather than an opaque CalledProcessError.
+    """
+    completed = subprocess.run(
+        ["git", "show", f"HEAD:{path}"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"failed to read HEAD {path}:\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return completed.stdout
 
 
 def get_head_commit(*, cwd: Path | None = None) -> str:
