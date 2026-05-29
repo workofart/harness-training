@@ -31,11 +31,12 @@ from __future__ import annotations
 import json
 import shlex
 from abc import ABC
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, fields
 from typing import Any, ClassVar, Literal, TypeAlias
 
 from src.adapters.llm_base import BaseLlm
 from src.harness.contracts import HarnessEnv, RawState
+from src.trace import NOOP_HARNESS_RECORDER, NOOP_STEP_RECORDER
 
 
 # ============================================================================
@@ -68,7 +69,17 @@ ActionName: TypeAlias = Literal[
 Trajectory: TypeAlias = tuple[tuple["Action", "RawState"], ...]
 
 
+@dataclass(frozen=True, slots=True)
 class Action(ABC):
+    """Base for the 8 typed actions.
+
+    Declared a frozen+slots dataclass — matching every subclass — so the base
+    itself is a dataclass type. That makes the "every Action is a dataclass"
+    invariant true at the type level, so `fields()`/`asdict()` over the action
+    classes type-check. `frozen` must agree with the subclasses (Python forbids
+    mixing frozen and non-frozen across a dataclass hierarchy).
+    """
+
     NAME: ClassVar[ActionName]
 
 
@@ -148,6 +159,41 @@ class TaskLoopProgress:
 # ============================================================================
 
 
+# The 8 action dataclasses above are the single source of truth for action
+# structure. `ACTION_BY_NAME` maps the model-facing name to its class; a spec's
+# required vs optional keys are derived from the class's fields (a field with a
+# default is optional). Only the model-facing descriptions and the names of
+# integer-typed fields are declared by hand here.
+ACTION_CLASSES: tuple[type[Action], ...] = (
+    ListDirAction,
+    FindFilesAction,
+    SearchTextAction,
+    ReadFileAction,
+    WriteFileAction,
+    EditFileAction,
+    RunAction,
+    VerifyAction,
+)
+ACTION_BY_NAME: dict[ActionName, type[Action]] = {
+    cls.NAME: cls for cls in ACTION_CLASSES
+}
+
+# Fields typed `int | None`; every other action field is a string. Drives both
+# the tool-spec JSON type and argument validation.
+INTEGER_FIELDS: frozenset[str] = frozenset({"start_line", "end_line", "timeout_sec"})
+
+_ACTION_DESCRIPTIONS: dict[ActionName, str] = {
+    "list_dir": "List directory contents.",
+    "find_files": "Find files by filename pattern.",
+    "search_text": "Search file contents for text.",
+    "read_file": "Read a file, optionally by line range.",
+    "write_file": "Write the full contents of a file.",
+    "edit_file": "Replace one exact text span in a file.",
+    "run": "Run one shell command.",
+    "verify": "Ask the environment for the authoritative task judgment.",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ActionSpec:
     name: ActionName
@@ -156,56 +202,28 @@ class ActionSpec:
     optional_keys: tuple[str, ...] = ()
 
 
+def _action_spec(cls: type[Action]) -> ActionSpec:
+    required = tuple(
+        f.name
+        for f in fields(cls)
+        if f.default is MISSING and f.default_factory is MISSING
+    )
+    optional = tuple(
+        f.name
+        for f in fields(cls)
+        if f.default is not MISSING or f.default_factory is not MISSING
+    )
+    return ActionSpec(
+        name=cls.NAME,
+        description=_ACTION_DESCRIPTIONS[cls.NAME],
+        required_keys=required,
+        optional_keys=optional,
+    )
+
+
 ACTION_SPECS: dict[ActionName, ActionSpec] = {
-    "list_dir": ActionSpec(
-        name="list_dir",
-        description="List directory contents.",
-        required_keys=(),
-        optional_keys=("path",),
-    ),
-    "find_files": ActionSpec(
-        name="find_files",
-        description="Find files by filename pattern.",
-        required_keys=("pattern",),
-        optional_keys=("root",),
-    ),
-    "search_text": ActionSpec(
-        name="search_text",
-        description="Search file contents for text.",
-        required_keys=("query",),
-        optional_keys=("root",),
-    ),
-    "read_file": ActionSpec(
-        name="read_file",
-        description="Read a file, optionally by line range.",
-        required_keys=("path",),
-        optional_keys=("start_line", "end_line"),
-    ),
-    "write_file": ActionSpec(
-        name="write_file",
-        description="Write the full contents of a file.",
-        required_keys=("path", "content"),
-    ),
-    "edit_file": ActionSpec(
-        name="edit_file",
-        description="Replace one exact text span in a file.",
-        required_keys=("path", "old_text", "new_text"),
-    ),
-    "run": ActionSpec(
-        name="run",
-        description="Run one shell command.",
-        required_keys=("command",),
-        optional_keys=("cwd", "timeout_sec"),
-    ),
-    "verify": ActionSpec(
-        name="verify",
-        description="Ask the environment for the authoritative task judgment.",
-        required_keys=(),
-    ),
+    cls.NAME: _action_spec(cls) for cls in ACTION_CLASSES
 }
-
-
-INTEGER_FIELDS: frozenset[str] = frozenset({"start_line", "end_line", "timeout_sec"})
 
 
 def build_tool_specs() -> list[dict[str, Any]]:
@@ -252,7 +270,8 @@ def validate_action_args(action_name: ActionName, args: Any) -> dict[str, Any]:
     if not isinstance(args, dict):
         raise ValueError(f"{action_name}: arguments must decode to an object")
     spec = ACTION_SPECS[action_name]
-    allowed = set(spec.required_keys) | set(spec.optional_keys)
+    required = set(spec.required_keys)
+    allowed = required | set(spec.optional_keys)
     missing = [k for k in spec.required_keys if k not in args]
     if missing:
         raise ValueError(f"{action_name}: missing required keys {missing}")
@@ -263,72 +282,30 @@ def validate_action_args(action_name: ActionName, args: Any) -> dict[str, Any]:
         value = args[key]
         if value is not None and not isinstance(value, int):
             raise ValueError(f"{key}: expected integer or null")
+    # String fields: a required one must be a non-empty string; an optional one
+    # may be a string or null. Validated here rather than in build_action so a
+    # bad type surfaces as a ValueError inside act()'s repair loop, and
+    # build_action can construct the dataclass from already-typed args.
+    for key in (*spec.required_keys, *spec.optional_keys):
+        if key in INTEGER_FIELDS or key not in args:
+            continue
+        value = args[key]
+        if key in required:
+            if not isinstance(value, str) or value == "":
+                raise ValueError(f"{key}: expected non-empty string")
+        elif value is not None and not isinstance(value, str):
+            raise ValueError("expected string or null")
     return dict(args)
 
 
 def build_action(action_name: ActionName, args: dict[str, Any]) -> Action:
-    match action_name:
-        case "list_dir":
-            return ListDirAction(path=_optional_str(args.get("path")))
-        case "find_files":
-            return FindFilesAction(
-                pattern=_required_str(args, "pattern"),
-                root=_optional_str(args.get("root")),
-            )
-        case "search_text":
-            return SearchTextAction(
-                query=_required_str(args, "query"),
-                root=_optional_str(args.get("root")),
-            )
-        case "read_file":
-            return ReadFileAction(
-                path=_required_str(args, "path"),
-                start_line=_optional_int(args.get("start_line")),
-                end_line=_optional_int(args.get("end_line")),
-            )
-        case "write_file":
-            return WriteFileAction(
-                path=_required_str(args, "path"),
-                content=_required_str(args, "content"),
-            )
-        case "edit_file":
-            return EditFileAction(
-                path=_required_str(args, "path"),
-                old_text=_required_str(args, "old_text"),
-                new_text=_required_str(args, "new_text"),
-            )
-        case "run":
-            return RunAction(
-                command=_required_str(args, "command"),
-                cwd=_optional_str(args.get("cwd")),
-                timeout_sec=_optional_int(args.get("timeout_sec")),
-            )
-        case "verify":
-            return VerifyAction()
-    raise ValueError(f"unknown action name: {action_name!r}")
+    """Construct the typed Action from already-validated args.
 
-
-def _required_str(args: dict[str, Any], key: str) -> str:
-    value = args[key]
-    if not isinstance(value, str) or value == "":
-        raise ValueError(f"{key}: expected non-empty string")
-    return value
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError("expected string or null")
-    return value
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int):
-        raise ValueError("expected integer or null")
-    return value
+    `args` must be the output of `validate_action_args`, which guarantees the
+    keys and value types line up with the dataclass fields — so the keyword
+    splat into the action class is safe.
+    """
+    return ACTION_BY_NAME[action_name](**args)
 
 
 # ============================================================================
@@ -430,31 +407,14 @@ def _clip(text: str, *, limit: int) -> str:
 
 def _replay_tool_call(action: Action, *, step_index: int) -> dict[str, Any]:
     """Synthesize the assistant `tool_call` envelope for a stored Action."""
-    match action:
-        case ListDirAction(path=path):
-            args: dict[str, Any] = {"path": path}
-        case FindFilesAction(pattern=pattern, root=root):
-            args = {"pattern": pattern, "root": root}
-        case SearchTextAction(query=query, root=root):
-            args = {"query": query, "root": root}
-        case ReadFileAction(path=path, start_line=start_line, end_line=end_line):
-            args = {"path": path, "start_line": start_line, "end_line": end_line}
-        case WriteFileAction(path=path, content=content):
-            args = {"path": path, "content": content}
-        case EditFileAction(path=path, old_text=old_text, new_text=new_text):
-            args = {"path": path, "old_text": old_text, "new_text": new_text}
-        case RunAction(command=command, cwd=cwd, timeout_sec=timeout_sec):
-            args = {"command": command, "cwd": cwd, "timeout_sec": timeout_sec}
-        case VerifyAction():
-            args = {}
-        case _:
-            raise TypeError(f"unsupported action type {type(action).__name__}")
-    args = {k: v for k, v in args.items() if v is not None}
+    args = summarize_action(action)
     return {
         "id": f"call_{step_index:04d}",
         "type": "function",
         "function": {
             "name": action.NAME,
+            # sort_keys keeps the emitted JSON byte-stable (alphabetical), which
+            # prompt-cache reuse depends on; do not drop it.
             "arguments": json.dumps(args, sort_keys=True, separators=(",", ":")),
         },
     }
@@ -512,7 +472,7 @@ async def act(
     working_dir: str | None,
     trajectory: Trajectory,
     max_output_retries: int,
-    recorder: Any = None,
+    recorder: Any = NOOP_STEP_RECORDER,
 ) -> tuple[Action, ...]:
     """One LLM round-trip. Returns the typed Actions parsed from its tool calls.
 
@@ -531,19 +491,17 @@ async def act(
             messages=[*base_messages, *repair_messages],
             tools=tools,
         )
-        if recorder is not None:
-            recorder.completion_received(
-                attempt_index=attempt_index,
-                request_messages=[*base_messages, *repair_messages],
-                request_tools=tools,
-                completion=completion,
-            )
+        recorder.completion_received(
+            attempt_index=attempt_index,
+            request_messages=[*base_messages, *repair_messages],
+            request_tools=tools,
+            completion=completion,
+        )
         if not completion.tool_calls:
-            if recorder is not None:
-                recorder.action_parse_failed(
-                    error="MissingToolCall",
-                    detail="model response omitted required tool call",
-                )
+            recorder.action_parse_failed(
+                error="MissingToolCall",
+                detail="model response omitted required tool call",
+            )
             repair_messages = [
                 {"role": "assistant", "content": completion.content or ""},
                 {"role": "user", "content": MISSING_TOOL_CALL_REPAIR_PROMPT},
@@ -559,11 +517,10 @@ async def act(
                 actions.append(build_action(action_name, args))
             return tuple(actions)
         except Exception as exc:
-            if recorder is not None:
-                recorder.action_parse_failed(
-                    error=type(exc).__name__,
-                    detail=str(exc),
-                )
+            recorder.action_parse_failed(
+                error=type(exc).__name__,
+                detail=str(exc),
+            )
             repair_messages = [
                 {
                     "role": "user",
@@ -590,7 +547,7 @@ async def run_task_loop(
     reset_state: RawState,
     max_steps: int,
     max_output_retries: int = 2,
-    recorder: Any = None,
+    recorder: Any = NOOP_HARNESS_RECORDER,
     progress: TaskLoopProgress | None = None,
 ) -> TaskLoopResult:
     """Run the agent loop after environment reset.
@@ -610,7 +567,7 @@ async def run_task_loop(
         progress.final_passed = final_passed
     while steps_used < max_steps and not done:
         step_index = steps_used + 1
-        step_recorder = None if recorder is None else recorder.for_step(step_index)
+        step_recorder = recorder.for_step(step_index)
         actions = await act(
             llm=llm,
             instruction=reset_state.instruction,
@@ -623,20 +580,18 @@ async def run_task_loop(
             if done or steps_used >= max_steps:
                 break
             step_index = steps_used + 1
-            step_recorder = None if recorder is None else recorder.for_step(step_index)
+            step_recorder = recorder.for_step(step_index)
             action_summary = summarize_action(action)
-            if step_recorder is not None:
-                step_recorder.action_chosen(
-                    action_name=action.NAME,
-                    action_summary=action_summary,
-                )
+            step_recorder.action_chosen(
+                action_name=action.NAME,
+                action_summary=action_summary,
+            )
             raw_state = await execute_action(env, action)
-            if step_recorder is not None:
-                step_recorder.env_step_completed(
-                    action_name=action.NAME,
-                    action_summary=action_summary,
-                    raw_state=raw_state,
-                )
+            step_recorder.env_step_completed(
+                action_name=action.NAME,
+                action_summary=action_summary,
+                raw_state=raw_state,
+            )
             trajectory = (*trajectory, (action, raw_state))
             steps_used += 1
             done = raw_state.done

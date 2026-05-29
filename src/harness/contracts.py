@@ -29,9 +29,7 @@ class RawState:
 
     Contract notes:
     - `reset()` returns `instruction` and `working_dir`.
-    - `exec()` returns one command result. For bounded observation commands,
-      `next_start_line` and `has_more` are continuation hints owned by the
-      harness-facing contract rather than hidden adapter-private metadata.
+    - `exec()` returns one command result.
     - `verify()` returns the authoritative terminal judgment for the task.
     """
 
@@ -43,8 +41,6 @@ class RawState:
     return_code: int | None = None
     stdout: str | None = None
     stderr: str | None = None
-    next_start_line: int | None = None
-    has_more: bool = False
 
 
 class HarnessEnv(Protocol):

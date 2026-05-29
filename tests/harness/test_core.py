@@ -175,6 +175,25 @@ def test_validate_action_args_accepts_null_for_optional_integer():
     assert out == {"path": "/x", "start_line": None}
 
 
+def test_validate_action_args_rejects_empty_required_string():
+    # A required string field must be non-empty (validation owns this so the
+    # error is a ValueError inside act()'s repair loop, not a later TypeError).
+    with pytest.raises(ValueError, match="content: expected non-empty string"):
+        validate_action_args("write_file", {"path": "/x", "content": ""})
+
+
+def test_validate_action_args_rejects_non_string_for_optional_string_field():
+    with pytest.raises(ValueError, match="expected string or null"):
+        validate_action_args("find_files", {"pattern": "*.py", "root": 5})
+
+
+def test_validate_action_args_accepts_empty_string_for_optional_string_field():
+    # Asymmetry preserved from the original _required_str/_optional_str split:
+    # an optional string may be empty even though a required one may not.
+    out = validate_action_args("find_files", {"pattern": "*.py", "root": ""})
+    assert out == {"pattern": "*.py", "root": ""}
+
+
 # ----------------------------------------------------------------------------
 # build_action
 # ----------------------------------------------------------------------------
@@ -300,8 +319,6 @@ def test_execute_action_read_file_uses_default_window_when_no_end_line():
     expected_end = DEFAULT_READ_WINDOW_LINES
     assert env.exec_calls[0]["command"] == f"sed -n '1,{expected_end}p' /x"
     assert result.stdout == stdout
-    assert result.next_start_line is None
-    assert result.has_more is False
 
 
 def test_execute_action_write_file_uses_printf():
@@ -419,6 +436,20 @@ def test_build_messages_replays_full_write_content_for_cache_stability():
     msgs = build_messages(instruction="do", working_dir="/w", trajectory=trajectory)
     args = json.loads(msgs[2]["tool_calls"][0]["function"]["arguments"])
     assert args["content"] == long
+
+
+def test_build_messages_emits_alphabetically_sorted_tool_arguments():
+    # The replayed `arguments` JSON must stay byte-stable and alphabetically
+    # keyed (sort_keys), independent of dataclass field order, so the prompt
+    # prefix is cache-stable.
+    trajectory = (
+        (ReadFileAction(path="/x", start_line=1, end_line=10), RawState(return_code=0)),
+    )
+    msgs = build_messages(instruction="do", working_dir="/w", trajectory=trajectory)
+    assert (
+        msgs[2]["tool_calls"][0]["function"]["arguments"]
+        == '{"end_line":10,"path":"/x","start_line":1}'
+    )
 
 
 def test_build_messages_prefix_is_byte_stable_when_step_appended():
