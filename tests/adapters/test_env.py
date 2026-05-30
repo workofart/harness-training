@@ -222,6 +222,66 @@ def test_harbor_exec_overlaps_without_semaphore(tmp_path: Path) -> None:
     assert order[:2] == ["enter:a", "enter:b"]
 
 
+def test_harbor_reset_serializes_startup_under_shared_semaphore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor.environments.factory import EnvironmentFactory
+
+    order: list[str] = []
+
+    class FakeEnvironment:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def start(self, *, force_build: bool) -> None:
+            del force_build
+            order.append(f"enter:{self.name}")
+            await asyncio.sleep(0.01)
+            order.append(f"exit:{self.name}")
+
+        async def exec(self, *, command, cwd=None, timeout_sec=None):
+            del cwd, timeout_sec
+            assert command == "pwd"
+            return ExecResult(return_code=0, stdout="/app\n", stderr="")
+
+    def fake_create_environment_from_config(**kwargs):
+        return FakeEnvironment(kwargs["environment_name"])
+
+    monkeypatch.setattr(
+        EnvironmentFactory,
+        "create_environment_from_config",
+        staticmethod(fake_create_environment_from_config),
+    )
+    task_a = tmp_path / "task-a"
+    task_b = tmp_path / "task-b"
+    _write_minimal_task(task_a)
+    _write_minimal_task(task_b)
+    config = HarborConfig(experiments_dir=tmp_path / "experiments")
+    exec_semaphore = asyncio.Semaphore(1)
+    harbor_a = Harbor(
+        config,
+        task_name="task-a",
+        task_dir=task_a,
+        exec_semaphore=exec_semaphore,
+    )
+    harbor_b = Harbor(
+        config,
+        task_name="task-b",
+        task_dir=task_b,
+        exec_semaphore=exec_semaphore,
+    )
+
+    async def go():
+        await asyncio.gather(harbor_a.reset(), harbor_b.reset())
+
+    asyncio.run(go())
+
+    assert order in (
+        ["enter:task-a", "exit:task-a", "enter:task-b", "exit:task-b"],
+        ["enter:task-b", "exit:task-b", "enter:task-a", "exit:task-a"],
+    )
+
+
 def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:
     """Build a Harbor whose session.environment.exec follows a scripted
     sequence (`exec_side_effect`), with a real on-disk bootstrap log dir so we

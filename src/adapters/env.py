@@ -285,16 +285,17 @@ class Harbor:
             task_env_config=task.config.environment,
         )
         try:
-            await harbor_environment.start(
-                force_build=self.config.environment.force_build
-            )
-            self._attach_session(
-                task=task,
-                trial_paths=trial_paths,
-                harbor_environment=harbor_environment,
-            )
-            await self._bootstrap_environment()
-            working_dir = await self._detect_working_dir()
+            async with self._env_gate():
+                await harbor_environment.start(
+                    force_build=self.config.environment.force_build
+                )
+                self._attach_session(
+                    task=task,
+                    trial_paths=trial_paths,
+                    harbor_environment=harbor_environment,
+                )
+                await self._bootstrap_environment()
+                working_dir = await self._detect_working_dir()
             return RawState(
                 instruction=task.instruction,
                 working_dir=working_dir,
@@ -306,7 +307,7 @@ class Harbor:
     def _env_gate(self):
         """Per-call gate around container CPU work. Returns the shared env-exec
         semaphore when configured, else a no-op context. Acquired only around
-        one exec/verify, never across an LLM round-trip."""
+        reset/startup, one exec, or one verify; never across an LLM round-trip."""
         if self._exec_semaphore is None:
             return contextlib.nullcontext()
         return self._exec_semaphore
