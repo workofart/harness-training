@@ -791,7 +791,7 @@ def format_panel_progress(
     trials_planned: int,
     solved: int,
     decided: int,
-    crash_trials: int,
+    error_trials: int,
     in_flight: int,
     elapsed_sec: float,
 ) -> str:
@@ -804,7 +804,8 @@ def format_panel_progress(
     detail text rather than driving the bar. `solved`/`decided` mirror the
     record's live counts: `decided` is tasks with at least one valid trial.
     ETA divides remaining tasks by the observed task-completion wall rate,
-    which already absorbs the configured concurrency.
+    which already absorbs the configured concurrency. The progress line is
+    event-driven: elapsed/ETA refresh only when a task result is persisted.
     """
     frac = tasks_done / total_tasks if total_tasks else 0.0
     filled = int(frac * PROGRESS_BAR_WIDTH)
@@ -813,11 +814,11 @@ def format_panel_progress(
         rate = tasks_done / elapsed_sec
         eta = f"~{_format_hms((total_tasks - tasks_done) / rate)} left"
     else:
-        eta = "~--m left"
+        eta = "~-- left"
     return (
         f"[{bar}] {tasks_done}/{total_tasks} tasks ({frac * 100:.0f}%) | "
         f"trials {trials_done}/{trials_planned} | "
-        f"solved {solved}/{decided} | crash {crash_trials} | run {in_flight} | "
+        f"solved {solved}/{decided} | errors {error_trials} | active {in_flight} | "
         f"{_format_hms(elapsed_sec)} elapsed, {eta}"
     )
 
@@ -862,7 +863,7 @@ class PanelProgressReporter:
             trials_planned=trials_planned,
             solved=record.train_solved_count or 0,
             decided=decided,
-            crash_trials=trials_done - valid_done,
+            error_trials=trials_done - valid_done,
             in_flight=in_flight,
             elapsed_sec=time.monotonic() - self._start,
         )
