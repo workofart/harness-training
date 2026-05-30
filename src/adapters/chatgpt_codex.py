@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
 from src.adapters.llm_base import (
     BaseLlm,
     LlmCompletion,
@@ -27,6 +29,10 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 TOKEN_REFRESH_SKEW_SECONDS = 60
 
+RETRYABLE_STATUS_CODES = frozenset({408, 500, 502, 503, 524, 529})
+
+logger = logging.getLogger(__name__)
+
 
 class ChatGptCodexError(RuntimeError):
     pass
@@ -34,6 +40,22 @@ class ChatGptCodexError(RuntimeError):
 
 class ChatGptCodexUnauthorizedError(ChatGptCodexError):
     pass
+
+
+class ChatGptCodexResponseError(ChatGptCodexError):
+    """A Codex completion returned a non-success HTTP status other than 401."""
+
+    def __init__(self, *, status_code: int, message: str) -> None:
+        super().__init__(f"Codex completion failed: HTTP {status_code}: {message}")
+        self.status_code = status_code
+
+
+def _is_retryable_infra_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, ChatGptCodexResponseError):
+        return exc.status_code in RETRYABLE_STATUS_CODES
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +169,27 @@ class ChatGptCodex(BaseLlm):
             tools=tools,
             reasoning_effort=reasoning_effort,
         )
+
+        def _log_infra_retry(retry: int, exc: Exception) -> None:
+            logger.warning(
+                "Codex completion failed; retrying (%d/%d): %s: %s",
+                retry,
+                INFRA_RETRY_BUDGET,
+                type(exc).__name__,
+                exc,
+            )
+
+        return await retry_transient(
+            lambda: self._complete_with_auth(body=body),
+            is_transient=_is_retryable_infra_error,
+            on_retry=_log_infra_retry,
+        )
+
+    async def _complete_with_auth(self, *, body: dict[str, Any]) -> LlmCompletion:
+        """One completion attempt. Refreshes the access token once on a 401 and
+        retries that single attempt; a repeated 401 is terminal. Transport
+        failures (including during a proactive token refresh in `_current_auth`)
+        propagate so the bounded retry in `complete()` can handle them."""
         auth = await self._current_auth()
         try:
             return await self._post_completion(body=body, auth=auth)
@@ -190,8 +233,9 @@ class ChatGptCodex(BaseLlm):
                 raise ChatGptCodexUnauthorizedError("Codex backend returned HTTP 401")
             if response.status_code >= 400:
                 text = await _read_response_text(response)
-                raise ChatGptCodexError(
-                    f"Codex completion failed: HTTP {response.status_code}: {text}"
+                raise ChatGptCodexResponseError(
+                    status_code=response.status_code,
+                    message=text,
                 )
             return _completion_from_events(
                 [event async for event in _iter_sse_json(response)]

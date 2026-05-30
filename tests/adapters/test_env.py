@@ -150,6 +150,72 @@ def test_harbor_exec_propagates_non_timeout_runtime_error(tmp_path: Path) -> Non
         asyncio.run(harbor.exec(command="ls"))
 
 
+def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:
+    """Build a Harbor whose session.environment.exec follows a scripted
+    sequence (`exec_side_effect`), with a real on-disk bootstrap log dir so we
+    can assert the artifacts `_bootstrap_environment` leaves behind."""
+    config = HarborConfig(
+        experiments_dir=tmp_path / "experiments",
+        bootstrap_commands=("apt-get update",),
+        bootstrap_timeout_sec=600,
+    )
+    harbor = Harbor(config, task_name="task-a", task_dir=tmp_path / "task")
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir(parents=True)
+    fake_session = MagicMock()
+    fake_session.environment.upload_file = AsyncMock()
+    fake_session.environment.exec = AsyncMock(side_effect=exec_side_effect)
+    fake_session.trial_paths.trial_dir = trial_dir
+    harbor._session = fake_session
+    return harbor
+
+
+def test_bootstrap_retries_command_timeout_then_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A transient bootstrap timeout (Harbor raises RuntimeError("Command timed
+    # out after N seconds")) is retried within the trial; a later success
+    # resolves it without surfacing a crash.
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    harbor = _stub_harbor_for_bootstrap(
+        tmp_path,
+        exec_side_effect=[
+            RuntimeError("Command timed out after 600 seconds"),
+            ExecResult(return_code=0, stdout="done", stderr=""),
+        ],
+    )
+
+    asyncio.run(harbor._bootstrap_environment())
+
+    assert harbor.session.environment.exec.await_count == 2
+    bootstrap_dir = tmp_path / "trial" / "bootstrap"
+    assert (bootstrap_dir / "return-code.txt").read_text() == "0"
+    assert not (bootstrap_dir / "status.txt").exists()
+
+
+def test_bootstrap_timeout_exhausts_budget_and_marks_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A persistent bootstrap timeout exhausts the within-trial budget and
+    # re-raises; the only debuggable artifact (Harbor discards partial output on
+    # timeout) is a status.txt marker recording the exhausted timeout.
+    from src.adapters.infra_retry import INFRA_RETRY_BUDGET
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    harbor = _stub_harbor_for_bootstrap(
+        tmp_path,
+        exec_side_effect=RuntimeError("Command timed out after 600 seconds"),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio.run(harbor._bootstrap_environment())
+
+    assert harbor.session.environment.exec.await_count == INFRA_RETRY_BUDGET + 1
+    status = (tmp_path / "trial" / "bootstrap" / "status.txt").read_text()
+    assert "timed out" in status
+    assert "retries exhausted" in status
+
+
 def _stub_docker_environment(*, session_id: str) -> DockerEnvironment:
     env = object.__new__(DockerEnvironment)
     env.session_id = session_id

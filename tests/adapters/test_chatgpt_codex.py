@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
+import pytest
+
 import src.adapters.chatgpt_codex as chatgpt_codex_module
+from src.adapters.infra_retry import INFRA_RETRY_BUDGET
 from src.harness.config import ChatGptCodexConfig
 
 
@@ -203,3 +207,187 @@ def test_complete_posts_codex_sse_and_normalizes_tool_call():
     assert completion.usage.completion_tokens == 5
     assert completion.usage.cached_input_tokens == 3
     assert completion.usage.reasoning_tokens == 2
+
+
+# --- Transient-failure retry policy -----------------------------------------
+
+_GOOD_SSE_LINES = [
+    'data: {"type":"response.completed","response":{"id":"resp_ok",'
+    '"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}',
+    "data: [DONE]",
+]
+
+
+class _Response:
+    """A streamed Codex response: a status code plus SSE lines or error body."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        lines: list[str] | None = None,
+    ):
+        self.status_code = status_code
+        self._lines = lines if lines is not None else _GOOD_SSE_LINES
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aread(self) -> bytes:
+        return "\n".join(self._lines).encode()
+
+
+class _Stream:
+    """Async context manager mimicking `httpx.AsyncClient.stream`. Either raises
+    a transport error on entry or hands back a `_Response`."""
+
+    def __init__(
+        self,
+        *,
+        response: _Response | None = None,
+        enter_error: Exception | None = None,
+    ):
+        self._response = response
+        self._enter_error = enter_error
+
+    async def __aenter__(self) -> _Response:
+        if self._enter_error is not None:
+            raise self._enter_error
+        assert self._response is not None
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _SequencedClient:
+    """Returns one queued outcome per `stream()` call. A queued `Exception` is
+    raised on stream entry (transport failure); a `_Response` is served."""
+
+    def __init__(self, steps: list[Exception | _Response]):
+        self._steps = list(steps)
+        self.stream_calls = 0
+
+    def stream(self, method, url, *, json, headers) -> _Stream:
+        del method, url, json, headers
+        self.stream_calls += 1
+        step = self._steps.pop(0)
+        if isinstance(step, Exception):
+            return _Stream(enter_error=step)
+        return _Stream(response=step)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _StaticAuthStore:
+    """Loads a never-expiring token and counts refreshes."""
+
+    def __init__(self):
+        self.refresh_count = 0
+
+    def load(self):
+        return chatgpt_codex_module._CodexAuth(
+            access_token=_jwt({"exp": 4_102_444_800}),
+            id_token=_jwt({}),
+            refresh_token="refresh-token",
+            account_id="acct_123",
+        )
+
+    async def refresh(self, *, http_client):
+        del http_client
+        self.refresh_count += 1
+        return self.load()
+
+
+def _make_llm(*, client: _SequencedClient, auth_store: _StaticAuthStore):
+    return chatgpt_codex_module.ChatGptCodex(
+        config=ChatGptCodexConfig(
+            model_name="gpt-5.5",
+            max_context_length=200_000,
+            timeout_seconds=10.0,
+        ),
+        auth_store=auth_store,
+        http_client=client,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """Collapse the bounded-retry backoff so tests don't actually sleep."""
+
+    async def _sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+
+
+def test_complete_retries_transport_error_then_succeeds():
+    client = _SequencedClient([httpx.RemoteProtocolError("peer reset"), _Response()])
+    llm = _make_llm(client=client, auth_store=_StaticAuthStore())
+
+    completion = asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert completion.content == "ok"
+    assert client.stream_calls == 2
+
+
+def test_complete_retries_retryable_status_then_succeeds():
+    client = _SequencedClient(
+        [_Response(status_code=503, lines=["overloaded"]), _Response()]
+    )
+    llm = _make_llm(client=client, auth_store=_StaticAuthStore())
+
+    completion = asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert completion.content == "ok"
+    assert client.stream_calls == 2
+
+
+def test_complete_exhausts_budget_on_persistent_transport_error():
+    client = _SequencedClient(
+        [httpx.ReadError("eof") for _ in range(INFRA_RETRY_BUDGET + 1)]
+    )
+    llm = _make_llm(client=client, auth_store=_StaticAuthStore())
+
+    with pytest.raises(httpx.ReadError):
+        asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert client.stream_calls == INFRA_RETRY_BUDGET + 1
+
+
+def test_complete_does_not_retry_http_400():
+    client = _SequencedClient([_Response(status_code=400, lines=["bad request"])])
+    llm = _make_llm(client=client, auth_store=_StaticAuthStore())
+
+    with pytest.raises(chatgpt_codex_module.ChatGptCodexResponseError) as excinfo:
+        asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert excinfo.value.status_code == 400
+    assert client.stream_calls == 1
+
+
+def test_complete_refreshes_once_on_401_then_succeeds():
+    client = _SequencedClient([_Response(status_code=401), _Response()])
+    auth_store = _StaticAuthStore()
+    llm = _make_llm(client=client, auth_store=auth_store)
+
+    completion = asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert completion.content == "ok"
+    assert auth_store.refresh_count == 1
+    assert client.stream_calls == 2
+
+
+def test_complete_repeated_401_is_terminal():
+    client = _SequencedClient([_Response(status_code=401), _Response(status_code=401)])
+    auth_store = _StaticAuthStore()
+    llm = _make_llm(client=client, auth_store=auth_store)
+
+    with pytest.raises(chatgpt_codex_module.ChatGptCodexUnauthorizedError):
+        asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    # One refresh after the first 401; the second 401 is not retried.
+    assert auth_store.refresh_count == 1
+    assert client.stream_calls == 2

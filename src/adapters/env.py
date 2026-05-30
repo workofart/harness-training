@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # behind first call to reset() / download path keeps `uv run exp` cold-start
 # fast and shaves cost from invocations that never reach those paths.
 
+from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
 from src.harness.contracts import RawState
 
 DEFAULT_HARBOR_CONFIG_PATH = (
@@ -32,6 +33,13 @@ DEFAULT_HARBOR_CONFIG_PATH = (
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
 
 logger = logging.getLogger(__name__)
+
+
+def _is_command_timeout(exc: Exception) -> bool:
+    # Harbor's docker/gke backends signal a per-command timeout only as a
+    # RuntimeError whose message contains "timed out"; there is no typed
+    # timeout exception to match on.
+    return isinstance(exc, RuntimeError) and "timed out" in str(exc).lower()
 
 
 @dataclass
@@ -173,11 +181,41 @@ class Harbor:
             source_path=script_path,
             target_path=remote_script_path,
         )
-        result = await self.session.environment.exec(
-            command=f"bash {remote_script_path}",
-            env={"DEBIAN_FRONTEND": "noninteractive"},
-            timeout_sec=self.config.bootstrap_timeout_sec,
-        )
+
+        timeout_sec = self.config.bootstrap_timeout_sec
+
+        async def run_bootstrap() -> ExecResult:
+            return await self.session.environment.exec(
+                command=f"bash {remote_script_path}",
+                env={"DEBIAN_FRONTEND": "noninteractive"},
+                timeout_sec=timeout_sec,
+            )
+
+        def _log_retry(retry: int, exc: Exception) -> None:
+            logger.warning(
+                "bootstrap timed out for task %s; retrying (%d/%d): %s",
+                self.task_name,
+                retry,
+                INFRA_RETRY_BUDGET,
+                exc,
+            )
+
+        try:
+            result = await retry_transient(
+                run_bootstrap,
+                is_transient=_is_command_timeout,
+                on_retry=_log_retry,
+            )
+        except RuntimeError as exc:
+            # Harbor discards the command's partial output when it times out, so
+            # the only debuggable artifact we can leave for a timed-out bootstrap
+            # is a marker recording that it timed out after the budget.
+            if _is_command_timeout(exc):
+                (bootstrap_dir / "status.txt").write_text(
+                    f"timed out after {timeout_sec}s (retries exhausted): {exc}\n"
+                )
+            raise
+
         (bootstrap_dir / "return-code.txt").write_text(str(result.return_code))
         if result.stdout is not None:
             (bootstrap_dir / "stdout.txt").write_text(result.stdout)
@@ -248,10 +286,9 @@ class Harbor:
             # Harbor's docker/gke backends raise RuntimeError on per-command
             # timeout instead of returning a failed ExecResult. Convert into a
             # failed observation so the agent sees the timeout and can pick a
-            # longer `timeout_sec` or a different approach. Match narrowly on
-            # "timed out" so other RuntimeErrors (e.g. container crash) still
-            # surface as trial-fatal.
-            if "timed out" not in str(exc).lower():
+            # longer `timeout_sec` or a different approach. Other RuntimeErrors
+            # (e.g. container crash) still surface as trial-fatal.
+            if not _is_command_timeout(exc):
                 raise
             return RawState(
                 return_code=124,

@@ -47,7 +47,7 @@ Do not edit runner state by hand:
 
 A candidate is evaluated against the active baseline with per-task two-sided exact binomial tests at alpha = 0.05 against the baseline solve rate.
 
-1. A per-trial infrastructure failure concludes that trial as a terminal `crash`, excluded from all evidence, with no effect on the experiment status or other trials (and it is not re-run). Experiment-level failures still make the experiment `crash`: setup, task resolution, evaluation, or a run that produced zero valid trials across the whole panel. A baseline run that crashes is not promoted — no baseline is installed and the next `uv run auto` reruns it.
+1. A per-trial infrastructure failure is retried within the trial on a bounded internal budget. If it still fails, the trial concludes as a terminal `crash`, excluded from all evidence, with no effect on the experiment status or other trials (and it is not re-run). Experiment-level failures still make the experiment `crash`: setup, task resolution, evaluation, or a run that produced zero valid trials across the whole panel. A baseline run that crashes is not promoted; no baseline is installed and the next `uv run auto` reruns it.
 2. If there is no baseline yet, `uv run auto` first runs the current panel as a kept baseline, then starts candidate search.
 3. Otherwise `keep` iff some train task significantly improved (p < 0.05, candidate rate above baseline) AND no train task significantly regressed (p < 0.05, candidate rate below baseline). A task with no baseline samples counts as "improved" if the candidate majority-solves it. Else `discard`.
 
@@ -93,7 +93,7 @@ The supervisor enforces every rule above and will reject candidates that violate
 ## Post-Run Diagnosis
 
 1. Read the concluded experiment record, surfaced evidence artifacts, and `experiments/learning.md`.
-2. Use trace evidence (`agent/steps.jsonl`, `agent/metrics.json`) to reason about whether the candidate's mechanism reached its intended state transitions. Start with `metrics.json.rule_fires` (mechanism instrumentation) and `metrics.json.failure_mode` (per-trial terminal-state bucket: `solved | verified_rejected | never_verified | hit_step_cap | hit_timeout | crash`, where `crash` is an infra failure excluded from evidence).
+2. Use trace evidence (`agent/steps.jsonl`, `agent/metrics.json`) to reason about whether the candidate's mechanism reached its intended state transitions. Start with `metrics.json.rule_fires` (mechanism instrumentation) and `metrics.json.failure_mode` (per-trial terminal-state bucket: `solved | verified_rejected | never_verified | hit_step_cap | hit_timeout | crash`, where `crash` is an infra failure that exhausted internal retries and is excluded from evidence).
 3. Update only `experiments/learning.md`. Keep it concise, cumulative, generic, and organized by stable harness-design domains.
 4. Stop when the memo update is complete.
 
