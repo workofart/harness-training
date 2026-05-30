@@ -116,3 +116,11 @@ def test_main_auto_returns_130_on_keyboard_interrupt(monkeypatch):
     monkeypatch.setitem(sys.modules, "src.control.supervisor", fake_supervisor_module)
 
     assert cli.main_auto() == 130
+
+
+def test_load_llm_provider_secret_skips_openrouter_key_for_chatgpt():
+    harness_config = types.SimpleNamespace(
+        llm_provider_config=types.SimpleNamespace(provider="chatgpt_codex")
+    )
+
+    assert cli._load_llm_provider_secret(harness_config=harness_config) is None

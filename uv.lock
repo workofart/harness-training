@@ -927,6 +927,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "harbor" },
+    { name = "httpx" },
     { name = "openrouter" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -943,6 +944,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "harbor", specifier = "==0.1.45" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "openrouter", specifier = "==0.9.1" },
     { name = "pydantic", specifier = "==2.12.5" },
     { name = "python-dotenv", specifier = "==1.2.2" },

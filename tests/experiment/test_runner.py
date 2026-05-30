@@ -111,6 +111,25 @@ def _run_panel_for_experiment_runner(
     )
 
 
+def test_make_llm_for_config_builds_chatgpt_adapter(monkeypatch):
+    runner = _load_experiment_runner()
+    fake_chatgpt_module = types.ModuleType("src.adapters.chatgpt_codex")
+    calls: dict[str, object] = {}
+
+    class FakeChatGptCodex:
+        def __init__(self, *, config):
+            calls["config"] = config
+
+    fake_chatgpt_module.ChatGptCodex = FakeChatGptCodex
+    monkeypatch.setitem(sys.modules, "src.adapters.chatgpt_codex", fake_chatgpt_module)
+    config = types.SimpleNamespace(provider="chatgpt_codex")
+
+    llm = runner._make_llm_for_config(config=config, api_key=None)
+
+    assert isinstance(llm, FakeChatGptCodex)
+    assert calls["config"] is config
+
+
 class _FakeHarborConfig(SimpleNamespace):
     def model_copy(self, *, update):
         return _FakeHarborConfig(**{**self.__dict__, **update})

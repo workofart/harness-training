@@ -25,7 +25,7 @@ from src.metrics import (
 
 if TYPE_CHECKING:
     from src.adapters.env import HarborConfig
-    from src.harness.config import HarnessConfig
+    from src.harness.config import HarnessConfig, LlmProviderConfig
 
 
 EXPERIMENT_FILENAME = "experiment.json"
@@ -855,6 +855,20 @@ async def _run_panel(
     await asyncio.gather(*(run_task_trials(task_id) for task_id in task_names))
 
 
+def _make_llm_for_config(*, config: LlmProviderConfig, api_key: str | None):
+    match config.provider:
+        case "openrouter":
+            if api_key is None:
+                raise ValueError("OPENROUTER_API_KEY is not set")
+            from src.adapters.open_router import OpenRouter
+
+            return OpenRouter(config=config, api_key=api_key)
+        case "chatgpt_codex":
+            from src.adapters.chatgpt_codex import ChatGptCodex
+
+            return ChatGptCodex(config=config)
+
+
 class ExperimentRunner:
     @classmethod
     def run_baseline_at_head(
@@ -862,7 +876,7 @@ class ExperimentRunner:
         *,
         harness_config: HarnessConfig,
         harbor_config: HarborConfig,
-        api_key: str,
+        api_key: str | None,
         decision_reason: Literal["baseline seed", "baseline rerun"] = "baseline rerun",
         experiment_id: str | None = None,
         started_at: str | None = None,
@@ -932,7 +946,6 @@ class ExperimentRunner:
 
         try:
             from src.adapters.env import Harbor
-            from src.adapters.open_router import OpenRouter
 
             trial_harbor_config = harbor_config.model_copy(
                 update={"experiments_dir": experiment_dir / "tasks"}
@@ -948,7 +961,7 @@ class ExperimentRunner:
                     task_names=harness_config.train_task_names,
                     task_dirs=task_dirs,
                     harness_config=harness_config,
-                    make_llm=lambda: OpenRouter(
+                    make_llm=lambda: _make_llm_for_config(
                         config=harness_config.llm_provider_config,
                         api_key=api_key,
                     ),
@@ -983,7 +996,7 @@ class ExperimentRunner:
         *,
         harness_config: HarnessConfig,
         harbor_config: HarborConfig,
-        api_key: str,
+        api_key: str | None,
         require_clean_worktree: bool = True,
     ) -> None:
         self.harness_config = harness_config
@@ -1023,9 +1036,7 @@ class ExperimentRunner:
         )
 
     def _make_llm(self):
-        from src.adapters.open_router import OpenRouter
-
-        return OpenRouter(
+        return _make_llm_for_config(
             config=self.harness_config.llm_provider_config,
             api_key=self.api_key,
         )

@@ -34,7 +34,9 @@
   "task_trials": 1,
 
   "llm_provider_config": {
-    // Only OpenRouter is supported by the current config model.
+    // Supported providers: "openrouter" or experimental "chatgpt_codex".
+    // For "chatgpt_codex", run `codex login` first and provide
+    // "model_name" plus explicit "max_context_length".
     "provider": "openrouter",
 
     // OpenRouter model identifier.

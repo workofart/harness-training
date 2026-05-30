@@ -357,13 +357,15 @@ def _cleanup_orphaned_experiment_artifacts(
 def _load_runtime(
     *,
     repo_root: Path,
-) -> tuple[HarborConfig, str]:
-    from src.adapters.open_router import load_openrouter_api_key
-
+) -> tuple[HarborConfig, str | None]:
     harbor_config_path = repo_root.resolve() / "config" / "harbor_config.toml"
-    return HarborConfig.from_toml(harbor_config_path), load_openrouter_api_key(
-        dotenv_path=repo_root.resolve() / ".env"
-    )
+    harness_config = load_harness_config_for_repo(repo_root)
+    api_key: str | None = None
+    if harness_config.llm_provider_config.provider == "openrouter":
+        from src.adapters.open_router import load_openrouter_api_key
+
+        api_key = load_openrouter_api_key(dotenv_path=repo_root.resolve() / ".env")
+    return HarborConfig.from_toml(harbor_config_path), api_key
 
 
 def build_prelaunch_prompt(
