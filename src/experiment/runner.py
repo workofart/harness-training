@@ -95,6 +95,25 @@ def _schedule_order(
 PROGRESS_BAR_WIDTH = 24
 
 
+def _next_trial_admission_count(
+    *,
+    solved: int,
+    finished: int,
+    expected_total: int,
+) -> int:
+    if is_majority_decided(
+        solved=solved, finished=finished, expected_total=expected_total
+    ):
+        return 0
+    final_threshold = (expected_total + 1) // 2
+    failed = finished - solved
+    return min(
+        expected_total - finished,
+        final_threshold - solved,
+        final_threshold - failed,
+    )
+
+
 def _format_hms(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
@@ -273,9 +292,19 @@ async def _run_panel(
             remaining_budget = trials.expected_trial_count - len(trials.finished_trials)
             if remaining_budget <= 0:
                 break
+            admission_count = min(
+                remaining_budget,
+                _next_trial_admission_count(
+                    solved=trials.solved_count,
+                    finished=len(trials.valid_trials),
+                    expected_total=trials.expected_trial_count,
+                ),
+            )
+            if admission_count <= 0:
+                break
             in_flight: set[asyncio.Task[None]] = {
                 asyncio.create_task(run_one_trial(task_id))
-                for _ in range(remaining_budget)
+                for _ in range(admission_count)
             }
             try:
                 while in_flight:
