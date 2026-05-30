@@ -1653,8 +1653,6 @@ def test_panel_progress_reporter_draws_and_finalizes_on_tty():
 
 
 def test_panel_progress_reporter_maps_record_counts_to_line():
-    task_result_cls = _install_harness_stubs()
-    runner = _load_experiment_runner()
     record = runner.ExperimentRecord.initialize(
         experiment_id="exp-progress",
         git_commit_hash="abc123",
@@ -1670,7 +1668,6 @@ def test_panel_progress_reporter_maps_record_counts_to_line():
 
     record.record_task_result(
         _task_result(
-            task_result_cls,
             task_name="train-a",
             reward=None,
             error="reset failed",

@@ -20,7 +20,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
 from src.harness.contracts import TaskResult
-from src.metrics import BaselineComparison, is_majority_solved
+from src.metrics import BaselineComparison, TaskMetrics, is_majority_solved
 
 
 EXPERIMENT_FILENAME = "experiment.json"
@@ -510,6 +510,7 @@ def _terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
         solved=False,
         error=error,
         steps_used=0,
+        metrics=TaskMetrics(failure_mode="crash"),
         started_at=finished_at,
         finished_at=finished_at,
     )

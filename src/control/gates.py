@@ -112,9 +112,7 @@ def validate_learning_memo_update(
 
 
 def _load_head_harness_config_for_repo(repo_root: Path) -> HarnessConfig:
-    payload = control_repo.git_show_at_head(
-        "config/harness_config.json", cwd=repo_root
-    )
+    payload = control_repo.git_show_at_head("config/harness_config.json", cwd=repo_root)
     return HarnessConfig.model_validate_json(payload)
 
 
