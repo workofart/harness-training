@@ -161,52 +161,47 @@ def _write_baseline_record(
     return baseline
 
 
-def _baseline_with_durations(durations_sec: dict[str, float]):
-    baseline = ExperimentRecord.initialize(
-        experiment_id="baseline",
-        git_commit_hash="abc",
-        parent_baseline_experiment_id=None,
-        train_task_ids=list(durations_sec),
-        started_at="2026-04-10T00:00:00+00:00",
-        expected_trial_count=1,
-    )
-    for task_id, seconds in durations_sec.items():
-        end_min, end_sec = divmod(int(seconds), 60)
-        baseline.record_task_result(
-            TaskResult(
-                task_name=task_id,
-                reward=1.0,
-                solved=True,
-                steps_used=1,
-                started_at="2026-04-10T00:00:00+00:00",
-                finished_at=f"2026-04-10T00:{end_min:02d}:{end_sec:02d}+00:00",
-            )
-        )
-    return baseline
+def test_schedule_order_sorts_by_descending_duration_prior():
+    duration_priors = {"short": 1, "long": 100, "mid": 10}
 
-
-def test_schedule_order_sorts_by_descending_baseline_duration():
-    baseline = _baseline_with_durations({"short": 1, "long": 100, "mid": 10})
-
-    order = runner._schedule_order(["short", "long", "mid"], baseline)
+    order = runner._schedule_order(["short", "long", "mid"], duration_priors)
 
     assert order == ["long", "mid", "short"]
 
 
-def test_schedule_order_falls_back_to_config_order_without_baseline():
-    assert runner._schedule_order(["a", "b", "c"], None) == ["a", "b", "c"]
+def test_schedule_order_falls_back_to_config_order_without_priors():
+    assert runner._schedule_order(["a", "b", "c"], {}) == ["a", "b", "c"]
 
 
 def test_schedule_order_keeps_config_order_for_equal_durations():
-    # Stable sort: equal-cost ties (and tasks absent from the baseline) keep
+    # Stable sort: equal-cost ties (and tasks absent from the prior) keep
     # their config order rather than shuffling.
-    baseline = _baseline_with_durations({"a": 5, "b": 5})
+    duration_priors = {"a": 5, "b": 5}
 
-    assert runner._schedule_order(["a", "b", "unseen"], baseline) == [
+    assert runner._schedule_order(["a", "b", "unseen"], duration_priors) == [
         "a",
         "b",
         "unseen",
     ]
+
+
+def test_load_task_duration_priors(tmp_path):
+    path = tmp_path / "task_duration_priors.json"
+    path.write_text(
+        json.dumps(
+            {
+                "task_duration_seconds": {
+                    "slow": 12,
+                    "fast": 1.5,
+                }
+            }
+        )
+    )
+
+    assert runner._load_task_duration_priors(path) == {
+        "slow": 12.0,
+        "fast": 1.5,
+    }
 
 
 def test_run_panel_early_stops_after_majority_decided_when_trials_agree(

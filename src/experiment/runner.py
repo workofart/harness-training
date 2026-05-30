@@ -9,6 +9,7 @@ statistics in ``gate.py``.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -39,6 +40,11 @@ if TYPE_CHECKING:
     from src.harness.config import HarnessConfig, LlmProviderConfig
 
 
+DEFAULT_TASK_DURATION_PRIORS_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "task_duration_priors.json"
+)
+
+
 def _prepare_task_dirs(
     *,
     trial_harbor_config: HarborConfig,
@@ -49,39 +55,41 @@ def _prepare_task_dirs(
     return dict(TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names)))
 
 
+def _load_task_duration_priors(
+    path: Path = DEFAULT_TASK_DURATION_PRIORS_PATH,
+) -> dict[str, float]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text())
+    return {
+        str(task_id): float(seconds)
+        for task_id, seconds in payload["task_duration_seconds"].items()
+    }
+
+
 def _schedule_order(
     task_names: Sequence[str],
-    baseline: ExperimentRecord | None,
+    duration_priors: Mapping[str, float] | None = None,
 ) -> list[str]:
     """Longest-task-first (LPT) launch order to minimize panel makespan.
 
     Trials acquire the trial semaphore FIFO in the order tasks are launched, and
     makespan on a fixed worker pool is tail-dominated: a long task admitted late
-    hangs off the end with nothing to overlap it. Ordering by the baseline's
+    hangs off the end with nothing to overlap it. Ordering by historical
     per-task wall-time (descending) starts the long poles first so short tasks
     fill the tail. Reorders only the launch sequence — `train_task_ids`, the
     record, and the (task-id-keyed) gate are order-independent, so outcomes are
-    untouched. Falls back to config order when there is no baseline prior.
+    untouched. Falls back to config order for tasks absent from the prior.
     """
     names = list(task_names)
-    if baseline is None:
-        return names
-
-    def cost(task_id: str) -> float:
-        trials = baseline.train_task_results.get(task_id)
-        if trials is None:
-            return 0.0
-        total = 0.0
-        for trial in trials.trials:
-            if trial.started_at and trial.finished_at:
-                total += (
-                    datetime.fromisoformat(trial.finished_at)
-                    - datetime.fromisoformat(trial.started_at)
-                ).total_seconds()
-        return total
+    resolved_priors = (
+        _load_task_duration_priors() if duration_priors is None else duration_priors
+    )
 
     # Stable sort (reverse=True keeps equal-cost ties in config order).
-    return sorted(names, key=cost, reverse=True)
+    return sorted(
+        names, key=lambda task_id: resolved_priors.get(task_id, 0.0), reverse=True
+    )
 
 
 PROGRESS_BAR_WIDTH = 24
@@ -415,9 +423,7 @@ class ExperimentRunner:
                 _run_panel(
                     record=record,
                     experiments_root=experiments_root,
-                    task_names=_schedule_order(
-                        harness_config.train_task_names, baseline
-                    ),
+                    task_names=_schedule_order(harness_config.train_task_names),
                     task_dirs=task_dirs,
                     harness_config=harness_config,
                     make_llm=lambda: _make_llm_for_config(
@@ -568,9 +574,7 @@ class ExperimentRunner:
             await _run_panel(
                 record=self.record,
                 experiments_root=self.experiments_root,
-                task_names=_schedule_order(
-                    self.harness_config.train_task_names, baseline
-                ),
+                task_names=_schedule_order(self.harness_config.train_task_names),
                 task_dirs=self._task_dirs,
                 harness_config=self.harness_config,
                 make_llm=self._make_llm,
