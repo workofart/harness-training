@@ -2866,3 +2866,180 @@ def test_build_pooled_control_samples_filters_records_and_trials(pool_case):
     )
 
     assert pool == pool_case["expected"]
+
+
+class _FakeStream:
+    def __init__(self, *, is_tty: bool) -> None:
+        self._is_tty = is_tty
+        self.buffer: list[str] = []
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+    def write(self, text: str) -> int:
+        self.buffer.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    @property
+    def text(self) -> str:
+        return "".join(self.buffer)
+
+
+def test_format_panel_progress_anchors_on_tasks_and_computes_eta():
+    runner = _load_experiment_runner()
+    line = runner.format_panel_progress(
+        tasks_done=25,
+        total_tasks=100,
+        trials_done=80,
+        trials_planned=320,
+        solved=17,
+        decided=24,
+        error_trials=6,
+        in_flight=10,
+        elapsed_sec=3600,
+    )
+    assert "25/100 tasks (25%)" in line
+    assert "trials 80/320" in line
+    assert "solved 17/24" in line
+    assert "errors 6" in line
+    assert "active 10" in line
+    # 25 tasks in 1h -> 75 remaining at 25/h -> 3h elapsed-equivalent left.
+    assert "1h00m elapsed" in line
+    assert "~3h00m left" in line
+    # Bar fill is proportional to task completion.
+    assert line.count("#") == int(0.25 * runner.PROGRESS_BAR_WIDTH)
+
+
+def test_format_panel_progress_unknown_eta_before_first_task():
+    runner = _load_experiment_runner()
+    line = runner.format_panel_progress(
+        tasks_done=0,
+        total_tasks=10,
+        trials_done=3,
+        trials_planned=50,
+        solved=0,
+        decided=0,
+        error_trials=0,
+        in_flight=10,
+        elapsed_sec=42,
+    )
+    assert "0/10 tasks (0%)" in line
+    assert "~-- left" in line
+    assert "#" not in line
+
+
+def test_panel_progress_reporter_silent_on_non_tty():
+    task_result_cls = _install_harness_stubs()
+    runner = _load_experiment_runner()
+    record = runner.ExperimentRecord.initialize(
+        experiment_id="exp-progress",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a"],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    record.record_task_result(
+        _task_result(task_result_cls, task_name="train-a", reward=1.0)
+    )
+    stream = _FakeStream(is_tty=False)
+    reporter = runner.PanelProgressReporter(
+        total_tasks=1, max_concurrency=10, stream=stream
+    )
+    reporter.render(record)
+    reporter.close()
+    assert stream.text == ""
+
+
+def test_panel_progress_reporter_draws_and_finalizes_on_tty():
+    task_result_cls = _install_harness_stubs()
+    runner = _load_experiment_runner()
+    record = runner.ExperimentRecord.initialize(
+        experiment_id="exp-progress",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a", "train-b"],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    stream = _FakeStream(is_tty=True)
+    reporter = runner.PanelProgressReporter(
+        total_tasks=2, max_concurrency=10, stream=stream
+    )
+
+    record.record_task_result(
+        _task_result(task_result_cls, task_name="train-a", reward=1.0)
+    )
+    reporter.render(record)
+    assert "1/2 tasks" in stream.text
+    assert "\r\033[K" in stream.text
+    assert not stream.text.endswith("\n")  # bar is still live
+
+    # Completing the panel finalizes the line with a trailing newline.
+    record.record_task_result(
+        _task_result(task_result_cls, task_name="train-b", reward=0.0, solved=False)
+    )
+    reporter.render(record)
+    assert "2/2 tasks (100%)" in stream.text
+    assert stream.text.endswith("\n")
+
+    # Further renders are no-ops once finalized.
+    before = stream.text
+    reporter.render(record)
+    assert stream.text == before
+
+
+def test_panel_progress_reporter_maps_record_counts_to_line():
+    task_result_cls = _install_harness_stubs()
+    runner = _load_experiment_runner()
+    record = runner.ExperimentRecord.initialize(
+        experiment_id="exp-progress",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a", "train-b"],
+        started_at="2026-04-10T00:00:00+00:00",
+        expected_trial_count=2,
+    )
+    stream = _FakeStream(is_tty=True)
+    reporter = runner.PanelProgressReporter(
+        total_tasks=2, max_concurrency=2, stream=stream
+    )
+
+    record.record_task_result(
+        _task_result(
+            task_result_cls,
+            task_name="train-a",
+            reward=None,
+            error="reset failed",
+        )
+    )
+    reporter.render(record)
+
+    assert "trials 1/4" in stream.text
+    assert "solved 0/0" in stream.text
+    assert "errors 1" in stream.text
+    assert "active 2" in stream.text
+
+
+def test_panel_progress_reporter_close_terminates_dangling_line():
+    task_result_cls = _install_harness_stubs()
+    runner = _load_experiment_runner()
+    record = runner.ExperimentRecord.initialize(
+        experiment_id="exp-progress",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a", "train-b"],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    stream = _FakeStream(is_tty=True)
+    reporter = runner.PanelProgressReporter(
+        total_tasks=2, max_concurrency=10, stream=stream
+    )
+    record.record_task_result(
+        _task_result(task_result_cls, task_name="train-a", reward=1.0)
+    )
+    reporter.render(record)  # one task done, panel incomplete -> no newline yet
+    assert not stream.text.endswith("\n")
+    reporter.close()  # crash/cancel path terminates the line
+    assert stream.text.endswith("\n")

@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import re
+import sys
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -773,6 +775,116 @@ def _prepare_task_dirs(
     return dict(TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names)))
 
 
+PROGRESS_BAR_WIDTH = 24
+
+
+def _format_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def format_panel_progress(
+    *,
+    tasks_done: int,
+    total_tasks: int,
+    trials_done: int,
+    trials_planned: int,
+    solved: int,
+    decided: int,
+    error_trials: int,
+    in_flight: int,
+    elapsed_sec: float,
+) -> str:
+    """Render one progress line for a panel run.
+
+    Anchored on task completion (`tasks_done/total_tasks`) because that
+    denominator is fixed and the bar never moves backward. `trials_planned`
+    is the dynamic per-task budget sum, which shrinks as the majority decides
+    early and grows on candidate confirm-on-fail, so trials are reported as
+    detail text rather than driving the bar. `solved`/`decided` mirror the
+    record's live counts: `decided` is tasks with at least one valid trial.
+    ETA divides remaining tasks by the observed task-completion wall rate,
+    which already absorbs the configured concurrency. The progress line is
+    event-driven: elapsed/ETA refresh only when a task result is persisted.
+    """
+    frac = tasks_done / total_tasks if total_tasks else 0.0
+    filled = int(frac * PROGRESS_BAR_WIDTH)
+    bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+    if tasks_done > 0 and elapsed_sec > 0:
+        rate = tasks_done / elapsed_sec
+        eta = f"~{_format_hms((total_tasks - tasks_done) / rate)} left"
+    else:
+        eta = "~-- left"
+    return (
+        f"[{bar}] {tasks_done}/{total_tasks} tasks ({frac * 100:.0f}%) | "
+        f"trials {trials_done}/{trials_planned} | "
+        f"solved {solved}/{decided} | errors {error_trials} | active {in_flight} | "
+        f"{_format_hms(elapsed_sec)} elapsed, {eta}"
+    )
+
+
+class PanelProgressReporter:
+    """Live single-line progress bar for a panel run.
+
+    Active only when the target stream is an interactive TTY. The supervisor
+    launches `uv run exp` with captured (piped) output, so this stays silent
+    there and renders only for a direct interactive run.
+    """
+
+    def __init__(
+        self,
+        *,
+        total_tasks: int,
+        max_concurrency: int,
+        stream: Any | None = None,
+    ) -> None:
+        self._stream = sys.stderr if stream is None else stream
+        self._total_tasks = total_tasks
+        self._max_concurrency = max_concurrency
+        self._enabled = bool(getattr(self._stream, "isatty", lambda: False)())
+        self._start = time.monotonic()
+        self._drawn = False
+        self._finalized = False
+
+    def render(self, record: ExperimentRecord) -> None:
+        if not self._enabled or self._finalized:
+            return
+        trials = record.train_task_results.values()
+        tasks_done = sum(1 for t in trials if t.is_finished)
+        trials_done = sum(len(t.finished_trials) for t in trials)
+        valid_done = sum(len(t.valid_trials) for t in trials)
+        trials_planned = sum(t.expected_trial_count for t in trials)
+        decided = sum(1 for t in trials if t.majority_solved is not None)
+        in_flight = max(0, min(self._max_concurrency, trials_planned - trials_done))
+        line = format_panel_progress(
+            tasks_done=tasks_done,
+            total_tasks=self._total_tasks,
+            trials_done=trials_done,
+            trials_planned=trials_planned,
+            solved=record.train_solved_count or 0,
+            decided=decided,
+            error_trials=trials_done - valid_done,
+            in_flight=in_flight,
+            elapsed_sec=time.monotonic() - self._start,
+        )
+        self._stream.write("\r\033[K" + line)
+        self._stream.flush()
+        self._drawn = True
+        if tasks_done >= self._total_tasks:
+            self._finalize()
+
+    def close(self) -> None:
+        # Terminate the dangling bar line on the crash/cancel path so later
+        # stdout lines don't append to it.
+        self._finalize()
+
+    def _finalize(self) -> None:
+        if self._enabled and self._drawn and not self._finalized:
+            self._stream.write("\n")
+            self._stream.flush()
+        self._finalized = True
+
+
 async def _run_panel(
     *,
     record: ExperimentRecord,
@@ -784,10 +896,15 @@ async def _run_panel(
     make_env: Callable[..., Any],
 ) -> None:
     semaphore = asyncio.Semaphore(harness_config.max_concurrency)
+    reporter = PanelProgressReporter(
+        total_tasks=len(task_names),
+        max_concurrency=harness_config.max_concurrency,
+    )
 
     def persist_task_result(task_result: TaskResult) -> None:
         record.record_task_result(task_result)
         record.write(root=experiments_root)
+        reporter.render(record)
 
     async def run_one_trial(task_id: str) -> None:
         async with semaphore:
@@ -858,7 +975,10 @@ async def _run_panel(
                     await asyncio.gather(*in_flight, return_exceptions=True)
                 raise
 
-    await asyncio.gather(*(run_task_trials(task_id) for task_id in task_names))
+    try:
+        await asyncio.gather(*(run_task_trials(task_id) for task_id in task_names))
+    finally:
+        reporter.close()
 
 
 def _make_llm_for_config(*, config: LlmProviderConfig, api_key: str | None):
