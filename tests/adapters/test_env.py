@@ -498,3 +498,30 @@ def test_bootstrap_script_recovers_stale_apt_lock_before_commands(
     assert "pkill -9 -x apt " in script
     assert script.index("rm -f") < script.index("apt-get update")
     assert "Acquire::http::Timeout" in script
+
+
+def test_bootstrap_script_routes_apt_through_host_cache_when_reachable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The generated bootstrap must probe the optional host-side apt cache and,
+    # only when the port is reachable, point apt at it -- so repeated installs
+    # hit a local cache instead of the public mirror (the dominant cause of
+    # bootstrap stalls under concurrent load). The probe is curl-free
+    # (bash /dev/tcp) and the proxy config is written before the user commands.
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    harbor = _stub_harbor_for_bootstrap(
+        tmp_path,
+        exec_side_effect=[ExecResult(return_code=0, stdout="", stderr="")],
+    )
+
+    asyncio.run(harbor._bootstrap_environment())
+
+    script = (tmp_path / "trial" / "bootstrap" / "bootstrap.sh").read_text()
+    assert "/dev/tcp/host.docker.internal/3142" in script
+    assert 'Acquire::http::Proxy "http://host.docker.internal:3142"' in script
+    # Reachability-gated: only set inside the success branch of the probe.
+    assert script.index("/dev/tcp/host.docker.internal/3142") < script.index(
+        "Acquire::http::Proxy"
+    )
+    # Configured before the user apt commands run.
+    assert script.index("Acquire::http::Proxy") < script.index("apt-get update")

@@ -44,6 +44,14 @@ logger = logging.getLogger(__name__)
 # usage so an unreachable mirror fails fast instead of hanging until the
 # bootstrap timeout. Best-effort: each line tolerates a minimal image (no
 # procps, already-clean locks) via "|| true".
+#
+# Finally, when a host-side apt cache (apt-cacher-ng, see
+# scripts/setup-apt-cache.sh) is reachable on host.docker.internal:3142, point
+# apt at it so repeated python3 installs hit a local cache instead of refetching
+# from the public mirror on every trial -- the main driver of bootstrap stalls
+# under concurrent load. Probed via bash's /dev/tcp (minimal images have no
+# curl) and strictly optional: an unreachable cache leaves apt on the direct
+# mirror, so the bootstrap never hard-depends on it.
 _BOOTSTRAP_PREAMBLE = """\
 set -eu
 pkill -9 -x apt 2>/dev/null || true
@@ -59,6 +67,9 @@ Acquire::http::Timeout "30";
 Acquire::https::Timeout "30";
 DPkg::Lock::Timeout "60";
 EOF
+if timeout 2 bash -c ': < /dev/tcp/host.docker.internal/3142' 2>/dev/null; then
+printf 'Acquire::http::Proxy "http://host.docker.internal:3142";\\n' > /etc/apt/apt.conf.d/00-harness-apt-cache 2>/dev/null || true
+fi
 """
 
 

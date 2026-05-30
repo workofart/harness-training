@@ -36,6 +36,7 @@ class FakeHarnessConfig:
     max_trial_concurrency: int = 1
     max_env_concurrency: int = 10
     task_timeout_sec: float = 600.0
+    env_setup_timeout_sec: float = 600.0
     max_output_retries: int = 2
     max_disallowed_retries: int = 2
     task_trials: int = 1
@@ -311,6 +312,7 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
         max_steps,
         max_output_retries=2,
         task_timeout_sec=None,
+        env_setup_timeout_sec=None,
         trace_path=None,
         slot_release=None,
     ):
@@ -320,6 +322,7 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
             max_steps,
             max_output_retries,
             task_timeout_sec,
+            env_setup_timeout_sec,
             trace_path,
             slot_release,
         )
@@ -390,6 +393,7 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
         max_steps,
         max_output_retries=2,
         task_timeout_sec=None,
+        env_setup_timeout_sec=None,
         trace_path=None,
         slot_release=None,
     ):

@@ -98,6 +98,7 @@
   "max_trial_concurrency": 16,
   "max_env_concurrency": 10,
   "task_timeout_sec": 1200.0,
+  "env_setup_timeout_sec": 600.0,
   "max_output_retries": 2,
   "task_trials": 5,
   "llm_provider_config": {

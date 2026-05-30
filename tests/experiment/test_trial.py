@@ -288,6 +288,64 @@ def test_run_task_timeout_preserves_artifact_paths_and_attempted_steps(tmp_path)
     assert metrics["steps_total"] == result.steps_used
 
 
+def test_run_task_env_setup_timeout_is_crash_distinct_from_hit_timeout(tmp_path):
+    # A slow/hung reset (docker start + bootstrap) must fail fast against the
+    # separate env_setup_timeout_sec as a crash -- not a hit_timeout -- and must
+    # not have consumed any agent steps.
+    class _SlowResetEnv(_StubEnv):
+        async def reset(self) -> RawState:
+            await asyncio.sleep(1)
+            return self._reset_state
+
+    trial_dir = tmp_path / "trial"
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _SlowResetEnv(trial_dir=str(trial_dir))
+
+    result = asyncio.run(
+        run_task(
+            task_name="t",
+            llm=llm,
+            env=env,
+            max_steps=5,
+            task_timeout_sec=10.0,
+            env_setup_timeout_sec=0.05,
+        )
+    )
+
+    assert result.metrics.failure_mode == "crash"
+    assert result.error == "environment reset/bootstrap timed out after 0.05 seconds"
+    assert result.steps_used == 0
+
+
+def test_run_task_agent_timeout_independent_of_env_setup_budget(tmp_path):
+    # With a generous setup budget and an instant reset, exhausting only the
+    # agent budget still registers as hit_timeout -- proving the two budgets are
+    # decoupled and a fast reset does not borrow from / lend to the agent loop.
+    class _SlowVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(1)
+            return RawState(done=True, passed=True, reward=1.0)
+
+    trial_dir = tmp_path / "trial"
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _SlowVerifyEnv(trial_dir=str(trial_dir))
+
+    result = asyncio.run(
+        run_task(
+            task_name="t",
+            llm=llm,
+            env=env,
+            max_steps=5,
+            task_timeout_sec=0.05,
+            env_setup_timeout_sec=10.0,
+        )
+    )
+
+    assert result.error is None
+    assert result.metrics.failure_mode == "hit_timeout"
+
+
 def test_run_task_timeout_omits_missing_verifier_stdout_path(tmp_path):
     class _SlowVerifyEnv(_StubEnv):
         async def verify(self) -> RawState:

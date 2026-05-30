@@ -102,10 +102,12 @@ async def run_task(
     max_steps: int,
     max_output_retries: int = 2,
     task_timeout_sec: float | None = None,
+    env_setup_timeout_sec: float | None = None,
     trace_path: str | None = None,
     slot_release: Callable[[], None] | None = None,
 ) -> TaskResult:
-    timeout_ctx = None
+    setup_timeout_ctx = None
+    agent_timeout_ctx = None
     started_at = datetime.now(timezone.utc).isoformat()
     finished_at: str | None = None
     trial_dir = env.trial_dir
@@ -113,7 +115,6 @@ async def run_task(
     metrics_path: str | None = None
     recorder = trace_module.NOOP_HARNESS_RECORDER
     reset_completed = False
-    timeout_stage = "environment reset/bootstrap"
 
     reward: float | None = 0.0
     solved = False
@@ -133,13 +134,20 @@ async def run_task(
         nonlocal reward
         nonlocal solved
         nonlocal steps_used
-        nonlocal timeout_stage
+        nonlocal setup_timeout_ctx
+        nonlocal agent_timeout_ctx
         nonlocal trial_dir
         nonlocal verifier_stdout_path
 
-        reset_state = await env.reset()
+        # Environment setup (docker start + bootstrap) is budgeted separately
+        # from the agent loop so a slow/hung bootstrap fails fast as a crash
+        # without consuming the agent's step budget or being misreported as a
+        # task timeout. asyncio.timeout(None) never fires, preserving the
+        # unbounded behavior when a budget is not configured (single-trial use,
+        # tests).
+        async with asyncio.timeout(env_setup_timeout_sec) as setup_timeout_ctx:
+            reset_state = await env.reset()
         reset_completed = True
-        timeout_stage = "task"
         trial_dir = env.trial_dir
         verifier_stdout_path = env.verifier_stdout_path
         if trial_dir is None:
@@ -159,16 +167,17 @@ async def run_task(
             instruction=reset_state.instruction,
             working_dir=reset_state.working_dir,
         )
-        outcome = await run_task_loop(
-            task_name=task_name,
-            llm=llm,
-            env=env,
-            reset_state=reset_state,
-            max_steps=max_steps,
-            max_output_retries=max_output_retries,
-            recorder=recorder,
-            progress=progress,
-        )
+        async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
+            outcome = await run_task_loop(
+                task_name=task_name,
+                llm=llm,
+                env=env,
+                reset_state=reset_state,
+                max_steps=max_steps,
+                max_output_retries=max_output_retries,
+                recorder=recorder,
+                progress=progress,
+            )
         reward = outcome.reward
         solved = outcome.solved
         steps_used = outcome.steps_used
@@ -211,10 +220,7 @@ async def run_task(
         )
 
     try:
-        if task_timeout_sec is None:
-            return await execute_trial()
-        async with asyncio.timeout(task_timeout_sec) as timeout_ctx:
-            return await execute_trial()
+        return await execute_trial()
     except TimeoutError as exc:
         reward = progress.reward
         steps_used = progress.steps_used
@@ -232,13 +238,21 @@ async def run_task(
             recorder = _recorder_for_paths(
                 trace_path=trace_path, metrics_path=metrics_path
             )
-        timeout_expired = timeout_ctx is not None and timeout_ctx.expired()
-        if timeout_expired and reset_completed:
+        # Each stage has its own timeout context; whichever expired tells us
+        # which stage timed out. The agent context only exists once reset has
+        # completed, so its expiry unambiguously means the agent loop ran out of
+        # time (hit_timeout); a setup-context expiry means reset/bootstrap did.
+        agent_expired = agent_timeout_ctx is not None and agent_timeout_ctx.expired()
+        setup_expired = setup_timeout_ctx is not None and setup_timeout_ctx.expired()
+        if agent_expired:
             error = None
             failure_mode = "hit_timeout"
             detail = f"task timed out after {task_timeout_sec} seconds"
-        elif timeout_expired:
-            error = f"{timeout_stage} timed out after {task_timeout_sec} seconds"
+        elif setup_expired:
+            error = (
+                "environment reset/bootstrap timed out after "
+                f"{env_setup_timeout_sec} seconds"
+            )
             failure_mode = "crash"
             detail = error
         else:

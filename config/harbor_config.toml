@@ -4,7 +4,11 @@ experiments_dir = "experiments"
 bootstrap_commands = [
   "command -v python3 >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y --no-install-recommends python3)",
 ]
-bootstrap_timeout_sec = 600
+# A healthy apt bootstrap finishes in ~20-30s; a much higher value only lets a
+# stalled mirror burn the whole window. Bound it low so a stall is killed fast
+# and infra_retry (with the lock-safe preamble) gets clean retries well inside
+# env_setup_timeout_sec instead of hanging until the trial budget is gone.
+bootstrap_timeout_sec = 120
 
 [environment]
 type = "docker"

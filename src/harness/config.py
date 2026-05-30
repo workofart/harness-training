@@ -165,7 +165,17 @@ class HarnessConfig(BaseModel):
     task_timeout_sec: float = Field(
         default=600.0,
         gt=0,
-        description="Wall-clock timeout for one task episode.",
+        description="Wall-clock timeout for the agent loop of one task episode.",
+    )
+    env_setup_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            "Wall-clock timeout for environment reset (docker start + "
+            "bootstrap), budgeted separately from task_timeout_sec so a slow or "
+            "hung bootstrap fails fast as a crash without consuming the agent's "
+            "step budget or being misreported as a task timeout."
+        ),
     )
     max_output_retries: int = Field(
         default=2,

@@ -41,6 +41,7 @@ source .venv/bin/activate
 
 - LLM credentials: for OpenRouter, set `OPENROUTER_API_KEY` in the shell or in a repo-local `.env`; for experimental `chatgpt_codex`, run `codex login` first so `~/.codex/auth.json` exists.
 - Docker: install and start Docker. Harbor starts one container per task trial; `max_trial_concurrency` in [`config/harness_config.json`](./config/harness_config.json) caps trials in flight, and `max_env_concurrency` caps how many run a container command at once (host-CPU bound).
+- Optional but recommended for multi-trial runs — local apt cache: run [`scripts/setup-apt-cache.sh`](./scripts/setup-apt-cache.sh) once. Task images are minimal and reinstall `python3` via `apt` on every trial; the cache serves those repeats locally so concurrent bootstraps don't stall on the public mirror (the dominant infra failure). The bootstrap auto-detects it on `host.docker.internal:3142` and falls back to the direct mirror when absent.
 
 3. Prerequisites for the self-improvement loop:
 

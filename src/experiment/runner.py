@@ -244,6 +244,7 @@ async def _run_panel(
                     max_steps=harness_config.max_steps,
                     max_output_retries=harness_config.max_output_retries,
                     task_timeout_sec=harness_config.task_timeout_sec,
+                    env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
                     slot_release=release_slot,
                 )
             except asyncio.CancelledError:

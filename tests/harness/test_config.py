@@ -26,6 +26,7 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
     assert config.max_steps == 20
     assert config.max_trial_concurrency == 3
     assert config.task_timeout_sec == 30.0
+    assert config.env_setup_timeout_sec == 600.0  # default applied when omitted
     assert config.max_output_retries == 4
     assert config.llm_provider_config.service_tier is None
 
@@ -40,6 +41,8 @@ def test_default_harness_config_matches_baseline_run_profile():
     assert len(set(config.train_task_names) | set(config.slow_task_names)) == 89
     assert config.max_trial_concurrency == 16
     assert config.max_env_concurrency == 10
+    assert config.task_timeout_sec == 1200.0
+    assert config.env_setup_timeout_sec == 600.0
     assert config.task_trials == 5
     assert config.llm_provider_config.provider == "chatgpt_codex"
     assert config.llm_provider_config.model_name == "gpt-5.5"
