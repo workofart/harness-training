@@ -213,6 +213,21 @@ def test_run_task_marks_crash_with_exception_type_for_blank_error():
     assert result.metrics.failure_mode == "crash"
 
 
+def test_run_task_classifies_no_valid_action_distinct_from_crash():
+    # When the model never emits a parseable tool call (e.g. empty/refused
+    # completions), the trial is labeled an agent failure (no_valid_action), not
+    # an infra crash. error stays set so it remains excluded from the gate's
+    # valid trials -- an empty/refused response is not a fair capability signal.
+    llm = _StubLlm([_completion(content="no tool call")] * 3)
+    env = _StubEnv()
+
+    result = asyncio.run(run_task(task_name="t", llm=llm, env=env, max_steps=5))
+
+    assert result.metrics.failure_mode == "no_valid_action"
+    assert result.error == "failed to parse a valid action call"
+    assert result.solved is False
+
+
 def test_run_task_writes_jsonl_when_trace_path_provided(tmp_path):
     trace = tmp_path / "trace.jsonl"
     llm = _StubLlm([_completion(_tool_call("verify"))])

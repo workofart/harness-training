@@ -20,6 +20,7 @@ FailureMode = Literal[
     "verified_rejected",
     "hit_step_cap",
     "hit_timeout",
+    "no_valid_action",
     "crash",
 ]
 

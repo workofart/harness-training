@@ -352,6 +352,20 @@ class Harbor:
                     stderr=str(exc),
                     passed=False,
                 )
+            except ValueError as exc:
+                # The agent can emit action arguments that cannot be marshalled
+                # into a container command -- most concretely a write_file/run
+                # whose content carries an embedded NUL, which Python's
+                # subprocess layer rejects with ValueError("embedded null byte").
+                # That is the agent's own input, not an infra failure, so surface
+                # it as a failed observation it can react to next step instead of
+                # a trial-fatal crash.
+                return RawState(
+                    return_code=1,
+                    stdout=None,
+                    stderr=f"invalid command (cannot execute): {exc}",
+                    passed=False,
+                )
             self._append_agent_log(command=command, result=result, cwd=cwd)
             return RawState(
                 return_code=result.return_code,

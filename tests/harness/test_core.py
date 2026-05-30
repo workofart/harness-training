@@ -17,6 +17,7 @@ from src.harness.core import (
     EditFileAction,
     FindFilesAction,
     ListDirAction,
+    NoValidActionError,
     ReadFileAction,
     RunAction,
     SearchTextAction,
@@ -526,8 +527,11 @@ def test_act_retries_on_invalid_json_and_appends_correction():
 
 
 def test_act_raises_after_exhausting_retries():
+    # Exhausting the output-retry budget raises the typed NoValidActionError (a
+    # RuntimeError subclass) so the trial layer classifies it as an agent
+    # failure (no_valid_action) rather than an infra crash.
     llm = _StubLlm([_completion(content="no calls")] * 3)
-    with pytest.raises(RuntimeError, match="failed to parse"):
+    with pytest.raises(NoValidActionError, match="failed to parse"):
         asyncio.run(
             act(
                 llm=llm,

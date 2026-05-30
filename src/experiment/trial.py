@@ -8,7 +8,7 @@ from pathlib import Path
 import src.trace as trace_module
 from src.adapters.llm_base import BaseLlm
 from src.harness.contracts import HarnessEnv, TaskResult
-from src.harness.core import TaskLoopProgress, run_task_loop
+from src.harness.core import NoValidActionError, TaskLoopProgress, run_task_loop
 from src.metrics import FailureMode
 
 
@@ -284,7 +284,13 @@ async def run_task(
                 trace_path=trace_path, metrics_path=metrics_path
             )
         error = str(exc) or type(exc).__name__
-        failure_mode = "crash"
+        # A model that never emits a parseable action is an agent failure, not a
+        # broken environment: label it distinctly. `error` stays set, so it is
+        # still excluded from the gate's valid trials (an empty/refused response
+        # is not a fair measure of capability) -- just not lumped under `crash`.
+        failure_mode = (
+            "no_valid_action" if isinstance(exc, NoValidActionError) else "crash"
+        )
         finished_at = datetime.now(timezone.utc).isoformat()
         recorder.task_failed(exc=exc, detail=error)
         steps_used = _recorded_steps_used(recorder, fallback=steps_used)

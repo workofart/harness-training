@@ -137,6 +137,24 @@ def test_harbor_exec_converts_timeout_runtime_error_to_failed_raw_state(
     assert "timed out after 15 seconds" in result.stderr
 
 
+def test_harbor_exec_converts_value_error_to_failed_raw_state(tmp_path: Path) -> None:
+    # An agent action whose content cannot be marshalled into a container
+    # command -- e.g. a write_file with an embedded NUL, which the subprocess
+    # layer rejects with ValueError("embedded null byte") -- must become a
+    # recoverable failed observation, not a trial-fatal crash.
+    harbor = _stub_harbor_with_inner_exec(
+        tmp_path,
+        inner_exec_side_effect=ValueError("embedded null byte"),
+    )
+
+    result = asyncio.run(harbor.exec(command="printf %s 'x\x00y' > f"))
+
+    assert result.passed is False
+    assert result.return_code != 0
+    assert result.stderr is not None
+    assert "embedded null byte" in result.stderr
+
+
 def test_harbor_exec_propagates_non_timeout_runtime_error(tmp_path: Path) -> None:
     # Only timeout-shaped RuntimeError is absorbed. Genuine
     # container/transport failures must surface as trial-fatal so the

@@ -465,6 +465,17 @@ def build_messages(
 # ============================================================================
 
 
+class NoValidActionError(RuntimeError):
+    """The model failed to emit a parseable tool call within the output-retry
+    budget.
+
+    A distinct type (not a bare RuntimeError) so the trial layer can classify it
+    as an agent failure (`no_valid_action`) rather than an infra `crash`: the
+    model produced nothing usable -- often an empty/refused completion -- which
+    is the agent's outcome, not a broken environment.
+    """
+
+
 async def act(
     *,
     llm: BaseLlm,
@@ -530,7 +541,7 @@ async def act(
                     ),
                 }
             ]
-    raise RuntimeError("failed to parse a valid action call")
+    raise NoValidActionError("failed to parse a valid action call")
 
 
 def _validate_action_name(value: str) -> ActionName:
