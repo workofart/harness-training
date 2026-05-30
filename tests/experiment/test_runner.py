@@ -2522,6 +2522,7 @@ def test_run_panel_persists_completed_trial_without_refreshing_evidence(
     if trial_mode == "exception":
         assert trials[0]["solved"] is False
         assert trials[0]["error"] == "simulated env reset crash"
+        assert trials[0]["metrics"]["failure_mode"] == "crash"
     else:
         assert trials[0]["solved"] is True
         assert trials[0]["error"] is None

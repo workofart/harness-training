@@ -18,6 +18,7 @@ from src.harness.contracts import TaskResult
 from src.metrics import (
     PROMOTION_P_VALUE_ALPHA,
     BaselineComparison,
+    TaskMetrics,
     compare_candidate_against_baseline,
     is_majority_decided,
     is_majority_solved,
@@ -756,6 +757,7 @@ def _terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
         solved=False,
         error=error,
         steps_used=0,
+        metrics=TaskMetrics(failure_mode="crash"),
         started_at=finished_at,
         finished_at=finished_at,
     )
