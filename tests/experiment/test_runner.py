@@ -1041,8 +1041,12 @@ def test_task_trials_unfinished_trials_do_not_block_completion_after_padding():
         finished_at="2026-05-05T00:00:02+00:00",
     )
     trials.append(finalized)
+    # A finalized-but-errored trial is a `crash`: it counts toward the budget
+    # (so the panel terminates) but is excluded from solve scoring, so there is
+    # no valid evidence and therefore no majority verdict.
     assert trials.is_finished is True
-    assert trials.majority_solved is False
+    assert trials.valid_trials == []
+    assert trials.majority_solved is None
 
 
 def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
@@ -1231,8 +1235,9 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
             task_name=task_name,
             reward=0.0,
             solved=False,
-            error="task timed out after 0.01 seconds",
+            error=None,
             steps_used=1,
+            metrics=TaskMetrics(failure_mode="hit_timeout"),
             started_at="2026-05-05T00:00:00+00:00",
             finished_at="2026-05-05T00:00:01+00:00",
         )
@@ -1252,7 +1257,8 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
     trials = experiment_runner.record._task_trials("task-a")
     assert seen_timeouts == [0.01]
     assert trials.trials[0].solved is False
-    assert trials.trials[0].error == "task timed out after 0.01 seconds"
+    assert trials.trials[0].error is None
+    assert trials.trials[0].metrics.failure_mode == "hit_timeout"
 
 
 def test_run_panel_runs_all_trials_when_first_two_split(monkeypatch, tmp_path):
@@ -2145,20 +2151,20 @@ def test_run_baseline_at_head_seeds_when_no_active_baseline(monkeypatch, tmp_pat
 @pytest.mark.parametrize(
     "trial_error",
     [
-        pytest.param("task timed out after 400.0 seconds", id="with-message"),
-        # `run_task` does `error = str(exc)` for exceptions with no message
-        # (e.g. `raise RuntimeError()`), which yields "". A truthiness check
-        # on `trial.error` would silently let this slip through.
-        pytest.param("", id="empty-string-from-bare-exception"),
+        pytest.param("environment reset/bootstrap timed out", id="with-message"),
+        # An empty-string error still marks a `crash`. The `error is None`
+        # contract is load-bearing: a truthiness check on `trial.error` would
+        # misread "" as valid evidence.
+        pytest.param("", id="empty-string-crash"),
     ],
 )
-def test_run_baseline_at_head_crashes_when_any_trial_errors(
+def test_run_baseline_at_head_crashes_when_no_valid_evidence(
     trial_error, monkeypatch, tmp_path
 ):
-    """A baseline panel run with any errored trial must finalize as `crash`
-    and must NOT update `active_baseline_experiment_id`. Promoting an errored
-    baseline poisons every subsequent candidate comparison (the baseline pool
-    carries trial counts the baseline never actually measured)."""
+    """When every baseline trial is a `crash`, the run produced no valid
+    evidence: it must finalize as `crash` and must NOT update
+    `active_baseline_experiment_id`. Promoting an empty baseline would make
+    every later candidate compare against an all-zero pool."""
     runner = _load_experiment_runner()
     experiments_root = tmp_path / "experiments"
     experiments_root.mkdir()
@@ -2214,9 +2220,7 @@ def test_run_baseline_at_head_crashes_when_any_trial_errors(
     )
 
     assert record.status == "crash"
-    assert "train-a" in record.error
-    if trial_error:
-        assert trial_error in record.error
+    assert "no valid trials" in record.error
     assert (
         runner.ExperimentState.load(root=experiments_root).active_baseline_experiment_id
         is None
@@ -2226,17 +2230,17 @@ def test_run_baseline_at_head_crashes_when_any_trial_errors(
 @pytest.mark.parametrize(
     "trial_error",
     [
-        pytest.param("task timed out after 400.0 seconds", id="with-message"),
-        pytest.param("", id="empty-string-from-bare-exception"),
+        pytest.param("environment reset/bootstrap timed out", id="with-message"),
+        pytest.param("", id="empty-string-crash"),
     ],
 )
-def test_run_experiment_finalizes_crash_when_any_trial_errors(
+def test_run_experiment_finalizes_crash_when_no_valid_evidence(
     trial_error, monkeypatch, tmp_path
 ):
-    """A trial returning with `trial.error` is infrastructure failure; the
-    experiment must finalize as `crash`, never `keep`/`discard`. Without this,
-    the gate would treat an errored trial as evidence of a real solve failure
-    and feed a misattributed regression verdict back to the supervisor."""
+    """When the only task's only trial is a `crash`, the run produced no valid
+    evidence and must finalize as `crash`, never `keep`/`discard` — there is
+    nothing for the gate to compare. (An isolated crash alongside valid trials
+    is instead excluded and tolerated; see the mixed-evidence test.)"""
     import asyncio
 
     runner = _load_experiment_runner()
@@ -2298,9 +2302,160 @@ def test_run_experiment_finalizes_crash_when_any_trial_errors(
 
     record = experiment_runner.record
     assert record.status == "crash"
-    assert "task-a" in record.error
-    if trial_error:
-        assert trial_error in record.error
+    assert "no valid trials" in record.error
+
+
+def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
+    monkeypatch, tmp_path
+):
+    """A lone `crash` trial alongside valid trials must not sink the run: it is
+    dropped from the gate's evidence and the surviving valid trials are scored.
+    Here trial 1 crashes and trials 2-3 solve, so the frontier task
+    majority-solves on 2 valid trials and the run is kept."""
+    import asyncio
+
+    runner = _load_experiment_runner()
+    harness_config_cls = sys.modules["src.harness.config"].HarnessConfig
+    experiment_id = "exp-mixed-evidence"
+
+    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
+    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
+    monkeypatch.setattr(
+        runner.control_repo,
+        "update_ref",
+        lambda ref_name, commit_hash, *, cwd=None: None,
+    )
+
+    experiment_runner = runner.ExperimentRunner(
+        harness_config=harness_config_cls(
+            experiment_id=experiment_id,
+            focus_name="focus",
+            train_task_names=["task-a"],
+            task_trials=3,
+            max_concurrency=1,
+        ),
+        harbor_config=type(
+            "HarborConfig",
+            (),
+            {"experiments_dir": tmp_path / "experiments"},
+        )(),
+        api_key="key",
+    )
+    experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    call_count = 0
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        # max_concurrency=1 serializes trials, so the counter is deterministic.
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return TaskResult(
+                task_name=task_name,
+                reward=0.0,
+                solved=False,
+                error="environment reset/bootstrap timed out",
+                steps_used=12,
+                metrics=TaskMetrics(failure_mode="crash"),
+                started_at="2026-05-05T00:00:00+00:00",
+                finished_at="2026-05-05T00:00:01+00:00",
+            )
+        return TaskResult(
+            task_name=task_name,
+            reward=1.0,
+            solved=True,
+            error=None,
+            steps_used=5,
+            metrics=TaskMetrics(failure_mode="solved"),
+            started_at="2026-05-05T00:00:00+00:00",
+            finished_at="2026-05-05T00:00:01+00:00",
+        )
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        experiment_runner,
+        "_make_env",
+        lambda task_name, *, task_dir: object(),
+        raising=False,
+    )
+    _set_task_dirs(experiment_runner, tmp_path, "task-a")
+
+    asyncio.run(experiment_runner._run_experiment(baseline=None))
+
+    record = experiment_runner.record
+    trials = record.train_task_results["task-a"]
+    # All three slots ran; only the two non-crash trials count as evidence.
+    assert len(trials.finished_trials) == 3
+    assert len(trials.valid_trials) == 2
+    assert trials.solved_count == 2
+    # 2/2 valid trials solved on the frontier ⇒ improvement ⇒ keep.
+    assert record.status == "keep"
+    assert record.decision_reason == "train task task-a improved"
+
+
+def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_path):
+    """A task episode timeout is a measured unsolved trial, not an
+    experiment-level infrastructure crash."""
+    import asyncio
+
+    runner = _load_experiment_runner()
+    harness_config_cls = sys.modules["src.harness.config"].HarnessConfig
+    experiment_id = "exp-timeout-is-unsolved"
+
+    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
+    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
+    monkeypatch.setattr(
+        runner.control_repo,
+        "update_ref",
+        lambda ref_name, commit_hash, *, cwd=None: None,
+    )
+
+    experiment_runner = runner.ExperimentRunner(
+        harness_config=harness_config_cls(
+            experiment_id=experiment_id,
+            focus_name="focus",
+            train_task_names=["task-a"],
+            task_trials=1,
+            max_concurrency=1,
+        ),
+        harbor_config=type(
+            "HarborConfig",
+            (),
+            {"experiments_dir": tmp_path / "experiments"},
+        )(),
+        api_key="key",
+    )
+    experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        return TaskResult(
+            task_name=task_name,
+            reward=0.0,
+            solved=False,
+            error=None,
+            steps_used=12,
+            metrics=TaskMetrics(failure_mode="hit_timeout"),
+            started_at="2026-05-05T00:00:00+00:00",
+            finished_at="2026-05-05T00:00:01+00:00",
+        )
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        experiment_runner,
+        "_make_env",
+        lambda task_name, *, task_dir: object(),
+        raising=False,
+    )
+    _set_task_dirs(experiment_runner, tmp_path, "task-a")
+
+    asyncio.run(experiment_runner._run_experiment(baseline=None))
+
+    record = experiment_runner.record
+    assert record.status == "discard"
+    assert record.error == ""
+    assert record.decision_reason == "no train task improvement reached significance"
 
 
 @pytest.mark.parametrize("trial_mode", ["result", "exception"])
@@ -2466,7 +2621,10 @@ def _pool_trial_from_spec(task_name: str, spec) -> TaskResult:
         steps_used=spec.get("steps_used", 1),
         started_at="2026-05-10T00:00:00+00:00",
         finished_at="2026-05-10T00:00:01+00:00",
-        metrics=TaskMetrics(rule_fires=dict(spec.get("rule_fires") or {})),
+        metrics=TaskMetrics(
+            rule_fires=dict(spec.get("rule_fires") or {}),
+            failure_mode=spec.get("failure_mode"),
+        ),
     )
 
 
@@ -2602,8 +2760,8 @@ def _pool_record_from_spec(runner, spec):
                             {"solved": True, "steps_used": 19},
                             {
                                 "solved": False,
-                                "error": "task timed out after 400.0 seconds",
-                                "steps_used": 80,
+                                "failure_mode": "hit_timeout",
+                                "steps_used": 13,
                             },
                             {
                                 "solved": False,
@@ -2613,9 +2771,9 @@ def _pool_record_from_spec(runner, spec):
                         ]
                     },
                 },
-                "expected": {"t": (1, 1)},
+                "expected": {"t": (1, 2)},
             },
-            id="excludes-errored-trials-regardless-of-steps-used",
+            id="includes-task-timeouts-excludes-infrastructure-errors",
         ),
         pytest.param(
             {

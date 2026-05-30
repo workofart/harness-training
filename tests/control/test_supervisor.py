@@ -2439,7 +2439,9 @@ def test_run_supervisor_loop_abandons_unfinished_candidate_and_restarts_prelaunc
     assert updated.evidence.candidate_change.parent_baseline_commit == "base123"
     assert len(updated.evidence.task_outcomes) == 1
     assert updated.evidence.task_outcomes[0].baseline_solved is True
-    assert updated.evidence.task_outcomes[0].candidate_solved is False
+    # The abandoned trial is a `crash` (error set), excluded from evidence, so
+    # the candidate has no valid trials and no solve verdict.
+    assert updated.evidence.task_outcomes[0].candidate_solved is None
     assert update_ref_calls == [
         (supervisor.failed_experiment_git_ref("exp-next"), "candidate123")
     ]

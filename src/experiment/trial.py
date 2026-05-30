@@ -12,16 +12,16 @@ from src.harness.core import TaskLoopProgress, run_task_loop
 
 def _failure_mode(
     *,
-    error: str | None,
     solved: bool,
     final_passed: bool | None,
     steps_used: int,
     max_steps: int,
 ) -> str | None:
+    # Classifies a trial that completed its loop without an infrastructure
+    # failure. Infra failures (`error is not None`) are labeled "crash" where
+    # they are caught, not here.
     if solved:
         return "solved"
-    if error is not None:
-        return "env_error"
     if final_passed is False:
         return "verified_rejected"
     if steps_used >= max_steps:
@@ -115,6 +115,7 @@ async def run_task(
     reward: float | None = 0.0
     solved = False
     error: str | None = None
+    failure_mode: str | None = None
     steps_used = 0
     final_passed: bool | None = None
     progress = TaskLoopProgress()
@@ -173,7 +174,6 @@ async def run_task(
         recorder.set_trial_outcome(
             verifier_passed=final_passed,
             failure_mode=_failure_mode(
-                error=error,
                 solved=solved,
                 final_passed=final_passed,
                 steps_used=steps_used,
@@ -229,15 +229,21 @@ async def run_task(
             recorder = _recorder_for_paths(
                 trace_path=trace_path, metrics_path=metrics_path
             )
-        if timeout_ctx is not None and timeout_ctx.expired():
-            if reset_completed:
-                error = f"task timed out after {task_timeout_sec} seconds"
-            else:
-                error = f"{timeout_stage} timed out after {task_timeout_sec} seconds"
+        timeout_expired = timeout_ctx is not None and timeout_ctx.expired()
+        if timeout_expired and reset_completed:
+            error = None
+            failure_mode = "hit_timeout"
+            detail = f"task timed out after {task_timeout_sec} seconds"
+        elif timeout_expired:
+            error = f"{timeout_stage} timed out after {task_timeout_sec} seconds"
+            failure_mode = "crash"
+            detail = error
         else:
-            error = str(exc)
+            error = str(exc) or type(exc).__name__
+            failure_mode = "crash"
+            detail = error
         finished_at = datetime.now(timezone.utc).isoformat()
-        recorder.task_failed(exc=exc, detail=error)
+        recorder.task_failed(exc=exc, detail=detail)
         steps_used = _recorded_steps_used(recorder, fallback=steps_used)
     except Exception as exc:
         reward = progress.reward
@@ -260,7 +266,8 @@ async def run_task(
             recorder = _recorder_for_paths(
                 trace_path=trace_path, metrics_path=metrics_path
             )
-        error = str(exc)
+        error = str(exc) or type(exc).__name__
+        failure_mode = "crash"
         finished_at = datetime.now(timezone.utc).isoformat()
         recorder.task_failed(exc=exc, detail=error)
         steps_used = _recorded_steps_used(recorder, fallback=steps_used)
@@ -269,7 +276,7 @@ async def run_task(
 
     recorder.set_trial_outcome(
         verifier_passed=None,
-        failure_mode="env_error" if error is not None else None,
+        failure_mode=failure_mode,
     )
     final_metrics = recorder.build_metrics()
     recorder.write_metrics()

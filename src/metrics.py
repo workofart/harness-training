@@ -20,9 +20,9 @@ class TaskMetrics:
     # Trial-final summary fields. Populated by the runner once `final_passed`
     # is known so the supervisor can answer "where did it die" without
     # walking steps.jsonl. `failure_mode` is one of: "solved",
-    # "never_verified", "verified_rejected", "hit_step_cap",
-    # "loop_terminated", "no_verify_limit", "env_error", or None when the
-    # trial did not produce a terminal outcome.
+    # "never_verified", "verified_rejected", "hit_step_cap", "hit_timeout",
+    # "loop_terminated", "no_verify_limit", "crash" (an infra failure excluded
+    # from evidence), or None when the trial did not produce a terminal outcome.
     final_action_passed: bool | None = None
     verifier_passed: bool | None = None
     failure_mode: str | None = None
