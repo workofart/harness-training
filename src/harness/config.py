@@ -155,11 +155,13 @@ class HarnessConfig(BaseModel):
         default=10,
         gt=0,
         description=(
-            "Maximum number of trials executing a container command "
-            "(env exec/verify) at once. Bounds host-CPU contention "
-            "independently of `max_trial_concurrency`, so trials idling on the "
-            "LLM can overlap without oversubscribing cores and slowing real "
-            "builds. No effect when >= max_trial_concurrency."
+            "Maximum number of trials executing heavyweight container work "
+            "(reset/startup, run, verify) at once. Cheap harness-generated "
+            "file/list/search/edit commands bypass this gate so they do not "
+            "queue behind compiles or long verifiers. Bounds host-CPU "
+            "contention independently of `max_trial_concurrency`, so trials "
+            "idling on the LLM can overlap without oversubscribing cores and "
+            "slowing real builds. No effect when >= max_trial_concurrency."
         ),
     )
     task_timeout_sec: float = Field(

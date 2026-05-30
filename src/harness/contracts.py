@@ -14,9 +14,11 @@ depending on the other.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from src.metrics import TaskMetrics
+
+EnvExecWorkload = Literal["light", "heavy"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,7 @@ class HarnessEnv(Protocol):
         command: str,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        workload: EnvExecWorkload = "heavy",
     ) -> RawState:
         """Run one shell command inside the task environment."""
 

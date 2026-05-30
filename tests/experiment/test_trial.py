@@ -61,9 +61,14 @@ class _StubEnv:
     async def reset(self) -> RawState:
         return self._reset_state
 
-    async def exec(self, *, command, cwd=None, timeout_sec=None):
+    async def exec(self, *, command, cwd=None, timeout_sec=None, workload="heavy"):
         self.exec_calls.append(
-            {"command": command, "cwd": cwd, "timeout_sec": timeout_sec}
+            {
+                "command": command,
+                "cwd": cwd,
+                "timeout_sec": timeout_sec,
+                "workload": workload,
+            }
         )
         if self._exec_states:
             return self._exec_states.pop(0)

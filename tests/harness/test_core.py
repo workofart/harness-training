@@ -95,9 +95,14 @@ class _StubEnv:
     async def reset(self) -> RawState:
         return self._reset_state
 
-    async def exec(self, *, command, cwd=None, timeout_sec=None):
+    async def exec(self, *, command, cwd=None, timeout_sec=None, workload="heavy"):
         self.exec_calls.append(
-            {"command": command, "cwd": cwd, "timeout_sec": timeout_sec}
+            {
+                "command": command,
+                "cwd": cwd,
+                "timeout_sec": timeout_sec,
+                "workload": workload,
+            }
         )
         if self._exec_states:
             return self._exec_states.pop(0)
@@ -285,24 +290,28 @@ def test_execute_action_list_dir_compiles_ls_command():
     env = _StubEnv()
     asyncio.run(execute_action(env, ListDirAction(path="/work")))
     assert env.exec_calls[0]["command"] == "ls -1Ap /work"
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_list_dir_defaults_to_dot():
     env = _StubEnv()
     asyncio.run(execute_action(env, ListDirAction()))
     assert env.exec_calls[0]["command"] == "ls -1Ap ."
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_find_files_compiles_find_command():
     env = _StubEnv()
     asyncio.run(execute_action(env, FindFilesAction(pattern="*.py", root="src")))
     assert env.exec_calls[0]["command"] == "find src -name '*.py'"
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_search_text_compiles_grep_command():
     env = _StubEnv()
     asyncio.run(execute_action(env, SearchTextAction(query="hello world", root=".")))
     assert env.exec_calls[0]["command"] == "grep -rn 'hello world' ."
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_read_file_uses_sed_with_explicit_line_range():
@@ -311,6 +320,7 @@ def test_execute_action_read_file_uses_sed_with_explicit_line_range():
         execute_action(env, ReadFileAction(path="/x", start_line=5, end_line=20))
     )
     assert env.exec_calls[0]["command"] == "sed -n '5,20p' /x"
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_read_file_uses_default_window_when_no_end_line():
@@ -319,6 +329,7 @@ def test_execute_action_read_file_uses_default_window_when_no_end_line():
     result = asyncio.run(execute_action(env, ReadFileAction(path="/x", start_line=1)))
     expected_end = DEFAULT_READ_WINDOW_LINES
     assert env.exec_calls[0]["command"] == f"sed -n '1,{expected_end}p' /x"
+    assert env.exec_calls[0]["workload"] == "light"
     assert result.stdout == stdout
 
 
@@ -326,6 +337,7 @@ def test_execute_action_write_file_uses_printf():
     env = _StubEnv()
     asyncio.run(execute_action(env, WriteFileAction(path="/x", content="hi there")))
     assert env.exec_calls[0]["command"] == "printf %s 'hi there' > /x"
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_edit_file_uses_python_script():
@@ -337,6 +349,7 @@ def test_execute_action_edit_file_uses_python_script():
     assert cmd.startswith("python3 -c ")
     assert "p.read_text().replace" in cmd
     assert cmd.endswith(" /x foo BAR")
+    assert env.exec_calls[0]["workload"] == "light"
 
 
 def test_execute_action_run_passes_through_command_cwd_timeout():
@@ -348,6 +361,7 @@ def test_execute_action_run_passes_through_command_cwd_timeout():
         "command": "pytest",
         "cwd": "/repo",
         "timeout_sec": 30,
+        "workload": "heavy",
     }
 
 

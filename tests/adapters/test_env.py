@@ -200,10 +200,10 @@ def _stub_harbor_with_recording_exec(
 
 
 def test_harbor_exec_serializes_under_shared_semaphore(tmp_path: Path) -> None:
-    # The run-scoped exec_semaphore bounds how many trials run a container
-    # command at once. A size-1 gate must forbid two Harbor.exec calls from
-    # overlapping inside the container — the signal-preserving guarantee that
-    # lets trial-admission (outer max_trial_concurrency) run ahead of host-CPU
+    # The run-scoped exec_semaphore bounds heavyweight container commands. A
+    # size-1 gate must forbid two default Harbor.exec calls from overlapping
+    # inside the container — the signal-preserving guarantee that lets
+    # trial-admission (outer max_trial_concurrency) run ahead of host-CPU
     # capacity (inner max_env_concurrency) without oversubscribing cores.
     order: list[str] = []
     harbor = _stub_harbor_with_recording_exec(
@@ -238,6 +238,23 @@ def test_harbor_exec_overlaps_without_semaphore(tmp_path: Path) -> None:
 
     # Both enter before either exits.
     assert order[:2] == ["enter:a", "enter:b"]
+
+
+def test_harbor_light_exec_bypasses_shared_heavy_semaphore(tmp_path: Path) -> None:
+    order: list[str] = []
+    harbor = _stub_harbor_with_recording_exec(
+        tmp_path, order=order, exec_semaphore=asyncio.Semaphore(1)
+    )
+
+    async def go():
+        heavy = asyncio.create_task(harbor.exec(command="heavy"))
+        await asyncio.sleep(0)
+        light = asyncio.create_task(harbor.exec(command="light", workload="light"))
+        await asyncio.gather(heavy, light)
+
+    asyncio.run(go())
+
+    assert order[:2] == ["enter:heavy", "enter:light"]
 
 
 def test_harbor_reset_serializes_startup_under_shared_semaphore(
