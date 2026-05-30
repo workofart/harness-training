@@ -51,7 +51,7 @@ class ChatGptCodexResponseError(ChatGptCodexError):
 
 
 def _is_retryable_infra_error(exc: Exception) -> bool:
-    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+    if isinstance(exc, httpx.TransportError):
         return True
     if isinstance(exc, ChatGptCodexResponseError):
         return exc.status_code in RETRYABLE_STATUS_CODES
