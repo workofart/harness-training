@@ -71,6 +71,49 @@ class OpenRouterConfig(BaseModel):
     )
 
 
+class ChatGptCodexConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["chatgpt_codex"] = "chatgpt_codex"
+    model_name: str = Field(description="Codex backend model identifier to call.")
+    max_context_length: int = Field(
+        gt=0,
+        description="Prompt context budget used by the harness for this model.",
+    )
+    reasoning_effort: ReasoningEffort = Field(
+        default="medium",
+        description="Reasoning effort sent to the Codex backend; 'none' omits it.",
+    )
+    timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="Per-request timeout for one LLM completion attempt.",
+    )
+    base_url: str = Field(
+        default="https://chatgpt.com/backend-api",
+        description="ChatGPT backend API base URL.",
+    )
+    auth_file: str | None = Field(
+        default=None,
+        description="Optional path to Codex auth.json; defaults to CODEX_HOME/auth.json.",
+    )
+    text_verbosity: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Responses text verbosity.",
+    )
+    service_tier: ServiceTier | None = Field(
+        default=None,
+        description="Optional Codex backend service tier.",
+    )
+    prompt_cache_key: str | None = Field(
+        default=None,
+        description="Optional prompt cache key forwarded to the Codex backend.",
+    )
+
+
+LlmProviderConfig = OpenRouterConfig | ChatGptCodexConfig
+
+
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -111,6 +154,6 @@ class HarnessConfig(BaseModel):
         ge=1,
         description="Number of independent trials per task per panel run. Selection uses majority across trials.",
     )
-    llm_provider_config: OpenRouterConfig = Field(
+    llm_provider_config: LlmProviderConfig = Field(
         description="LLM provider settings used by the harness policy."
     )

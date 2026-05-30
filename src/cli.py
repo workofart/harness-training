@@ -24,15 +24,26 @@ def load_strict_runtime_config(
     return harbor_config, harness_config
 
 
-def load_runtime_config() -> tuple[HarborConfig, HarnessConfig, str]:
+def _load_llm_provider_secret(
+    *,
+    harness_config: HarnessConfig,
+    dotenv_path: str | Path = ".env",
+) -> str | None:
+    if harness_config.llm_provider_config.provider == "openrouter":
+        from src.adapters.open_router import load_openrouter_api_key
+
+        return load_openrouter_api_key(dotenv_path=dotenv_path)
+    return None
+
+
+def load_runtime_config() -> tuple[HarborConfig, HarnessConfig, str | None]:
     from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH
-    from src.adapters.open_router import load_openrouter_api_key
 
     harbor_config, harness_config = load_strict_runtime_config(
         harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
         harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
     )
-    api_key = load_openrouter_api_key()
+    api_key = _load_llm_provider_secret(harness_config=harness_config)
     return harbor_config, harness_config, api_key
 
 

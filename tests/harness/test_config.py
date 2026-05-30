@@ -54,6 +54,20 @@ def test_harness_config_accepts_provider_require_parameters():
     assert config.llm_provider_config.provider_kwargs.require_parameters is True
 
 
+def test_harness_config_defaults_missing_provider_to_openrouter():
+    payload = {
+        "experiment_id": "exp-1",
+        "train_task_names": ["task-a"],
+        "llm_provider_config": {
+            "model_name": "openrouter/openai/gpt-oss-20b",
+        },
+    }
+
+    config = HarnessConfig.model_validate(payload)
+
+    assert config.llm_provider_config.provider == "openrouter"
+
+
 def test_harness_config_accepts_provider_routing_with_ignore():
     payload = {
         "experiment_id": "exp-1",
@@ -99,3 +113,22 @@ def test_provider_routing_ignore_defaults_to_empty_tuple():
     routing = config.llm_provider_config.provider_kwargs.provider
     assert routing is not None
     assert routing.ignore == ()
+
+
+def test_harness_config_accepts_chatgpt_codex_provider():
+    payload = {
+        "experiment_id": "exp-1",
+        "train_task_names": ["task-a"],
+        "llm_provider_config": {
+            "provider": "chatgpt_codex",
+            "model_name": "gpt-5.5",
+            "max_context_length": 200000,
+            "reasoning_effort": "low",
+        },
+    }
+
+    config = HarnessConfig.model_validate(payload)
+
+    assert config.llm_provider_config.provider == "chatgpt_codex"
+    assert config.llm_provider_config.model_name == "gpt-5.5"
+    assert config.llm_provider_config.max_context_length == 200000

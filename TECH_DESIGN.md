@@ -5,7 +5,7 @@
 Configured in `pyproject.toml`:
 
 - `exp` -> `src.cli:main_exp`
-  - loads `config/harbor_config.toml`, `config/harness_config.json`, and `OPENROUTER_API_KEY`
+  - loads `config/harbor_config.toml`, `config/harness_config.json`, and provider credentials
   - runs one tracked experiment via `ExperimentRunner`
   - when an active baseline exists, fails fast if the candidate train panel does not match it
 - `auto` -> `src.cli:main_auto`
@@ -52,6 +52,8 @@ Configured in `pyproject.toml`:
   - Harbor-backed environment adapter and task-directory resolution
 - `src/adapters/open_router.py`
   - OpenRouter transport, token counting, provider retry/shutdown
+- `src/adapters/chatgpt_codex.py`
+  - experimental ChatGPT/Codex OAuth transport, Responses request conversion, and SSE parsing
 - `src/adapters/llm_base.py`
   - abstract LLM interface and typed completion dataclasses
 - `src/trace.py`

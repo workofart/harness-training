@@ -19,8 +19,8 @@ This repository is intended to be run from a source checkout, not from an instal
 
 Important behavior:
 
-- **`uv run exp` uses paid LLM calls.** The harness calls OpenRouter on every task step.
-- **`uv run auto` adds a second paid agent loop.** The supervisor calls Codex or Claude while the harness calls OpenRouter. There is no built-in budget cap; stop it with Ctrl+C.
+- **`uv run exp` uses paid/quota-limited LLM calls.** The harness calls the configured LLM provider on every task step.
+- **`uv run auto` adds a second paid/quota-limited agent loop.** The supervisor calls Codex or Claude while the harness calls its configured LLM provider. There is no built-in budget cap; stop it with Ctrl+C.
 - **`uv run auto` moves your git HEAD.** The supervisor `git reset --hard`s your primary worktree between baseline and candidate commits as it evaluates patches (see [`promote_workspace_commit_to_repo`](./src/control/supervisor.py)). Run `auto` in a dedicated checkout, not on a branch you care about.
 - **The supervisor agent CLIs run without permission prompts.** The Codex backend uses `--dangerously-bypass-approvals-and-sandbox`; the Claude backend uses `--dangerously-skip-permissions`.
 
@@ -39,7 +39,7 @@ source .venv/bin/activate
 
 2. Prerequisites for running Terminal-Bench tasks:
 
-- OpenRouter credentials: set `OPENROUTER_API_KEY` in the shell or in a repo-local `.env`. Copy [`.env.example`](./.env.example) as a starting point.
+- LLM credentials: for OpenRouter, set `OPENROUTER_API_KEY` in the shell or in a repo-local `.env`; for experimental `chatgpt_codex`, run `codex login` first so `~/.codex/auth.json` exists.
 - Docker: install and start Docker. Harbor starts one container per task trial; `max_concurrency` in [`config/harness_config.json`](./config/harness_config.json) caps parallel trials.
 
 3. Prerequisites for the self-improvement loop:
@@ -51,7 +51,7 @@ source .venv/bin/activate
 4. Configure the run in [`config/harness_config.json`](./config/harness_config.json):
 
 - The committed default is a one-task smoke run: `log-summary-date-ranges`, `max_concurrency: 1`, `task_trials: 1`, `max_steps: 100`. This is meant to validate local setup with bounded Docker/API usage, not to produce benchmark-quality evidence.
-- The default OpenRouter config includes provider routing used by the checked-in tests. If that provider is unavailable in your OpenRouter account, update `llm_provider_config.provider_kwargs.provider`.
+- The default OpenRouter config includes provider routing used by the checked-in tests. If that provider is unavailable in your OpenRouter account, update `llm_provider_config.provider_kwargs.provider`. Experimental `chatgpt_codex` requires explicit `model_name` and `max_context_length`.
 - For serious comparisons, expand `train_task_names`, raise budgets deliberately, and commit the config before running `uv run auto`.
 - See [`config/harness_config.template.json`](./config/harness_config.template.json) for a commented template.
 
