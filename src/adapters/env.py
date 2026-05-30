@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # fast and shaves cost from invocations that never reach those paths.
 
 from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
-from src.harness.contracts import RawState
+from src.harness.contracts import EnvExecWorkload, RawState
 
 DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"
@@ -137,10 +137,10 @@ class Harbor:
         self._trial_dir: Path | None = None
         self._verifier_stdout_path: Path | None = None
         # Optional run-scoped gate, shared across the panel's Harbor instances,
-        # bounding how many trials run a container command at once. Acquired per
-        # exec/verify call (never across an LLM round-trip), so trials idling on
-        # the model overlap while host-CPU stays bounded by max_env_concurrency.
-        # None => ungated (single-trial use, tests).
+        # bounding heavyweight container work (reset/startup, run, verify).
+        # Cheap harness-generated file/list/search/edit commands use workload
+        # "light" and bypass this gate, so they do not queue behind compiles or
+        # long verifiers. None => ungated (single-trial use, tests).
         self._exec_semaphore = exec_semaphore
 
     @property
@@ -315,11 +315,9 @@ class Harbor:
             await self._stop_environment(harbor_environment)
             raise
 
-    def _env_gate(self):
-        """Per-call gate around container CPU work. Returns the shared env-exec
-        semaphore when configured, else a no-op context. Acquired only around
-        reset/startup, one exec, or one verify; never across an LLM round-trip."""
-        if self._exec_semaphore is None:
+    def _env_gate(self, workload: EnvExecWorkload = "heavy"):
+        """Per-call gate around heavyweight container CPU work."""
+        if workload == "light" or self._exec_semaphore is None:
             return contextlib.nullcontext()
         return self._exec_semaphore
 
@@ -329,8 +327,9 @@ class Harbor:
         command: str,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        workload: EnvExecWorkload = "heavy",
     ) -> RawState:
-        async with self._env_gate():
+        async with self._env_gate(workload):
             try:
                 result = await self.session.environment.exec(
                     command=command,

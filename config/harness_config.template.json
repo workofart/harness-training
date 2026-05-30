@@ -25,7 +25,8 @@
   // max_env_concurrency to overlap trials that are idling on the LLM.
   "max_trial_concurrency": 1,
 
-  // Maximum trials running a container command (env exec/verify) at once.
+  // Maximum trials running heavyweight container work (reset/startup, run,
+  // verify) at once. Cheap file/list/search/edit commands bypass this gate.
   // Bounds host-CPU contention independently of max_trial_concurrency; set near the
   // core count. No effect when >= max_trial_concurrency. Default 10.
   "max_env_concurrency": 1,

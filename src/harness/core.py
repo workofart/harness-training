@@ -316,14 +316,18 @@ def build_action(action_name: ActionName, args: dict[str, Any]) -> Action:
 async def execute_action(env: HarnessEnv, action: Action) -> RawState:
     match action:
         case ListDirAction(path=path):
-            return await env.exec(command=f"ls -1Ap {shlex.quote(path or '.')}")
+            return await env.exec(
+                command=f"ls -1Ap {shlex.quote(path or '.')}", workload="light"
+            )
         case FindFilesAction(pattern=pattern, root=root):
             return await env.exec(
-                command=f"find {shlex.quote(root or '.')} -name {shlex.quote(pattern)}"
+                command=f"find {shlex.quote(root or '.')} -name {shlex.quote(pattern)}",
+                workload="light",
             )
         case SearchTextAction(query=query, root=root):
             return await env.exec(
-                command=f"grep -rn {shlex.quote(query)} {shlex.quote(root or '.')}"
+                command=f"grep -rn {shlex.quote(query)} {shlex.quote(root or '.')}",
+                workload="light",
             )
         case ReadFileAction(path=path, start_line=start_line, end_line=end_line):
             start = start_line or 1
@@ -333,11 +337,13 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
                 else start + DEFAULT_READ_WINDOW_LINES - 1
             )
             return await env.exec(
-                command=f"sed -n '{start},{end}p' {shlex.quote(path)}"
+                command=f"sed -n '{start},{end}p' {shlex.quote(path)}",
+                workload="light",
             )
         case WriteFileAction(path=path, content=content):
             return await env.exec(
-                command=f"printf %s {shlex.quote(content)} > {shlex.quote(path)}"
+                command=f"printf %s {shlex.quote(content)} > {shlex.quote(path)}",
+                workload="light",
             )
         case EditFileAction(path=path, old_text=old_text, new_text=new_text):
             script = (
@@ -349,7 +355,8 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
                 command=(
                     f"python3 -c {shlex.quote(script)} "
                     f"{shlex.quote(path)} {shlex.quote(old_text)} {shlex.quote(new_text)}"
-                )
+                ),
+                workload="light",
             )
         case RunAction(command=command, cwd=cwd, timeout_sec=timeout_sec):
             return await env.exec(command=command, cwd=cwd, timeout_sec=timeout_sec)
