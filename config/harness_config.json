@@ -1,5 +1,5 @@
 {
-  "experiment_id": "exp-gpt-5-5-high-small-baseline-0529",
+  "experiment_id": "exp-gpt-5-5-high-small-baseline-0530",
   "focus_name": "baseline",
   "train_task_names": [
     "openssl-selfsigned-cert",
@@ -32,7 +32,6 @@
     "password-recovery",
     "sanitize-git-repo",
     "git-leak-recovery",
-    "vulnerable-secret",
     "build-pmars",
     "build-pov-ray",
     "sqlite-with-gcov",
@@ -67,7 +66,6 @@
     "polyglot-rust-c",
     "write-compressor",
     "feal-linear-cryptanalysis",
-    "model-extraction-relu-logits",
     "gpt2-codegolf",
     "dna-assembly",
     "protein-assembly"
@@ -92,7 +90,9 @@
     "make-doom-for-mips",
     "make-mips-interpreter",
     "install-windows-3.11",
-    "regex-chess"
+    "regex-chess",
+    "vulnerable-secret",
+    "model-extraction-relu-logits"
   ],
   "max_steps": 1000,
   "max_trial_concurrency": 16,

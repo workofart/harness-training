@@ -34,11 +34,14 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
 def test_default_harness_config_matches_baseline_run_profile():
     config = HarnessConfig.model_validate_json(DEFAULT_HARNESS_CONFIG_PATH.read_text())
 
-    assert len(config.train_task_names) == 69
-    assert len(config.slow_task_names) == 20
+    assert len(config.train_task_names) == 67
+    assert len(config.slow_task_names) == 22
     # slow tasks are held out of the panel, never overlapping it
     assert set(config.train_task_names).isdisjoint(config.slow_task_names)
     assert len(set(config.train_task_names) | set(config.slow_task_names)) == 89
+    # the two refusal-prone tasks were moved out of the panel into storage
+    assert "vulnerable-secret" in config.slow_task_names
+    assert "model-extraction-relu-logits" in config.slow_task_names
     assert config.max_trial_concurrency == 16
     assert config.max_env_concurrency == 10
     assert config.task_timeout_sec == 1200.0
