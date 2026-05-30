@@ -5,7 +5,8 @@
     "log-summary-date-ranges"
   ],
   "max_steps": 100,
-  "max_concurrency": 1,
+  "max_trial_concurrency": 1,
+  "max_env_concurrency": 1,
   "task_timeout_sec": 300.0,
   "max_output_retries": 2,
   "task_trials": 1,

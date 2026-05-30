@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -102,6 +103,7 @@ async def run_task(
     max_output_retries: int = 2,
     task_timeout_sec: float | None = None,
     trace_path: str | None = None,
+    slot_release: Callable[[], None] | None = None,
 ) -> TaskResult:
     timeout_ctx = None
     started_at = datetime.now(timezone.utc).isoformat()
@@ -273,6 +275,13 @@ async def run_task(
         recorder.task_failed(exc=exc, detail=error)
         steps_used = _recorded_steps_used(recorder, fallback=steps_used)
     finally:
+        # The trial's result is already finalized at this point (happy path
+        # returned it; error paths captured state into the nonlocals the bottom
+        # return packages). Free the concurrency slot *before* the docker
+        # teardown so the next trial's `compose up` overlaps this trial's
+        # `compose down` — teardown still runs here, in this same task.
+        if slot_release is not None:
+            slot_release()
         await _close_resources(llm=llm, env=env, recorder=recorder)
 
     recorder.set_trial_outcome(

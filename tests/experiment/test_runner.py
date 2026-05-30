@@ -33,7 +33,8 @@ class FakeHarnessConfig:
     focus_name: str
     train_task_names: list[str]
     max_steps: int = 30
-    max_concurrency: int = 1
+    max_trial_concurrency: int = 1
+    max_env_concurrency: int = 10
     task_timeout_sec: float = 600.0
     max_output_retries: int = 2
     max_disallowed_retries: int = 2
@@ -159,6 +160,54 @@ def _write_baseline_record(
     return baseline
 
 
+def _baseline_with_durations(durations_sec: dict[str, float]):
+    baseline = ExperimentRecord.initialize(
+        experiment_id="baseline",
+        git_commit_hash="abc",
+        parent_baseline_experiment_id=None,
+        train_task_ids=list(durations_sec),
+        started_at="2026-04-10T00:00:00+00:00",
+        expected_trial_count=1,
+    )
+    for task_id, seconds in durations_sec.items():
+        end_min, end_sec = divmod(int(seconds), 60)
+        baseline.record_task_result(
+            TaskResult(
+                task_name=task_id,
+                reward=1.0,
+                solved=True,
+                steps_used=1,
+                started_at="2026-04-10T00:00:00+00:00",
+                finished_at=f"2026-04-10T00:{end_min:02d}:{end_sec:02d}+00:00",
+            )
+        )
+    return baseline
+
+
+def test_schedule_order_sorts_by_descending_baseline_duration():
+    baseline = _baseline_with_durations({"short": 1, "long": 100, "mid": 10})
+
+    order = runner._schedule_order(["short", "long", "mid"], baseline)
+
+    assert order == ["long", "mid", "short"]
+
+
+def test_schedule_order_falls_back_to_config_order_without_baseline():
+    assert runner._schedule_order(["a", "b", "c"], None) == ["a", "b", "c"]
+
+
+def test_schedule_order_keeps_config_order_for_equal_durations():
+    # Stable sort: equal-cost ties (and tasks absent from the baseline) keep
+    # their config order rather than shuffling.
+    baseline = _baseline_with_durations({"a": 5, "b": 5})
+
+    assert runner._schedule_order(["a", "b", "unseen"], baseline) == [
+        "a",
+        "b",
+        "unseen",
+    ]
+
+
 def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
     monkeypatch, tmp_path
 ):
@@ -173,7 +222,7 @@ def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
             focus_name="focus",
             train_task_names=["task-a", "task-b"],
             task_trials=3,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -210,7 +259,7 @@ def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a", "task-b")
@@ -242,7 +291,7 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=1,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -263,8 +312,17 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
         max_output_retries=2,
         task_timeout_sec=None,
         trace_path=None,
+        slot_release=None,
     ):
-        del llm, env, max_steps, max_output_retries, task_timeout_sec, trace_path
+        del (
+            llm,
+            env,
+            max_steps,
+            max_output_retries,
+            task_timeout_sec,
+            trace_path,
+            slot_release,
+        )
         call_log.append(task_name)
         return TaskResult(
             task_name=task_name,
@@ -286,7 +344,7 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -311,7 +369,7 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=1,
-            max_concurrency=1,
+            max_trial_concurrency=1,
             task_timeout_sec=0.01,
         ),
         harbor_config=type(
@@ -333,8 +391,9 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
         max_output_retries=2,
         task_timeout_sec=None,
         trace_path=None,
+        slot_release=None,
     ):
-        del llm, env, max_steps, max_output_retries, trace_path
+        del llm, env, max_steps, max_output_retries, trace_path, slot_release
         seen_timeouts.append(task_timeout_sec)
         return TaskResult(
             task_name=task_name,
@@ -352,7 +411,7 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -378,7 +437,7 @@ def test_run_panel_runs_all_trials_when_first_two_split(monkeypatch, tmp_path):
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=3,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -413,7 +472,7 @@ def test_run_panel_runs_all_trials_when_first_two_split(monkeypatch, tmp_path):
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -442,7 +501,7 @@ def test_run_panel_early_stops_when_two_trials_fail(monkeypatch, tmp_path):
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=3,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -479,7 +538,7 @@ def test_run_panel_early_stops_when_two_trials_fail(monkeypatch, tmp_path):
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -508,7 +567,7 @@ def test_run_panel_requires_resolved_task_dir(monkeypatch, tmp_path):
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=1,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -537,7 +596,7 @@ def test_run_experiment_runs_single_trial_for_deterministic_baseline_task(
             focus_name="focus",
             train_task_names=["train-det", "train-noise"],
             task_trials=3,
-            max_concurrency=2,
+            max_trial_concurrency=2,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -602,7 +661,7 @@ def test_run_experiment_runs_single_trial_for_deterministic_baseline_task(
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "train-det", "train-noise")
@@ -641,7 +700,7 @@ def test_run_experiment_confirms_on_fail_when_deterministic_trial_fails(
             focus_name="focus",
             train_task_names=["train-det"],
             task_trials=3,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -698,7 +757,7 @@ def test_run_experiment_confirms_on_fail_when_deterministic_trial_fails(
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "train-det")
@@ -731,7 +790,7 @@ def test_apply_baseline_derived_trial_counts_skips_non_deterministic(
             focus_name="focus",
             train_task_names=["task-a", "task-b", "task-c"],
             task_trials=3,
-            max_concurrency=2,
+            max_trial_concurrency=2,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -780,7 +839,7 @@ def test_run_experiment_runs_train_when_baseline_absent(monkeypatch, tmp_path):
             focus_name="focus",
             train_task_names=["train-a"],
             task_trials=3,
-            max_concurrency=2,
+            max_trial_concurrency=2,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -821,7 +880,7 @@ def test_run_experiment_runs_train_when_baseline_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "train-a")
@@ -1086,7 +1145,7 @@ def test_run_baseline_at_head_runs_full_current_panel(monkeypatch, tmp_path):
             train_task_names=["train-a", "train-b"],
             task_trials=1,
             llm_provider_config=None,
-            max_concurrency=1,
+            max_trial_concurrency=1,
             max_steps=30,
             task_timeout_sec=600.0,
             max_output_retries=2,
@@ -1147,7 +1206,7 @@ def test_run_baseline_at_head_seeds_when_no_active_baseline(monkeypatch, tmp_pat
             train_task_names=["train-a"],
             task_trials=1,
             llm_provider_config=None,
-            max_concurrency=1,
+            max_trial_concurrency=1,
             max_steps=30,
             task_timeout_sec=600.0,
             max_output_retries=2,
@@ -1224,7 +1283,7 @@ def test_run_baseline_at_head_crashes_when_no_valid_evidence(
             train_task_names=["train-a"],
             task_trials=1,
             llm_provider_config=None,
-            max_concurrency=1,
+            max_trial_concurrency=1,
             max_steps=30,
             task_timeout_sec=600.0,
             max_output_retries=2,
@@ -1276,7 +1335,7 @@ def test_run_experiment_finalizes_crash_when_no_valid_evidence(
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=1,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -1308,7 +1367,7 @@ def test_run_experiment_finalizes_crash_when_no_valid_evidence(
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -1345,7 +1404,7 @@ def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=3,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -1359,7 +1418,7 @@ def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
     call_count = 0
 
     async def fake_run_task(*, task_name, **_kwargs):
-        # max_concurrency=1 serializes trials, so the counter is deterministic.
+        # max_trial_concurrency=1 serializes trials, so the counter is deterministic.
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -1389,7 +1448,7 @@ def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -1428,7 +1487,7 @@ def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=1,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -1456,7 +1515,7 @@ def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -1485,7 +1544,7 @@ def test_run_panel_persists_completed_trial_without_refreshing_evidence(
             focus_name="focus",
             train_task_names=["task-a"],
             task_trials=1,
-            max_concurrency=1,
+            max_trial_concurrency=1,
         ),
         harbor_config=type(
             "HarborConfig",
@@ -1518,7 +1577,7 @@ def test_run_panel_persists_completed_trial_without_refreshing_evidence(
     monkeypatch.setattr(
         experiment_runner,
         "_make_env",
-        lambda task_name, *, task_dir: object(),
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
         raising=False,
     )
     _set_task_dirs(experiment_runner, tmp_path, "task-a")
@@ -1612,7 +1671,7 @@ def test_panel_progress_reporter_silent_on_non_tty():
     record.record_task_result(_task_result(task_name="train-a", reward=1.0))
     stream = _FakeStream(is_tty=False)
     reporter = runner.PanelProgressReporter(
-        total_tasks=1, max_concurrency=10, stream=stream
+        total_tasks=1, max_trial_concurrency=10, stream=stream
     )
     reporter.render(record)
     reporter.close()
@@ -1629,7 +1688,7 @@ def test_panel_progress_reporter_draws_and_finalizes_on_tty():
     )
     stream = _FakeStream(is_tty=True)
     reporter = runner.PanelProgressReporter(
-        total_tasks=2, max_concurrency=10, stream=stream
+        total_tasks=2, max_trial_concurrency=10, stream=stream
     )
 
     record.record_task_result(_task_result(task_name="train-a", reward=1.0))
@@ -1663,7 +1722,7 @@ def test_panel_progress_reporter_maps_record_counts_to_line():
     )
     stream = _FakeStream(is_tty=True)
     reporter = runner.PanelProgressReporter(
-        total_tasks=2, max_concurrency=2, stream=stream
+        total_tasks=2, max_trial_concurrency=2, stream=stream
     )
 
     record.record_task_result(
@@ -1691,7 +1750,7 @@ def test_panel_progress_reporter_close_terminates_dangling_line():
     )
     stream = _FakeStream(is_tty=True)
     reporter = runner.PanelProgressReporter(
-        total_tasks=2, max_concurrency=10, stream=stream
+        total_tasks=2, max_trial_concurrency=10, stream=stream
     )
     record.record_task_result(_task_result(task_name="train-a", reward=1.0))
     reporter.render(record)  # one task done, panel incomplete -> no newline yet

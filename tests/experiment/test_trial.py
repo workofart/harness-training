@@ -132,6 +132,58 @@ def test_run_task_closes_llm_and_env_in_finally():
     assert env.closed is True
 
 
+def test_run_task_releases_slot_before_closing_env():
+    # The concurrency slot must be handed back *before* teardown so the next
+    # trial's container startup overlaps this trial's `compose down`.
+    events: list[str] = []
+
+    class _OrderEnv(_StubEnv):
+        async def close(self) -> None:
+            events.append("close")
+            await super().close()
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _OrderEnv()
+
+    asyncio.run(
+        run_task(
+            task_name="t",
+            llm=llm,
+            env=env,
+            max_steps=5,
+            slot_release=lambda: events.append("release"),
+        )
+    )
+
+    assert events == ["release", "close"]
+    assert env.closed is True
+
+
+def test_run_task_releases_slot_before_close_even_when_act_raises():
+    events: list[str] = []
+
+    class _OrderEnv(_StubEnv):
+        async def close(self) -> None:
+            events.append("close")
+            await super().close()
+
+    llm = _StubLlm([])  # empty -> act() raises on first completion
+    env = _OrderEnv()
+
+    result = asyncio.run(
+        run_task(
+            task_name="t",
+            llm=llm,
+            env=env,
+            max_steps=5,
+            slot_release=lambda: events.append("release"),
+        )
+    )
+
+    assert result.error == "pop from empty list"
+    assert events == ["release", "close"]
+
+
 def test_run_task_closes_resources_even_when_act_raises():
     llm = _StubLlm([])
     env = _StubEnv()

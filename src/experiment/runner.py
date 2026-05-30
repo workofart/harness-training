@@ -49,6 +49,41 @@ def _prepare_task_dirs(
     return dict(TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names)))
 
 
+def _schedule_order(
+    task_names: Sequence[str],
+    baseline: ExperimentRecord | None,
+) -> list[str]:
+    """Longest-task-first (LPT) launch order to minimize panel makespan.
+
+    Trials acquire the trial semaphore FIFO in the order tasks are launched, and
+    makespan on a fixed worker pool is tail-dominated: a long task admitted late
+    hangs off the end with nothing to overlap it. Ordering by the baseline's
+    per-task wall-time (descending) starts the long poles first so short tasks
+    fill the tail. Reorders only the launch sequence — `train_task_ids`, the
+    record, and the (task-id-keyed) gate are order-independent, so outcomes are
+    untouched. Falls back to config order when there is no baseline prior.
+    """
+    names = list(task_names)
+    if baseline is None:
+        return names
+
+    def cost(task_id: str) -> float:
+        trials = baseline.train_task_results.get(task_id)
+        if trials is None:
+            return 0.0
+        total = 0.0
+        for trial in trials.trials:
+            if trial.started_at and trial.finished_at:
+                total += (
+                    datetime.fromisoformat(trial.finished_at)
+                    - datetime.fromisoformat(trial.started_at)
+                ).total_seconds()
+        return total
+
+    # Stable sort (reverse=True keeps equal-cost ties in config order).
+    return sorted(names, key=cost, reverse=True)
+
+
 PROGRESS_BAR_WIDTH = 24
 
 
@@ -109,12 +144,12 @@ class PanelProgressReporter:
         self,
         *,
         total_tasks: int,
-        max_concurrency: int,
+        max_trial_concurrency: int,
         stream: Any | None = None,
     ) -> None:
         self._stream = sys.stderr if stream is None else stream
         self._total_tasks = total_tasks
-        self._max_concurrency = max_concurrency
+        self._max_trial_concurrency = max_trial_concurrency
         self._enabled = bool(getattr(self._stream, "isatty", lambda: False)())
         self._start = time.monotonic()
         self._drawn = False
@@ -129,7 +164,9 @@ class PanelProgressReporter:
         valid_done = sum(len(t.valid_trials) for t in trials)
         trials_planned = sum(t.expected_trial_count for t in trials)
         decided = sum(1 for t in trials if t.majority_solved is not None)
-        in_flight = max(0, min(self._max_concurrency, trials_planned - trials_done))
+        in_flight = max(
+            0, min(self._max_trial_concurrency, trials_planned - trials_done)
+        )
         line = format_panel_progress(
             tasks_done=tasks_done,
             total_tasks=self._total_tasks,
@@ -169,10 +206,11 @@ async def _run_panel(
     make_llm: Callable[[], Any],
     make_env: Callable[..., Any],
 ) -> None:
-    semaphore = asyncio.Semaphore(harness_config.max_concurrency)
+    semaphore = asyncio.Semaphore(harness_config.max_trial_concurrency)
+    env_semaphore = asyncio.Semaphore(harness_config.max_env_concurrency)
     reporter = PanelProgressReporter(
         total_tasks=len(task_names),
-        max_concurrency=harness_config.max_concurrency,
+        max_trial_concurrency=harness_config.max_trial_concurrency,
     )
 
     def persist_task_result(task_result: TaskResult) -> None:
@@ -181,16 +219,32 @@ async def _run_panel(
         reporter.render(record)
 
     async def run_one_trial(task_id: str) -> None:
-        async with semaphore:
+        # Manual acquire/release (not `async with`) so `run_task` can hand the
+        # slot back the moment its result is final — before its docker teardown
+        # — letting the next trial start while this one tears down. `release_slot`
+        # is idempotent; the `finally` is the safety net for paths that never
+        # reach run_task's own release (e.g. the task_dir KeyError below).
+        await semaphore.acquire()
+        slot_released = False
+
+        def release_slot() -> None:
+            nonlocal slot_released
+            if not slot_released:
+                slot_released = True
+                semaphore.release()
+
+        try:
             task_dir = task_dirs[task_id]
+            env = make_env(task_id, task_dir=task_dir, exec_semaphore=env_semaphore)
             try:
                 trial_result = await run_task(
                     task_name=task_id,
                     llm=make_llm(),
-                    env=make_env(task_id, task_dir=task_dir),
+                    env=env,
                     max_steps=harness_config.max_steps,
                     max_output_retries=harness_config.max_output_retries,
                     task_timeout_sec=harness_config.task_timeout_sec,
+                    slot_release=release_slot,
                 )
             except asyncio.CancelledError:
                 raise
@@ -200,6 +254,8 @@ async def _run_panel(
                     return
                 raise
             persist_task_result(trial_result)
+        finally:
+            release_slot()
 
     async def run_task_trials(task_id: str) -> None:
         full_trial_count = harness_config.task_trials
@@ -358,17 +414,20 @@ class ExperimentRunner:
                 _run_panel(
                     record=record,
                     experiments_root=experiments_root,
-                    task_names=harness_config.train_task_names,
+                    task_names=_schedule_order(
+                        harness_config.train_task_names, baseline
+                    ),
                     task_dirs=task_dirs,
                     harness_config=harness_config,
                     make_llm=lambda: _make_llm_for_config(
                         config=harness_config.llm_provider_config,
                         api_key=api_key,
                     ),
-                    make_env=lambda task_name, *, task_dir: Harbor(
+                    make_env=lambda task_name, *, task_dir, exec_semaphore=None: Harbor(
                         trial_harbor_config,
                         task_name=task_name,
                         task_dir=task_dir,
+                        exec_semaphore=exec_semaphore,
                     ),
                 )
             )
@@ -423,13 +482,19 @@ class ExperimentRunner:
             update={"experiments_dir": self.experiment_dir / "tasks"}
         )
 
-    def _make_env(self, task_name: str, task_dir: Path):
+    def _make_env(
+        self,
+        task_name: str,
+        task_dir: Path,
+        exec_semaphore: asyncio.Semaphore | None = None,
+    ):
         from src.adapters.env import Harbor
 
         return Harbor(
             self._trial_harbor_config(),
             task_name=task_name,
             task_dir=task_dir,
+            exec_semaphore=exec_semaphore,
         )
 
     def _make_llm(self):
@@ -502,7 +567,9 @@ class ExperimentRunner:
             await _run_panel(
                 record=self.record,
                 experiments_root=self.experiments_root,
-                task_names=list(self.harness_config.train_task_names),
+                task_names=_schedule_order(
+                    self.harness_config.train_task_names, baseline
+                ),
                 task_dirs=self._task_dirs,
                 harness_config=self.harness_config,
                 make_llm=self._make_llm,
