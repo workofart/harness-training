@@ -40,7 +40,7 @@ source .venv/bin/activate
 2. Prerequisites for running Terminal-Bench tasks:
 
 - LLM credentials: for OpenRouter, set `OPENROUTER_API_KEY` in the shell or in a repo-local `.env`; for experimental `chatgpt_codex`, run `codex login` first so `~/.codex/auth.json` exists.
-- Docker: install and start Docker. Harbor starts one container per task trial; `max_concurrency` in [`config/harness_config.json`](./config/harness_config.json) caps parallel trials.
+- Docker: install and start Docker. Harbor starts one container per task trial; `max_trial_concurrency` in [`config/harness_config.json`](./config/harness_config.json) caps trials in flight, and `max_env_concurrency` caps how many run a container command at once (host-CPU bound).
 
 3. Prerequisites for the self-improvement loop:
 
@@ -50,7 +50,7 @@ source .venv/bin/activate
 
 4. Configure the run in [`config/harness_config.json`](./config/harness_config.json):
 
-- The committed default is a one-task smoke run: `log-summary-date-ranges`, `max_concurrency: 1`, `task_trials: 1`, `max_steps: 100`. This is meant to validate local setup with bounded Docker/API usage, not to produce benchmark-quality evidence.
+- The committed default is a one-task smoke run: `log-summary-date-ranges`, `max_trial_concurrency: 1`, `task_trials: 1`, `max_steps: 100`. This is meant to validate local setup with bounded Docker/API usage, not to produce benchmark-quality evidence.
 - The default OpenRouter config includes provider routing used by the checked-in tests. If that provider is unavailable in your OpenRouter account, update `llm_provider_config.provider_kwargs.provider`. Experimental `chatgpt_codex` requires explicit `model_name` and `max_context_length`.
 - For serious comparisons, expand `train_task_names`, raise budgets deliberately, and commit the config before running `uv run auto`.
 - See [`config/harness_config.template.json`](./config/harness_config.template.json) for a commented template.

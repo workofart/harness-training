@@ -134,10 +134,25 @@ class HarnessConfig(BaseModel):
         gt=0,
         description="Maximum policy/environment steps allowed per task episode.",
     )
-    max_concurrency: int = Field(
+    max_trial_concurrency: int = Field(
         default=10,
         gt=0,
-        description="Maximum number of task episodes to run concurrently.",
+        description=(
+            "Maximum number of task trials in flight at once (each holds one "
+            "live container). Bounded by memory and the LLM backend. Raise above "
+            "max_env_concurrency to overlap trials idling on the LLM."
+        ),
+    )
+    max_env_concurrency: int = Field(
+        default=10,
+        gt=0,
+        description=(
+            "Maximum number of trials executing a container command "
+            "(env exec/verify) at once. Bounds host-CPU contention "
+            "independently of `max_trial_concurrency`, so trials idling on the "
+            "LLM can overlap without oversubscribing cores and slowing real "
+            "builds. No effect when >= max_trial_concurrency."
+        ),
     )
     task_timeout_sec: float = Field(
         default=600.0,

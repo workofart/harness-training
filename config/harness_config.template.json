@@ -20,9 +20,15 @@
   // Maximum policy/environment steps per task trial. Raise this for serious runs.
   "max_steps": 100,
 
-  // Maximum task trials in flight. Keep this at 1 until Docker and API cost
-  // behavior is understood.
-  "max_concurrency": 1,
+  // Maximum task trials in flight (each holds one live container). Keep this at
+  // 1 until Docker and API cost behavior is understood. Raise it above
+  // max_env_concurrency to overlap trials that are idling on the LLM.
+  "max_trial_concurrency": 1,
+
+  // Maximum trials running a container command (env exec/verify) at once.
+  // Bounds host-CPU contention independently of max_trial_concurrency; set near the
+  // core count. No effect when >= max_trial_concurrency. Default 10.
+  "max_env_concurrency": 1,
 
   // Wall-clock timeout for one task trial.
   "task_timeout_sec": 300.0,

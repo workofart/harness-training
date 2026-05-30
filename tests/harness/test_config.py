@@ -9,7 +9,7 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
         "focus_name": "action-set",
         "train_task_names": ["task-a"],
         "max_steps": 20,
-        "max_concurrency": 3,
+        "max_trial_concurrency": 3,
         "task_timeout_sec": 30.0,
         "max_output_retries": 4,
         "llm_provider_config": {
@@ -24,7 +24,7 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
     assert config.focus_name == "action-set"
     assert config.train_task_names == ["task-a"]
     assert config.max_steps == 20
-    assert config.max_concurrency == 3
+    assert config.max_trial_concurrency == 3
     assert config.task_timeout_sec == 30.0
     assert config.max_output_retries == 4
     assert config.llm_provider_config.service_tier is None

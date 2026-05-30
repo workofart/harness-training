@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import tomllib
 from dataclasses import dataclass
@@ -116,6 +117,7 @@ class Harbor:
         *,
         task_name: str,
         task_dir: Path,
+        exec_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self.config = config
         self.task_name = task_name
@@ -123,6 +125,12 @@ class Harbor:
         self._session: HarborSession | None = None
         self._trial_dir: Path | None = None
         self._verifier_stdout_path: Path | None = None
+        # Optional run-scoped gate, shared across the panel's Harbor instances,
+        # bounding how many trials run a container command at once. Acquired per
+        # exec/verify call (never across an LLM round-trip), so trials idling on
+        # the model overlap while host-CPU stays bounded by max_env_concurrency.
+        # None => ungated (single-trial use, tests).
+        self._exec_semaphore = exec_semaphore
 
     @property
     def session(self) -> HarborSession:
@@ -295,6 +303,14 @@ class Harbor:
             await self._stop_environment(harbor_environment)
             raise
 
+    def _env_gate(self):
+        """Per-call gate around container CPU work. Returns the shared env-exec
+        semaphore when configured, else a no-op context. Acquired only around
+        one exec/verify, never across an LLM round-trip."""
+        if self._exec_semaphore is None:
+            return contextlib.nullcontext()
+        return self._exec_semaphore
+
     async def exec(
         self,
         *,
@@ -302,48 +318,51 @@ class Harbor:
         cwd: str | None = None,
         timeout_sec: int | None = None,
     ) -> RawState:
-        try:
-            result = await self.session.environment.exec(
-                command=command,
-                cwd=cwd,
-                timeout_sec=timeout_sec,
-            )
-        except RuntimeError as exc:
-            # Harbor's docker/gke backends raise RuntimeError on per-command
-            # timeout instead of returning a failed ExecResult. Convert into a
-            # failed observation so the agent sees the timeout and can pick a
-            # longer `timeout_sec` or a different approach. Other RuntimeErrors
-            # (e.g. container crash) still surface as trial-fatal.
-            if not _is_command_timeout(exc):
-                raise
+        async with self._env_gate():
+            try:
+                result = await self.session.environment.exec(
+                    command=command,
+                    cwd=cwd,
+                    timeout_sec=timeout_sec,
+                )
+            except RuntimeError as exc:
+                # Harbor's docker/gke backends raise RuntimeError on per-command
+                # timeout instead of returning a failed ExecResult. Convert into
+                # a failed observation so the agent sees the timeout and can pick
+                # a longer `timeout_sec` or a different approach. Other
+                # RuntimeErrors (e.g. container crash) still surface as
+                # trial-fatal.
+                if not _is_command_timeout(exc):
+                    raise
+                return RawState(
+                    return_code=124,
+                    stdout=None,
+                    stderr=str(exc),
+                    passed=False,
+                )
+            self._append_agent_log(command=command, result=result, cwd=cwd)
             return RawState(
-                return_code=124,
-                stdout=None,
-                stderr=str(exc),
-                passed=False,
+                return_code=result.return_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                passed=result.return_code == 0,
             )
-        self._append_agent_log(command=command, result=result, cwd=cwd)
-        return RawState(
-            return_code=result.return_code,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            passed=result.return_code == 0,
-        )
 
     async def verify(self) -> RawState:
-        verifier_result = await self.session.verifier.verify()
-        rewards = verifier_result.rewards
-        raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
-        reward = 0.0 if raw_reward is None else float(raw_reward)
-        stdout_path = self.session.trial_paths.test_stdout_path
-        stderr_path = self.session.trial_paths.test_stderr_path
-        return RawState(
-            reward=reward,
-            done=True,
-            passed=reward > 0.0,
-            stdout=stdout_path.read_text() if stdout_path.exists() else None,
-            stderr=stderr_path.read_text() if stderr_path.exists() else None,
-        )
+        async with self._env_gate():
+            verifier_result = await self.session.verifier.verify()
+            rewards = verifier_result.rewards
+            raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
+            reward = 0.0 if raw_reward is None else float(raw_reward)
+            stdout_path = self.session.trial_paths.test_stdout_path
+            stderr_path = self.session.trial_paths.test_stderr_path
+            return RawState(
+                reward=reward,
+                done=True,
+                passed=reward > 0.0,
+                stdout=stdout_path.read_text() if stdout_path.exists() else None,
+                stderr=stderr_path.read_text() if stderr_path.exists() else None,
+            )
 
     async def _detect_working_dir(self) -> str:
         result = await self.session.environment.exec(command="pwd")

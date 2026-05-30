@@ -150,6 +150,78 @@ def test_harbor_exec_propagates_non_timeout_runtime_error(tmp_path: Path) -> Non
         asyncio.run(harbor.exec(command="ls"))
 
 
+def _stub_harbor_with_recording_exec(
+    tmp_path: Path,
+    *,
+    order: list[str],
+    exec_semaphore: asyncio.Semaphore | None,
+) -> Harbor:
+    """Build a Harbor whose inner exec records enter/exit order around an await
+    boundary, so concurrent `harbor.exec` calls reveal whether they overlap."""
+
+    async def fake_exec(*, command, cwd=None, timeout_sec=None):
+        order.append(f"enter:{command}")
+        await asyncio.sleep(0.01)
+        order.append(f"exit:{command}")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    config = HarborConfig(experiments_dir=tmp_path / "experiments")
+    harbor = Harbor(
+        config,
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+        exec_semaphore=exec_semaphore,
+    )
+    fake_session = MagicMock()
+    fake_session.environment.exec = fake_exec
+    agent_dir = tmp_path / "trial" / "agent"
+    agent_dir.mkdir(parents=True)
+    fake_session.trial_paths.agent_dir = agent_dir
+    harbor._session = fake_session
+    return harbor
+
+
+def test_harbor_exec_serializes_under_shared_semaphore(tmp_path: Path) -> None:
+    # The run-scoped exec_semaphore bounds how many trials run a container
+    # command at once. A size-1 gate must forbid two Harbor.exec calls from
+    # overlapping inside the container — the signal-preserving guarantee that
+    # lets trial-admission (outer max_trial_concurrency) run ahead of host-CPU
+    # capacity (inner max_env_concurrency) without oversubscribing cores.
+    order: list[str] = []
+    harbor = _stub_harbor_with_recording_exec(
+        tmp_path, order=order, exec_semaphore=asyncio.Semaphore(1)
+    )
+
+    async def go():
+        await asyncio.gather(harbor.exec(command="a"), harbor.exec(command="b"))
+
+    asyncio.run(go())
+
+    # Each command fully exits before the next enters — no interleaving.
+    assert order in (
+        ["enter:a", "exit:a", "enter:b", "exit:b"],
+        ["enter:b", "exit:b", "enter:a", "exit:a"],
+    )
+
+
+def test_harbor_exec_overlaps_without_semaphore(tmp_path: Path) -> None:
+    # Negative control: with no gate (exec_semaphore=None, the single-trial /
+    # test default), two concurrent execs overlap — proving the serialization
+    # above is caused by the semaphore, not by something incidental in exec.
+    order: list[str] = []
+    harbor = _stub_harbor_with_recording_exec(
+        tmp_path, order=order, exec_semaphore=None
+    )
+
+    async def go():
+        await asyncio.gather(harbor.exec(command="a"), harbor.exec(command="b"))
+
+    asyncio.run(go())
+
+    # Both enter before either exits.
+    assert order[:2] == ["enter:a", "enter:b"]
+
+
 def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:
     """Build a Harbor whose session.environment.exec follows a scripted
     sequence (`exec_side_effect`), with a real on-disk bootstrap log dir so we
