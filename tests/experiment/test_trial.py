@@ -144,6 +144,23 @@ def test_run_task_closes_resources_even_when_act_raises():
     assert env.closed is True
 
 
+def test_run_task_marks_crash_with_exception_type_for_blank_error():
+    # A bare exception (e.g. httpx.ReadError("")) has an empty str(); the trial
+    # must still record a non-blank error (its type) and failure_mode "crash".
+    class _BareErrorLlm(_StubLlm):
+        async def complete(self, *, messages, tools=None, reasoning_effort=None):
+            raise RuntimeError()
+
+    llm = _BareErrorLlm([])
+    env = _StubEnv()
+
+    result = asyncio.run(run_task(task_name="t", llm=llm, env=env, max_steps=5))
+
+    assert result.solved is False
+    assert result.error == "RuntimeError"
+    assert result.metrics.failure_mode == "crash"
+
+
 def test_run_task_writes_jsonl_when_trace_path_provided(tmp_path):
     trace = tmp_path / "trace.jsonl"
     llm = _StubLlm([_completion(_tool_call("verify"))])
@@ -205,8 +222,9 @@ def test_run_task_timeout_preserves_artifact_paths_and_attempted_steps(tmp_path)
     )
 
     assert result.solved is False
-    assert result.error == "task timed out after 0.05 seconds"
+    assert result.error is None
     assert result.steps_used == 2
+    assert result.metrics.failure_mode == "hit_timeout"
     assert result.started_at is not None
     assert result.finished_at is not None
     assert result.trial_dir == str(trial_dir)
@@ -243,6 +261,7 @@ def test_run_task_timeout_omits_missing_verifier_stdout_path(tmp_path):
         )
     )
 
-    assert result.error == "task timed out after 0.05 seconds"
+    assert result.error is None
+    assert result.metrics.failure_mode == "hit_timeout"
     assert not verifier_stdout_path.exists()
     assert result.verifier_stdout_path is None

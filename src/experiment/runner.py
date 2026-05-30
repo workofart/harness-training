@@ -18,6 +18,7 @@ from src.harness.contracts import TaskResult
 from src.metrics import (
     PROMOTION_P_VALUE_ALPHA,
     BaselineComparison,
+    TaskMetrics,
     compare_candidate_against_baseline,
     is_majority_decided,
     is_majority_solved,
@@ -66,42 +67,55 @@ class TaskTrials:
         return [trial for trial in self.trials if trial.finished_at is not None]
 
     @property
+    def valid_trials(self) -> list[TaskResult]:
+        # Trials that produced task evidence. `error is None` is the contract:
+        # a trial with `error is not None` is an infra `crash`, recorded for
+        # diagnosis but never scored. Solve counts, the majority verdict, and
+        # the promotion gate all read valid trials only.
+        return [trial for trial in self.finished_trials if trial.error is None]
+
+    @property
     def solved_count(self) -> int:
-        return sum(1 for trial in self.finished_trials if trial.solved is True)
+        return sum(1 for trial in self.valid_trials if trial.solved is True)
 
     @property
     def majority_solved(self) -> bool | None:
-        finished = self.finished_trials
-        if not finished:
+        valid = self.valid_trials
+        if not valid:
             return None
-        return is_majority_solved(solved=self.solved_count, total=len(finished))
+        return is_majority_solved(solved=self.solved_count, total=len(valid))
 
     @property
     def is_deterministic_solved(self) -> bool:
-        # True iff every observed trial passed. Used by candidates to budget
-        # a single trial against baselines that show a task as reliably
-        # solved; confirm-on-fail expands back to task_trials if that single
-        # candidate trial fails.
-        finished = self.finished_trials
-        if not finished:
+        # True iff every valid trial passed. Used by candidates to budget a
+        # single trial against baselines that show a task as reliably solved;
+        # confirm-on-fail expands back to task_trials if that single candidate
+        # trial fails.
+        valid = self.valid_trials
+        if not valid:
             return False
-        return all(trial.solved is True for trial in finished)
+        return all(trial.solved is True for trial in valid)
 
     @property
     def representative(self) -> TaskResult | None:
-        finished = self.finished_trials
-        if not finished:
+        # Prefer a valid trial matching the majority outcome for evidence. When
+        # a task produced no valid trials, surface the most recent trial (a
+        # crash) so its error is visible for diagnosis.
+        valid = self.valid_trials
+        if not valid:
             return self.trials[-1] if self.trials else None
         majority = self.majority_solved
-        if majority is None:
-            return finished[-1]
-        for trial in reversed(finished):
+        for trial in reversed(valid):
             if trial.solved is majority:
                 return trial
-        return finished[-1]
+        return valid[-1]
 
     @property
     def is_finished(self) -> bool:
+        # Counts every completed slot, valid or crash, so the per-task budget
+        # terminates and a crash slot is never re-run. Solve scoring excludes
+        # crash trials; termination must not, or an all-crash task would spawn
+        # slots forever.
         return len(self.finished_trials) >= self.expected_trial_count
 
     def append(self, trial: TaskResult) -> None:
@@ -451,7 +465,7 @@ def build_gate_verdicts(
         baseline_solved, baseline_total = pool.get(task_id, (0, 0))
         verdicts[task_id] = compare_candidate_against_baseline(
             candidate_solved=candidate_trials.solved_count,
-            candidate_total=candidate_trials.trial_count,
+            candidate_total=len(candidate_trials.valid_trials),
             baseline_solved=baseline_solved,
             baseline_total=baseline_total,
             alpha=PROMOTION_P_VALUE_ALPHA,
@@ -595,13 +609,14 @@ def build_pooled_control_samples(
 
     Composition:
     1. Active-baseline trials for the task (always included unless the trial
-       carries an error marker).
+       carries an infrastructure-error marker).
     2. For each non-crashed record in `recent_candidates` whose
        `decision_reason` is not a baseline-bookkeeping marker, include only
-       error-free trials where no rule named in that candidate's
+       infrastructure-error-free trials where no rule named in that candidate's
        `new_rule_names` fired. The rule filter removes trials structurally
        affected by the candidate's mechanism; the error filter removes
-       crash/skip sentinels.
+       crash/skip sentinels. Task-episode timeouts are measured unsolved
+       trials and arrive with `error=None`.
 
     Caller is responsible for providing `recent_candidates` (typically the
     most recent N concluded candidates) and mapping each candidate's
@@ -612,14 +627,6 @@ def build_pooled_control_samples(
     def _add(task_id: str, solved: bool) -> None:
         s, n = pool[task_id]
         pool[task_id] = (s + (1 if solved else 0), n + 1)
-
-    def eligible_trial(trial: TaskResult) -> bool:
-        # `trial.error` is set only on infrastructure failure (timeout or
-        # raised exception in `run_task`); a step-cap exhaustion has
-        # `error=None` and `failure_mode="hit_step_cap"`. The `is None`
-        # check is load-bearing: `str(exc)` for a bare exception is "",
-        # which a truthiness test would silently let through.
-        return trial.error is None
 
     def touched_by_new_rules(
         trial: TaskResult,
@@ -632,9 +639,7 @@ def build_pooled_control_samples(
         baseline_trials = active_baseline.train_task_results.get(task_id)
         if baseline_trials is None:
             continue
-        for trial in baseline_trials.finished_trials:
-            if not eligible_trial(trial):
-                continue
+        for trial in baseline_trials.valid_trials:
             _add(task_id, trial.solved is True)
 
     for record in recent_candidates:
@@ -653,9 +658,7 @@ def build_pooled_control_samples(
             trials = record.train_task_results.get(task_id)
             if trials is None:
                 continue
-            for trial in trials.finished_trials:
-                if not eligible_trial(trial):
-                    continue
+            for trial in trials.valid_trials:
                 if touched_by_new_rules(trial, new_rules):
                     continue
                 _add(task_id, trial.solved is True)
@@ -727,17 +730,19 @@ class ExperimentState:
         write_json_atomic(self.path(root=root), asdict(self))
 
 
-def _raise_if_any_trial_errored(record: ExperimentRecord) -> None:
-    # `trial.error` always means infrastructure failure (timeout/exception in
-    # `run_task`). An errored trial conflated with a "real failed solve"
-    # would feed a misattributed verdict to the gate and, for baseline runs,
-    # poison every future candidate comparison via the pool. The `is not
-    # None` check is load-bearing: `str(exc)` for a bare exception is "",
-    # which a truthiness test would silently let through.
-    for task_id, trials in record.train_task_results.items():
-        for trial in trials.trials:
-            if trial.error is not None:
-                raise RuntimeError(f"task {task_id} trial failed: {trial.error}")
+def _raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
+    # A run must yield at least one valid trial somewhere on the panel. An
+    # isolated per-trial `crash` (`error is not None`) is tolerated: it is
+    # excluded from the gate and the pool. But a run where *every* trial
+    # crashed produced no task evidence — the gate would compare against
+    # nothing, and a baseline would be installed empty so that every later
+    # candidate compares against an all-zero pool. That is an experiment-level
+    # failure, so it crashes (and a baseline is therefore not promoted).
+    has_valid = any(
+        trials.valid_trials for trials in record.train_task_results.values()
+    )
+    if not has_valid:
+        raise RuntimeError("experiment produced no valid trials (every trial crashed)")
 
 
 def _terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
@@ -752,6 +757,7 @@ def _terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
         solved=False,
         error=error,
         steps_used=0,
+        metrics=TaskMetrics(failure_mode="crash"),
         started_at=finished_at,
         finished_at=finished_at,
     )
@@ -827,14 +833,14 @@ async def _run_panel(
                         trials.expected_trial_count == 1
                         and full_trial_count > 1
                         and trials.solved_count == 0
-                        and len(trials.finished_trials) == 1
+                        and len(trials.valid_trials) == 1
                     ):
                         trials.expected_trial_count = full_trial_count
                         record.write(root=experiments_root)
                         break
                     decided = is_majority_decided(
                         solved=trials.solved_count,
-                        finished=len(trials.finished_trials),
+                        finished=len(trials.valid_trials),
                         expected_total=trials.expected_trial_count,
                     )
                     if decided and not trials.is_finished:
@@ -972,7 +978,7 @@ class ExperimentRunner:
                     ),
                 )
             )
-            _raise_if_any_trial_errored(record)
+            _raise_if_no_valid_evidence(record)
         except BaseException as exc:
             record._complete_unfinished_task_results(exc=exc)
             record.finalize(status="crash", error=str(exc))
@@ -1208,4 +1214,4 @@ class ExperimentRunner:
             raise RuntimeError(
                 "experiment record must not carry a top-level error before evaluation"
             )
-        _raise_if_any_trial_errored(record)
+        _raise_if_no_valid_evidence(record)
