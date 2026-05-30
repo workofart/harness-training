@@ -35,23 +35,20 @@ DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrid
 
 logger = logging.getLogger(__name__)
 
-# Prepended to every generated bootstrap script. A prior attempt can be
-# orphaned by an exec timeout while its in-container apt-get still holds the
-# apt/dpkg locks (Harbor's timeout kills the host docker client, not the
-# in-container process), which makes a retried bootstrap fail with
-# "Could not get lock ... (apt-get)" -> exit 100. Recover so the script is safe
-# to re-run, and cap apt's network wait for bootstrap and later in-task apt
-# usage so an unreachable mirror fails fast instead of hanging until the
-# bootstrap timeout. Best-effort: each line tolerates a minimal image (no
-# procps, already-clean locks) via "|| true".
+# Prepended to every generated bootstrap script. Every line is best-effort
+# ("|| true") so a minimal image (no procps, no curl) never hard-fails; the
+# cache probes use bash /dev/tcp since there is no curl. Three concerns:
 #
-# Finally, when a host-side apt cache (apt-cacher-ng, see
-# scripts/setup-apt-cache.sh) is reachable on host.docker.internal:3142, point
-# apt at it so repeated python3 installs hit a local cache instead of refetching
-# from the public mirror on every trial -- the main driver of bootstrap stalls
-# under concurrent load. Probed via bash's /dev/tcp (minimal images have no
-# curl) and strictly optional: an unreachable cache leaves apt on the direct
-# mirror, so the bootstrap never hard-depends on it.
+#   1. Locks: an exec timeout kills the docker client, not the in-container
+#      apt-get, so its orphaned lock makes the retry fail `Could not get lock`
+#      (exit 100). Clear stale locks; cap apt timeouts so a dead mirror fails
+#      fast instead of hanging until the bootstrap timeout.
+#   2. apt cache (optional): apt-cacher-ng on host.docker.internal:3142
+#      (setup-apt-cache.sh) -> proxy repeat `python3` installs locally, else the
+#      direct mirror.
+#   3. PyPI cache (optional): verifiers `uv run` re-pull torch+CUDA (~2GB) every
+#      verify; proxpi on :3141 (setup-pypi-cache.sh) -> point uv/pip there, else
+#      direct PyPI. apt's proxy can't cache PyPI (it's HTTPS), so it's separate.
 _BOOTSTRAP_PREAMBLE = """\
 set -eu
 pkill -9 -x apt 2>/dev/null || true
@@ -69,6 +66,19 @@ DPkg::Lock::Timeout "60";
 EOF
 if timeout 2 bash -c ': < /dev/tcp/host.docker.internal/3142' 2>/dev/null; then
 printf 'Acquire::http::Proxy "http://host.docker.internal:3142";\\n' > /etc/apt/apt.conf.d/00-harness-apt-cache 2>/dev/null || true
+fi
+if timeout 2 bash -c ': < /dev/tcp/host.docker.internal/3141' 2>/dev/null; then
+mkdir -p /etc/uv 2>/dev/null || true
+cat > /etc/uv/uv.toml 2>/dev/null <<'EOF' || true
+[[index]]
+url = "http://host.docker.internal:3141/index/"
+default = true
+EOF
+cat > /etc/pip.conf 2>/dev/null <<'EOF' || true
+[global]
+index-url = http://host.docker.internal:3141/index/
+trusted-host = host.docker.internal
+EOF
 fi
 """
 

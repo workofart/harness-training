@@ -42,6 +42,7 @@ source .venv/bin/activate
 - LLM credentials: for OpenRouter, set `OPENROUTER_API_KEY` in the shell or in a repo-local `.env`; for experimental `chatgpt_codex`, run `codex login` first so `~/.codex/auth.json` exists.
 - Docker: install and start Docker. Harbor starts one container per task trial; `max_trial_concurrency` in [`config/harness_config.json`](./config/harness_config.json) caps trials in flight, and `max_env_concurrency` caps heavyweight container work (`reset`/`run`/`verify`) at once.
 - Optional but recommended for multi-trial runs — local apt cache: run [`scripts/setup-apt-cache.sh`](./scripts/setup-apt-cache.sh) once. Task images are minimal and reinstall `python3` via `apt` on every trial; the cache serves those repeats locally so concurrent bootstraps don't stall on the public mirror (the dominant infra failure). The bootstrap auto-detects it on `host.docker.internal:3142` and falls back to the direct mirror when absent.
+- Optional but recommended for multi-trial runs with ML tasks — local PyPI cache: run [`scripts/setup-pypi-cache.sh`](./scripts/setup-pypi-cache.sh) once. Task verifiers `uv run` the full dependency tree (torch + the CUDA stack, ~2 GB) from PyPI on every verify; the cache serves those repeats locally and coalesces concurrent fetches. The bootstrap auto-detects it on `host.docker.internal:3141` and falls back to direct PyPI when absent. (The apt cache can't cover PyPI — it's HTTPS — hence a separate index-level cache.)
 
 3. Prerequisites for the self-improvement loop:
 

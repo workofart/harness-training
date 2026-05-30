@@ -560,3 +560,33 @@ def test_bootstrap_script_routes_apt_through_host_cache_when_reachable(
     )
     # Configured before the user apt commands run.
     assert script.index("Acquire::http::Proxy") < script.index("apt-get update")
+
+
+def test_bootstrap_script_routes_pip_uv_through_host_cache_when_reachable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The generated bootstrap must also probe the optional host-side PyPI cache
+    # (proxpi) and, only when reachable, point uv/pip at it -- so verifier
+    # `uv run` installs (torch + CUDA, ~2GB) hit a local cache instead of PyPI on
+    # every trial. Same curl-free /dev/tcp probe; the index config is written
+    # into the container (/etc/uv/uv.toml, /etc/pip.conf) before user commands so
+    # the later in-container verify picks it up.
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    harbor = _stub_harbor_for_bootstrap(
+        tmp_path,
+        exec_side_effect=[ExecResult(return_code=0, stdout="", stderr="")],
+    )
+
+    asyncio.run(harbor._bootstrap_environment())
+
+    script = (tmp_path / "trial" / "bootstrap" / "bootstrap.sh").read_text()
+    assert "/dev/tcp/host.docker.internal/3141" in script
+    assert "/etc/uv/uv.toml" in script
+    assert "/etc/pip.conf" in script
+    assert "http://host.docker.internal:3141/index/" in script
+    # Reachability-gated: index config only inside the success branch of the probe.
+    assert script.index("/dev/tcp/host.docker.internal/3141") < script.index(
+        "/etc/uv/uv.toml"
+    )
+    # Configured before the user commands run.
+    assert script.index("/etc/uv/uv.toml") < script.index("apt-get update")
