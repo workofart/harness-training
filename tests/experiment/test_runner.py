@@ -204,6 +204,30 @@ def test_load_task_duration_priors(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    ("solved", "finished", "expected_total", "admission_count"),
+    [
+        (0, 0, 5, 3),
+        (2, 3, 5, 1),
+        (2, 4, 5, 1),
+        (3, 3, 5, 0),
+        (0, 1, 5, 2),
+        (0, 0, 3, 2),
+        (1, 2, 3, 1),
+        (2, 2, 3, 0),
+    ],
+)
+def test_next_trial_admission_count(solved, finished, expected_total, admission_count):
+    assert (
+        runner._next_trial_admission_count(
+            solved=solved,
+            finished=finished,
+            expected_total=expected_total,
+        )
+        == admission_count
+    )
+
+
 def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
     monkeypatch, tmp_path
 ):
@@ -273,6 +297,95 @@ def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
         assert trials.is_finished is True
         assert trials.majority_solved is True
     assert sorted(call_log) == ["task-a"] * 2 + ["task-b"] * 2
+
+
+def test_run_panel_admits_only_majority_threshold_trials_initially(
+    monkeypatch, tmp_path
+):
+    harness_config_cls = FakeHarnessConfig
+
+    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
+    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
+
+    experiment_runner = runner.ExperimentRunner(
+        harness_config=harness_config_cls(
+            experiment_id="exp-adaptive-admission",
+            focus_name="focus",
+            train_task_names=["task-a"],
+            task_trials=5,
+            max_trial_concurrency=5,
+        ),
+        harbor_config=type(
+            "HarborConfig",
+            (),
+            {"experiments_dir": tmp_path / "experiments"},
+        )(),
+        api_key="key",
+    )
+
+    started = 0
+    release = asyncio.Event()
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        nonlocal started
+        started += 1
+        trial_index = started
+        await release.wait()
+        return TaskResult(
+            task_name=task_name,
+            reward=1.0,
+            solved=True,
+            error=None,
+            steps_used=1,
+            trial_dir=f"/tmp/{task_name}/{trial_index}",
+            trace_path=None,
+            metrics_path=None,
+            verifier_stdout_path=None,
+            metrics=TaskMetrics(),
+            started_at="2026-05-05T00:00:00+00:00",
+            finished_at="2026-05-05T00:00:01+00:00",
+        )
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        experiment_runner,
+        "_make_env",
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
+        raising=False,
+    )
+    _set_task_dirs(experiment_runner, tmp_path, "task-a")
+
+    async def go():
+        panel_task = asyncio.create_task(
+            runner._run_panel(
+                record=experiment_runner.record,
+                experiments_root=experiment_runner.experiments_root,
+                task_names=["task-a"],
+                task_dirs=experiment_runner._task_dirs,
+                harness_config=experiment_runner.harness_config,
+                make_llm=experiment_runner._make_llm,
+                make_env=experiment_runner._make_env,
+            )
+        )
+
+        async def wait_for_started(count):
+            while started < count:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_started(3), timeout=1)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert started == 3
+        release.set()
+        await panel_task
+
+    asyncio.run(go())
+
+    trials = experiment_runner.record._task_trials("task-a")
+    assert trials.trial_count == 3
+    assert trials.expected_trial_count == 3
+    assert trials.majority_solved is True
 
 
 def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
