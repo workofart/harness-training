@@ -418,7 +418,7 @@ class ExperimentRecord:
         for task_id in self.train_task_results:
             trials = self._task_trials(task_id)
             while not trials.is_finished:
-                self.record_task_result(_terminal_task_result(task_id=task_id, exc=exc))
+                self.record_task_result(terminal_task_result(task_id=task_id, exc=exc))
 
 
 def build_experiment_evidence(
@@ -483,7 +483,7 @@ class ExperimentState:
         write_json_atomic(self.path(root=root), asdict(self))
 
 
-def _raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
+def raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
     # A run must yield at least one valid trial somewhere on the panel. An
     # isolated per-trial `crash` (`error is not None`) is tolerated: it is
     # excluded from the gate and the pool. But a run where *every* trial
@@ -498,7 +498,7 @@ def _raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
         raise RuntimeError("experiment produced no valid trials (every trial crashed)")
 
 
-def _terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
+def terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
     finished_at = datetime.now(timezone.utc).isoformat()
     if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
         error = "canceled"

@@ -29,9 +29,9 @@ from src.experiment.gate import (
 from src.experiment.record import (
     ExperimentRecord,
     ExperimentState,
-    _raise_if_no_valid_evidence,
-    _terminal_task_result,
     failed_experiment_git_ref,
+    raise_if_no_valid_evidence,
+    terminal_task_result,
 )
 
 if TYPE_CHECKING:
@@ -195,7 +195,7 @@ async def _run_panel(
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
-                persist_task_result(_terminal_task_result(task_id=task_id, exc=exc))
+                persist_task_result(terminal_task_result(task_id=task_id, exc=exc))
                 if isinstance(exc, Exception):
                     return
                 raise
@@ -372,7 +372,7 @@ class ExperimentRunner:
                     ),
                 )
             )
-            _raise_if_no_valid_evidence(record)
+            raise_if_no_valid_evidence(record)
         except BaseException as exc:
             record.finalize_crash(exc=exc, baseline=baseline, root=experiments_root)
             if isinstance(exc, Exception):
@@ -600,4 +600,4 @@ class ExperimentRunner:
             raise RuntimeError(
                 "experiment record must not carry a top-level error before evaluation"
             )
-        _raise_if_no_valid_evidence(record)
+        raise_if_no_valid_evidence(record)
