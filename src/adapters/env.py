@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +30,8 @@ DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"
 )
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -284,13 +288,98 @@ class Harbor:
             raise RuntimeError("failed to detect environment working directory")
         return result.stdout.strip()
 
+    async def _run_docker_cli(self, args: list[str]) -> ExecResult:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout_bytes, _ = await process.communicate()
+        stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
+        result = ExecResult(
+            stdout=stdout,
+            stderr=None,
+            return_code=process.returncode or 0,
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                "Docker cleanup command failed. "
+                f"Command: docker {' '.join(args)}. "
+                f"Return code: {result.return_code}. "
+                f"Output: {result.stdout}."
+            )
+        return result
+
+    @staticmethod
+    def _docker_compose_project_name(env: BaseEnvironment) -> str:
+        # Must stay in sync with Harbor's private DockerEnvironment
+        # `docker compose -p` derivation; drift makes label cleanup a no-op.
+        return env.session_id.lower().replace(".", "-")
+
+    async def _docker_ids_by_project_label(
+        self,
+        *,
+        resource: str,
+        project_name: str,
+    ) -> list[str]:
+        label = f"label=com.docker.compose.project={project_name}"
+        args = [resource, "ls", "--quiet", "--filter", label]
+        if resource == "container":
+            args.insert(2, "--all")
+        result = await self._run_docker_cli(args)
+        return [line for line in (result.stdout or "").splitlines() if line]
+
+    async def _cleanup_docker_project_by_label(self, project_name: str) -> None:
+        container_ids = await self._docker_ids_by_project_label(
+            resource="container",
+            project_name=project_name,
+        )
+        if container_ids:
+            await self._run_docker_cli(
+                ["container", "rm", "--force", "--volumes", *container_ids]
+            )
+
+        volume_ids = await self._docker_ids_by_project_label(
+            resource="volume",
+            project_name=project_name,
+        )
+        if volume_ids:
+            await self._run_docker_cli(["volume", "rm", "--force", *volume_ids])
+
+        network_ids = await self._docker_ids_by_project_label(
+            resource="network",
+            project_name=project_name,
+        )
+        if network_ids:
+            await self._run_docker_cli(["network", "rm", *network_ids])
+
     async def _stop_environment(self, env: BaseEnvironment) -> None:
         from harbor.environments.docker.docker import DockerEnvironment
 
         if self.config.environment.delete and isinstance(env, DockerEnvironment):
-            await env._run_docker_compose_command(
-                ["down", "--volumes", "--remove-orphans"]
-            )
+            try:
+                await env._run_docker_compose_command(
+                    ["down", "--volumes", "--remove-orphans"]
+                )
+            except RuntimeError as compose_error:
+                project_name = self._docker_compose_project_name(env)
+                try:
+                    await self._cleanup_docker_project_by_label(project_name)
+                    logger.warning(
+                        "Docker compose down failed for project %r; "
+                        "recovered via label fallback: %s",
+                        project_name,
+                        compose_error,
+                    )
+                except RuntimeError as fallback_error:
+                    raise RuntimeError(
+                        "Docker cleanup failed after compose down and "
+                        f"project-label fallback for project {project_name!r}. "
+                        f"Compose error: {compose_error}. "
+                        f"Fallback error: {fallback_error}."
+                    ) from compose_error
         else:
             await env.stop(delete=self.config.environment.delete)
 

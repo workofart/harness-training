@@ -5,6 +5,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from harbor.environments.base import ExecResult
+from harbor.environments.docker.docker import DockerEnvironment
 
 from src.adapters.env import Harbor, HarborConfig, TaskDirectoryResolver
 
@@ -146,3 +148,130 @@ def test_harbor_exec_propagates_non_timeout_runtime_error(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="docker socket disconnected"):
         asyncio.run(harbor.exec(command="ls"))
+
+
+def _stub_docker_environment(*, session_id: str) -> DockerEnvironment:
+    env = object.__new__(DockerEnvironment)
+    env.session_id = session_id
+    env._run_docker_compose_command = AsyncMock()
+    return env
+
+
+def test_stop_docker_environment_uses_image_preserving_compose_down(
+    tmp_path: Path,
+) -> None:
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+    env = _stub_docker_environment(session_id="Task.Name__Run.ID")
+
+    asyncio.run(harbor._stop_environment(env))
+
+    env._run_docker_compose_command.assert_awaited_once_with(
+        ["down", "--volumes", "--remove-orphans"]
+    )
+
+
+def test_stop_docker_environment_fallback_cleans_only_same_compose_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+    env = _stub_docker_environment(session_id="Task.Name__Run.ID")
+    env._run_docker_compose_command = AsyncMock(
+        side_effect=RuntimeError("compose network cleanup failed")
+    )
+    calls: list[list[str]] = []
+    expected_label = "label=com.docker.compose.project=task-name__run-id"
+
+    async def fake_docker_cli(args: list[str]) -> ExecResult:
+        calls.append(args)
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            expected_label,
+        ]:
+            return ExecResult(stdout="container-1\ncontainer-2\n", return_code=0)
+        if args == ["volume", "ls", "--quiet", "--filter", expected_label]:
+            return ExecResult(stdout="volume-1\n", return_code=0)
+        if args == ["network", "ls", "--quiet", "--filter", expected_label]:
+            return ExecResult(stdout="network-1\n", return_code=0)
+        return ExecResult(stdout="", return_code=0)
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+
+    asyncio.run(harbor._stop_environment(env))
+
+    assert "recovered via label fallback" in caplog.text
+    assert "compose network cleanup failed" in caplog.text
+    assert calls == [
+        [
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            expected_label,
+        ],
+        [
+            "container",
+            "rm",
+            "--force",
+            "--volumes",
+            "container-1",
+            "container-2",
+        ],
+        ["volume", "ls", "--quiet", "--filter", expected_label],
+        ["volume", "rm", "--force", "volume-1"],
+        ["network", "ls", "--quiet", "--filter", expected_label],
+        ["network", "rm", "network-1"],
+    ]
+    assert all("image" not in call and "prune" not in call for call in calls)
+
+
+def test_stop_docker_environment_raises_when_compose_and_fallback_cleanup_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+    env = _stub_docker_environment(session_id="task-a__run-id")
+    env._run_docker_compose_command = AsyncMock(
+        side_effect=RuntimeError("compose down failed")
+    )
+
+    async def fake_docker_cli(args: list[str]) -> ExecResult:
+        raise RuntimeError("docker API unavailable")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+
+    with pytest.raises(RuntimeError, match="Docker cleanup failed"):
+        asyncio.run(harbor._stop_environment(env))
+
+
+def test_run_docker_cli_reports_combined_output_on_failure(tmp_path: Path) -> None:
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(harbor._run_docker_cli(["definitely-not-a-real-docker-command"]))
+
+    message = str(exc_info.value)
+    assert "Output:" in message
+    assert "Stderr: None" not in message
