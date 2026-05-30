@@ -34,6 +34,32 @@ DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrid
 
 logger = logging.getLogger(__name__)
 
+# Prepended to every generated bootstrap script. A prior attempt can be
+# orphaned by an exec timeout while its in-container apt-get still holds the
+# apt/dpkg locks (Harbor's timeout kills the host docker client, not the
+# in-container process), which makes a retried bootstrap fail with
+# "Could not get lock ... (apt-get)" -> exit 100. Recover so the script is safe
+# to re-run, and cap apt's network wait for bootstrap and later in-task apt
+# usage so an unreachable mirror fails fast instead of hanging until the
+# bootstrap timeout. Best-effort: each line tolerates a minimal image (no
+# procps, already-clean locks) via "|| true".
+_BOOTSTRAP_PREAMBLE = """\
+set -eu
+pkill -9 -x apt 2>/dev/null || true
+pkill -9 -x apt-get 2>/dev/null || true
+pkill -9 -x dpkg 2>/dev/null || true
+rm -f /var/lib/apt/lists/lock 2>/dev/null || true
+rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend 2>/dev/null || true
+rm -f /var/cache/apt/archives/lock 2>/dev/null || true
+mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true
+cat > /etc/apt/apt.conf.d/99-harness-bootstrap 2>/dev/null <<'EOF' || true
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+DPkg::Lock::Timeout "60";
+EOF
+"""
+
 
 def _is_command_timeout(exc: Exception) -> bool:
     # Harbor's docker/gke backends signal a per-command timeout only as a
@@ -175,7 +201,7 @@ class Harbor:
         bootstrap_dir = self._bootstrap_log_dir()
         bootstrap_dir.mkdir(parents=True, exist_ok=True)
         script_path = bootstrap_dir / "bootstrap.sh"
-        script_path.write_text("set -eu\n" + "\n".join(commands) + "\n")
+        script_path.write_text(_BOOTSTRAP_PREAMBLE + "\n".join(commands) + "\n")
         remote_script_path = "/tmp/harbor-bootstrap.sh"
         await self.session.environment.upload_file(
             source_path=script_path,
