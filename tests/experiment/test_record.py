@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 
 import pytest
 
@@ -15,46 +14,7 @@ from src.experiment.record import (
 )
 from src.harness.contracts import TaskResult
 
-
-def _write_task_artifacts(root: Path, task_name: str) -> dict[str, str]:
-    task_dir = root / task_name
-    agent_dir = task_dir / "agent"
-    agent_dir.mkdir(parents=True)
-    steps_path = agent_dir / "steps.jsonl"
-    metrics_path = agent_dir / "metrics.json"
-    exec_log_path = agent_dir / "exec.log"
-    verifier_path = task_dir / "verifier.txt"
-    for path in (steps_path, metrics_path, exec_log_path, verifier_path):
-        path.write_text("{}\n")
-    return {
-        "trial_dir": str(task_dir),
-        "trace_path": str(steps_path),
-        "metrics_path": str(metrics_path),
-        "verifier_stdout_path": str(verifier_path),
-        "exec_log_path": str(exec_log_path),
-    }
-
-
-def _task_result(
-    *,
-    task_name: str,
-    reward: float | None,
-    solved: bool | None = None,
-    error: str | None = None,
-) -> TaskResult:
-    if solved is None:
-        solved = error is None and reward is not None and reward > 0.0
-    return TaskResult(
-        task_name=task_name,
-        reward=reward,
-        steps_used=1,
-        error=error,
-        trial_dir=None,
-        verifier_stdout_path=None,
-        started_at="2026-04-10T00:00:00+00:00",
-        finished_at="2026-04-10T00:00:01+00:00",
-        solved=solved,
-    )
+from conftest import _task_result, _write_task_artifacts
 
 
 def test_experiment_record_load_reads_panel_schema(tmp_path):

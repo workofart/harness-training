@@ -24,6 +24,8 @@ from src.experiment.record import (
 from src.harness.config import HarnessConfig, OpenRouterConfig
 from src.harness.contracts import TaskResult
 
+from conftest import _write_task_artifacts
+
 
 class FakeBackend:
     def __init__(self, results):
@@ -74,25 +76,6 @@ def write_workspace_harness_config(
         ).model_dump_json(indent=2)
         + "\n"
     )
-
-
-def write_task_artifacts(root: Path, task_name: str) -> dict[str, str]:
-    task_dir = root / task_name
-    agent_dir = task_dir / "agent"
-    agent_dir.mkdir(parents=True)
-    steps_path = agent_dir / "steps.jsonl"
-    metrics_path = agent_dir / "metrics.json"
-    exec_log_path = agent_dir / "exec.log"
-    verifier_path = task_dir / "verifier.txt"
-    for path in (steps_path, metrics_path, exec_log_path, verifier_path):
-        path.write_text("{}\n")
-    return {
-        "trial_dir": str(task_dir),
-        "trace_path": str(steps_path),
-        "metrics_path": str(metrics_path),
-        "verifier_stdout_path": str(verifier_path),
-        "exec_log_path": str(exec_log_path),
-    }
 
 
 def make_runtime_snapshot(
@@ -226,6 +209,19 @@ def stub_sparse_workspace(
     monkeypatch.setattr(
         supervisor, "ensure_sparse_workspace", lambda **_: workspace_root
     )
+
+
+def prime_supervisor_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: SimpleNamespace,
+    workspace_root: Path,
+) -> None:
+    """The boundary stubs every full-loop test installs together: run one
+    iteration on ``snapshot`` then raise LoopStopped, and resolve the sparse
+    workspace to ``workspace_root``. (Tests that only need one half call
+    ``stop_loop_after`` / ``stub_sparse_workspace`` directly.)"""
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
 
 
 def test_validate_candidate_editable_paths_allows_config_and_editable_paths() -> None:
@@ -431,7 +427,7 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_task_outcomes(
         ("task-c", True),
         ("task-d", False),
     ):
-        artifacts = write_task_artifacts(tmp_path / "baseline", task_name)
+        artifacts = _write_task_artifacts(tmp_path / "baseline", task_name)
         baseline.record_task_result(
             TaskResult(
                 task_name=task_name,
@@ -462,7 +458,7 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_task_outcomes(
         ("task-c", True),
         ("task-d", False),
     ):
-        artifacts = write_task_artifacts(tmp_path / "candidate", task_name)
+        artifacts = _write_task_artifacts(tmp_path / "candidate", task_name)
         candidate_artifacts[task_name] = artifacts
         candidate.record_task_result(
             TaskResult(
@@ -554,7 +550,7 @@ def test_validate_no_task_ids_in_workspace_diff_accepts_generic_change(
 def test_latest_evidence_task_artifact_paths_omits_missing_paths(
     tmp_path: Path,
 ) -> None:
-    artifacts = write_task_artifacts(tmp_path / "candidate", "task-a")
+    artifacts = _write_task_artifacts(tmp_path / "candidate", "task-a")
     record = ExperimentRecord.initialize(
         experiment_id="candidate",
         git_commit_hash="candidate123",
@@ -1246,8 +1242,7 @@ def test_run_supervisor_loop_reuses_same_thread_until_candidate_changes_then_lau
         ]
     )
 
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
 
     def fake_build_prelaunch_prompt(**kwargs):
         feedback_notes.append(kwargs["feedback_note"])
@@ -1405,8 +1400,7 @@ def test_run_supervisor_loop_uses_prepared_candidate_without_reloading_config(
     committed_experiment_ids: list[str] = []
     launched_experiment_ids: list[str] = []
 
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_prelaunch_phase",
@@ -1708,8 +1702,7 @@ def test_run_supervisor_loop_resumes_postrun_phase_before_prelaunch(
 
     backend = TrackingBackend()
 
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -1778,8 +1771,7 @@ def test_run_supervisor_loop_resumes_postrun_after_keep_advances_baseline(
     )
 
     diagnosis_calls: list[tuple[str | None, str]] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -1846,8 +1838,7 @@ def test_run_supervisor_loop_recovers_postrun_from_concluded_record(
     )
 
     diagnosis_calls: list[tuple[str, str]] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -1903,8 +1894,7 @@ def test_run_supervisor_loop_requires_postrun_without_saved_state(
     workspace_root.mkdir()
 
     diagnosis_calls: list[tuple[str | None, str]] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -1970,8 +1960,7 @@ def test_run_supervisor_loop_restarts_prelaunch_when_learning_memo_already_updat
     )
 
     prelaunch_thread_ids: list[str | None] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -2036,8 +2025,7 @@ def test_run_supervisor_loop_preserves_completed_postrun_marker_across_iteration
     )
 
     prelaunch_thread_ids: list[str | None] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -2113,8 +2101,7 @@ def test_run_supervisor_loop_restores_stale_postrun_cache_before_resuming_diagno
         root=tmp_path / "supervisor",
     )
 
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -2354,8 +2341,7 @@ def test_run_supervisor_loop_discards_sparse_workspace_and_reuses_only_prelaunch
 
     synced_commits: list[str] = []
     prelaunch_thread_ids: list[str | None] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -2586,8 +2572,7 @@ def test_run_supervisor_loop_syncs_workspace_after_postrun_diagnosis(
     )
 
     synced_commits: list[str] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -2909,8 +2894,7 @@ def test_run_supervisor_loop_syncs_workspace_before_resuming_postrun_diagnosis(
     )
 
     calls: list[tuple[str, str]] = []
-    stop_loop_after(monkeypatch, snapshot)
-    stub_sparse_workspace(monkeypatch, workspace_root)
+    prime_supervisor_loop(monkeypatch, snapshot, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",

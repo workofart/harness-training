@@ -19,6 +19,8 @@ from src.experiment.record import (
 from src.harness.contracts import TaskResult
 from src.metrics import TaskMetrics
 
+from conftest import _task_result
+
 
 @dataclass
 class FakeHarnessConfig:
@@ -41,28 +43,6 @@ class FakeHarnessConfig:
     max_disallowed_retries: int = 2
     task_trials: int = 1
     llm_provider_config: object | None = None
-
-
-def _task_result(
-    *,
-    task_name: str,
-    reward: float | None,
-    solved: bool | None = None,
-    error: str | None = None,
-) -> TaskResult:
-    if solved is None:
-        solved = error is None and reward is not None and reward > 0.0
-    return TaskResult(
-        task_name=task_name,
-        reward=reward,
-        steps_used=1,
-        error=error,
-        trial_dir=None,
-        verifier_stdout_path=None,
-        started_at="2026-04-10T00:00:00+00:00",
-        finished_at="2026-04-10T00:00:01+00:00",
-        solved=solved,
-    )
 
 
 def _set_task_dirs(experiment_runner, root: Path, *task_names: str) -> None:
@@ -490,11 +470,27 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
     assert trials.trials[0].metrics.failure_mode == "hit_timeout"
 
 
-def test_run_panel_runs_all_trials_when_first_two_split(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("solved_by_trial", "expected_calls", "expected_trials", "expected_majority"),
+    [
+        # First two trials split (pass, fail) -> undecided -> trial 3 runs.
+        pytest.param([True, False, True], 3, 3, True, id="split-runs-all"),
+        # First two trials fail -> decided False -> trial 3 cancelled.
+        pytest.param([False, False, False], 2, 2, False, id="two-fail-early-stop"),
+    ],
+)
+def test_run_panel_majority_decides_when_to_stop(
+    monkeypatch,
+    tmp_path,
+    solved_by_trial,
+    expected_calls,
+    expected_trials,
+    expected_majority,
+):
     experiment_runner = make_runner(
         monkeypatch,
         tmp_path,
-        experiment_id="exp-split",
+        experiment_id="exp-majority-stop",
         focus_name="focus",
         train_task_names=["task-a"],
         task_trials=3,
@@ -506,58 +502,24 @@ def test_run_panel_runs_all_trials_when_first_two_split(monkeypatch, tmp_path):
     call_log: list[str] = []
 
     async def fake_run_task(*, task_name, **_kwargs):
-        call_log.append(task_name)
-        solved = len(call_log) != 2  # trial 1 pass, trial 2 fail, trial 3 pass
-        return _panel_trial_result(task_name, solved=solved, index=len(call_log))
-
-    monkeypatch.setattr(runner, "run_task", fake_run_task)
-
-    _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
-
-    # First two trials split (1 pass, 1 fail) → majority undecided → trial 3
-    # must run. expected_trial_count stays at 3.
-    assert call_log == ["task-a", "task-a", "task-a"]
-    trials = experiment_runner.record._task_trials("task-a")
-    assert trials.trial_count == 3
-    assert trials.expected_trial_count == 3
-    assert trials.is_finished is True
-    assert trials.majority_solved is True
-
-
-def test_run_panel_early_stops_when_two_trials_fail(monkeypatch, tmp_path):
-    experiment_runner = make_runner(
-        monkeypatch,
-        tmp_path,
-        experiment_id="exp-fail",
-        focus_name="focus",
-        train_task_names=["task-a"],
-        task_trials=3,
-        max_trial_concurrency=1,
-        task_dirs=["task-a"],
-    )
-    stub_trial_factories(monkeypatch, experiment_runner)
-
-    call_log: list[str] = []
-
-    async def fake_run_task(*, task_name, **_kwargs):
-        # Yield to the event loop so the majority watcher in run_task_trials
-        # gets a chance to observe each completion and cancel siblings.
+        # Yield so the majority watcher can observe each completion and cancel
+        # the remaining trial once the outcome is decided.
         await asyncio.sleep(0)
         call_log.append(task_name)
-        return _panel_trial_result(task_name, solved=False, index=len(call_log))
+        return _panel_trial_result(
+            task_name, solved=solved_by_trial[len(call_log) - 1], index=len(call_log)
+        )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
 
     _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
 
-    # Trials 1+2 fail → majority decided False; trial 3 must be cancelled
-    # before it records a result.
-    assert call_log == ["task-a", "task-a"]
+    assert call_log == ["task-a"] * expected_calls
     trials = experiment_runner.record._task_trials("task-a")
-    assert trials.trial_count == 2
-    assert trials.expected_trial_count == 2
+    assert trials.trial_count == expected_trials
+    assert trials.expected_trial_count == expected_trials
     assert trials.is_finished is True
-    assert trials.majority_solved is False
+    assert trials.majority_solved is expected_majority
 
 
 def test_run_panel_requires_resolved_task_dir(monkeypatch, tmp_path):
