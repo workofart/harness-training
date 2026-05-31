@@ -148,14 +148,14 @@ class HarnessConfig(BaseModel):
         description=(
             "Maximum number of task trials in flight at once (each holds one "
             "live container). Bounded by memory and the LLM backend. Raise above "
-            "max_env_concurrency to overlap trials idling on the LLM."
+            "max_heavy_action_concurrency to overlap trials idling on the LLM."
         ),
     )
-    max_env_concurrency: int = Field(
+    max_heavy_action_concurrency: int = Field(
         default=10,
         gt=0,
         description=(
-            "Maximum number of trials executing heavyweight container work "
+            "Maximum number of trials executing heavyweight harness actions "
             "(reset/startup, run, verify) at once. Cheap harness-generated "
             "file/list/search/edit commands bypass this gate so they do not "
             "queue behind compiles or long verifiers. Bounds host-CPU "

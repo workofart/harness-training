@@ -22,11 +22,11 @@
 
   // Maximum task trials in flight (each holds one live container). Keep this at
   // 1 until Docker and API cost behavior is understood. Raise it above
-  // max_env_concurrency to overlap trials that are idling on the LLM (LLM
+  // max_heavy_action_concurrency to overlap trials that are idling on the LLM (LLM
   // requests are remote and absorb concurrency cheaply; the host CPU does not).
   "max_trial_concurrency": 1,
 
-  // Maximum trials running heavyweight container work (reset/startup, run,
+  // Maximum trials running heavyweight harness actions (reset/startup, run,
   // verify) at once. Cheap file/list/search/edit commands bypass this gate.
   // This is the host-CPU contention bound.
   //
@@ -43,7 +43,7 @@
   // >= max_trial_concurrency). So raising max_trial_concurrency for LLM-overlap
   // throughput is safe only while this stays low enough to keep concurrent heavy
   // ops under the core count. Default 10; ~half the cores is a safe start.
-  "max_env_concurrency": 1,
+  "max_heavy_action_concurrency": 1,
 
   // Wall-clock timeout for one task trial.
   "task_timeout_sec": 300.0,

@@ -324,11 +324,11 @@ def _stub_harbor_with_recording_exec(
 
 
 def test_harbor_exec_serializes_under_shared_semaphore(tmp_path: Path) -> None:
-    # The run-scoped exec_semaphore bounds heavyweight container commands. A
+    # The run-scoped semaphore bounds heavyweight harness actions. A
     # size-1 gate must forbid two default Harbor.exec calls from overlapping
     # inside the container — the signal-preserving guarantee that lets
     # trial-admission (outer max_trial_concurrency) run ahead of host-CPU
-    # capacity (inner max_env_concurrency) without oversubscribing cores.
+    # capacity (inner max_heavy_action_concurrency) without oversubscribing cores.
     order: list[str] = []
     harbor = _stub_harbor_with_recording_exec(
         tmp_path, order=order, exec_semaphore=asyncio.Semaphore(1)

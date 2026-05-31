@@ -8,7 +8,11 @@ from pathlib import Path
 import src.trace as trace_module
 from src.adapters.llm_base import BaseLlm
 from src.harness.contracts import HarnessEnv, TaskResult
-from src.harness.core import NoValidActionError, TaskLoopProgress, run_task_loop
+from src.harness.core import (
+    NoValidActionError,
+    TaskLoopProgress,
+    run_task_loop,
+)
 from src.metrics import FailureMode
 
 
