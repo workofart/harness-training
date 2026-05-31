@@ -191,6 +191,43 @@ def make_unfinished_record(
     return record
 
 
+def make_keep_baseline() -> ExperimentRecord:
+    """The finalized keep baseline at base123 that the loop tests start from."""
+    return make_record(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        status="keep",
+        reward=1.0,
+    )
+
+
+def stop_loop_after(
+    monkeypatch: pytest.MonkeyPatch, *snapshots: SimpleNamespace
+) -> None:
+    """Feed ``snapshots`` to run_supervisor_loop, one per iteration, then raise
+    LoopStopped when it asks for the next -- the standard way these tests break
+    out of the otherwise-infinite loop once the behavior under test has run."""
+    pending = iter(snapshots)
+
+    def fake_load_runtime_snapshot(**_):
+        try:
+            return next(pending)
+        except StopIteration:
+            raise LoopStopped()
+
+    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
+
+
+def stub_sparse_workspace(
+    monkeypatch: pytest.MonkeyPatch, workspace_root: Path
+) -> None:
+    """Resolve the sparse workspace to ``workspace_root`` for the whole loop."""
+    monkeypatch.setattr(
+        supervisor, "ensure_sparse_workspace", lambda **_: workspace_root
+    )
+
+
 def test_validate_candidate_editable_paths_allows_config_and_editable_paths() -> None:
     gates.validate_candidate_editable_paths(
         changed_paths=("config/harness_config.json", "src/harness/core.py"),
@@ -553,13 +590,7 @@ def test_latest_evidence_task_artifact_paths_omits_missing_paths(
 def test_build_prelaunch_prompt_routes_to_sources_without_policy_checklist(
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="candidate",
         git_commit_hash="candidate123",
@@ -638,13 +669,7 @@ def test_run_prelaunch_phase_reruns_with_feedback_until_workspace_is_valid(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="candidate",
         git_commit_hash="candidate123",
@@ -837,13 +862,7 @@ def test_run_prelaunch_phase_rejects_live_repo_edits_and_retries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     repo_root = tmp_path / "repo"
@@ -1189,13 +1208,7 @@ def test_run_supervisor_loop_reuses_same_thread_until_candidate_changes_then_lau
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     thread_ids: list[str | None] = []
     commit_messages: list[str] = []
@@ -1233,20 +1246,8 @@ def test_run_supervisor_loop_reuses_same_thread_until_candidate_changes_then_lau
         ]
     )
 
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
 
     def fake_build_prelaunch_prompt(**kwargs):
         feedback_notes.append(kwargs["feedback_note"])
@@ -1351,11 +1352,7 @@ def test_run_supervisor_loop_logs_failure_before_raising(
         "load_runtime_snapshot",
         lambda **_: snapshot,
     )
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "_ensure_baseline_at_head",
@@ -1397,13 +1394,7 @@ def test_run_supervisor_loop_uses_prepared_candidate_without_reloading_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(
         tmp_path,
         experiment_id="exp-old",
@@ -1414,20 +1405,8 @@ def test_run_supervisor_loop_uses_prepared_candidate_without_reloading_config(
     committed_experiment_ids: list[str] = []
     launched_experiment_ids: list[str] = []
 
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_prelaunch_phase",
@@ -1503,13 +1482,7 @@ def test_run_supervisor_loop_proceeds_to_candidate_when_head_matches_baseline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -1524,25 +1497,13 @@ def test_run_supervisor_loop_proceeds_to_candidate_when_head_matches_baseline(
     )
     write_workspace_harness_config(workspace_root, experiment_id="exp-next")
 
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
+    stop_loop_after(monkeypatch, snapshot)
     monkeypatch.setattr(
         supervisor,
         "_ensure_baseline_at_head",
         lambda **_: False,
     )
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -1620,13 +1581,7 @@ def test_run_supervisor_loop_resets_to_baseline_after_failed_candidate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     hard_reset_calls: list[str] = []
     synced_commits: list[str] = []
@@ -1644,11 +1599,7 @@ def test_run_supervisor_loop_resets_to_baseline_after_failed_candidate(
 
     backend = FakeBackend([TurnResult(thread_id="thread-1")])
     monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -1723,13 +1674,7 @@ def test_run_supervisor_loop_resumes_postrun_phase_before_prelaunch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -1763,20 +1708,8 @@ def test_run_supervisor_loop_resumes_postrun_phase_before_prelaunch(
 
     backend = TrackingBackend()
 
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -1845,20 +1778,8 @@ def test_run_supervisor_loop_resumes_postrun_after_keep_advances_baseline(
     )
 
     diagnosis_calls: list[tuple[str | None, str]] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -1900,13 +1821,7 @@ def test_run_supervisor_loop_recovers_postrun_from_concluded_record(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -1931,20 +1846,8 @@ def test_run_supervisor_loop_recovers_postrun_from_concluded_record(
     )
 
     diagnosis_calls: list[tuple[str, str]] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -1984,13 +1887,7 @@ def test_run_supervisor_loop_requires_postrun_without_saved_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -2006,20 +1903,8 @@ def test_run_supervisor_loop_requires_postrun_without_saved_state(
     workspace_root.mkdir()
 
     diagnosis_calls: list[tuple[str | None, str]] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -2059,13 +1944,7 @@ def test_run_supervisor_loop_restarts_prelaunch_when_learning_memo_already_updat
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -2091,20 +1970,8 @@ def test_run_supervisor_loop_restarts_prelaunch_when_learning_memo_already_updat
     )
 
     prelaunch_thread_ids: list[str | None] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -2142,13 +2009,7 @@ def test_run_supervisor_loop_preserves_completed_postrun_marker_across_iteration
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -2175,20 +2036,8 @@ def test_run_supervisor_loop_preserves_completed_postrun_marker_across_iteration
     )
 
     prelaunch_thread_ids: list[str | None] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -2231,13 +2080,7 @@ def test_run_supervisor_loop_restores_stale_postrun_cache_before_resuming_diagno
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -2270,20 +2113,8 @@ def test_run_supervisor_loop_restores_stale_postrun_cache_before_resuming_diagno
         root=tmp_path / "supervisor",
     )
 
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -2333,13 +2164,7 @@ def test_run_supervisor_loop_abandons_unfinished_candidate_and_restarts_prelaunc
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_unfinished_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -2382,11 +2207,7 @@ def test_run_supervisor_loop_abandons_unfinished_candidate_and_restarts_prelaunc
         raise LoopStopped()
 
     monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -2463,13 +2284,7 @@ def test_run_supervisor_loop_prelaunch_state_keeps_only_failed_candidate_referen
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -2487,11 +2302,7 @@ def test_run_supervisor_loop_prelaunch_state_keeps_only_failed_candidate_referen
         raise LoopStopped()
 
     monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "sync_sparse_workspace_to_commit",
@@ -2527,13 +2338,7 @@ def test_run_supervisor_loop_discards_sparse_workspace_and_reuses_only_prelaunch
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -2549,20 +2354,8 @@ def test_run_supervisor_loop_discards_sparse_workspace_and_reuses_only_prelaunch
 
     synced_commits: list[str] = []
     prelaunch_thread_ids: list[str | None] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
@@ -2768,13 +2561,7 @@ def test_run_supervisor_loop_syncs_workspace_after_postrun_diagnosis(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -2799,20 +2586,8 @@ def test_run_supervisor_loop_syncs_workspace_after_postrun_diagnosis(
     )
 
     synced_commits: list[str] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor,
         "run_postrun_diagnosis_phase",
@@ -2842,13 +2617,7 @@ def test_ensure_baseline_at_head_no_op_when_head_matches_and_clean(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
 
@@ -2877,13 +2646,7 @@ def test_ensure_baseline_at_head_aborts_on_dirty_worktree(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
 
@@ -2907,13 +2670,7 @@ def test_ensure_baseline_at_head_runs_baseline_when_head_advanced(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
 
@@ -3030,13 +2787,7 @@ def test_ensure_baseline_at_head_rejects_crashed_baseline_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
 
@@ -3104,13 +2855,7 @@ def test_ensure_baseline_at_head_rejects_crashed_baseline_run(
 def test_cleanup_orphaned_experiment_artifacts_removes_partial_launch_state(
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
     partial_dir = snapshot.experiments_root / "partial-dir"
     partial_dir.mkdir()
@@ -3139,13 +2884,7 @@ def test_run_supervisor_loop_syncs_workspace_before_resuming_postrun_diagnosis(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    baseline = make_record(
-        experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        status="keep",
-        reward=1.0,
-    )
+    baseline = make_keep_baseline()
     candidate = make_record(
         experiment_id="exp-next",
         git_commit_hash="candidate123",
@@ -3170,20 +2909,8 @@ def test_run_supervisor_loop_syncs_workspace_before_resuming_postrun_diagnosis(
     )
 
     calls: list[tuple[str, str]] = []
-    snapshots = iter([snapshot])
-
-    def fake_load_runtime_snapshot(**_):
-        try:
-            return next(snapshots)
-        except StopIteration:
-            raise LoopStopped()
-
-    monkeypatch.setattr(supervisor, "load_runtime_snapshot", fake_load_runtime_snapshot)
-    monkeypatch.setattr(
-        supervisor,
-        "ensure_sparse_workspace",
-        lambda **_: workspace_root,
-    )
+    stop_loop_after(monkeypatch, snapshot)
+    stub_sparse_workspace(monkeypatch, workspace_root)
     monkeypatch.setattr(
         supervisor.control_repo,
         "get_head_commit",
