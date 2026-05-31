@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from src.adapters.llm_base import LlmUsage
@@ -28,15 +30,16 @@ FailureMode = Literal[
 ]
 
 
-@dataclass(slots=True)
-class TaskMetrics:
+class TaskMetrics(BaseModel):
     """Per-trial counters and terminal-state summary.
 
     Mutated in place over a trial by the recorders in ``trace.py`` (which own
     a single instance), then frozen into the persisted ``metrics.json`` and
     carried on ``TaskResult.metrics``. Not hashed anywhere, so it is a plain
-    mutable dataclass rather than a frozen target fronted by a builder.
+    mutable model rather than a frozen target fronted by a builder.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     steps_total: int = 0
     run_count: int = 0
@@ -46,8 +49,8 @@ class TaskMetrics:
     token_output_total: int = 0
     token_reasoning_total: int = 0
     token_cached_input_total: int = 0
-    rule_fires: dict[str, int] = field(default_factory=dict)
-    custom_counters: dict[str, int] = field(default_factory=dict)
+    rule_fires: dict[str, int] = Field(default_factory=dict)
+    custom_counters: dict[str, int] = Field(default_factory=dict)
     # Trial-final summary fields. Populated by the runner once `final_passed`
     # is known so the supervisor can answer "where did it die" without
     # walking steps.jsonl. `failure_mode` is one of: "solved",
@@ -102,18 +105,7 @@ class TaskMetrics:
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2) + "\n")
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskMetrics":
-        fields = dict(payload)
-        for counters_field in ("rule_fires", "custom_counters"):
-            if counters_field in fields and isinstance(fields[counters_field], dict):
-                fields[counters_field] = {
-                    str(name): int(count)
-                    for name, count in fields[counters_field].items()
-                }
-        return cls(**fields)
+        path.write_text(json.dumps(self.model_dump(mode="json"), indent=2) + "\n")
 
 
 def compute_binomial_p_value(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
@@ -515,12 +515,13 @@ def _recover_interrupted_postrun_state(
                 )
             except RuntimeError:
                 return saved_state, experiment_record
-            completed_state = replace(
-                saved_state,
-                phase="prelaunch",
-                postrun_original_payload=None,
-                postrun_original_learning=None,
-                postrun_completed_experiment_id=experiment_record.experiment_id,
+            completed_state = saved_state.model_copy(
+                update={
+                    "phase": "prelaunch",
+                    "postrun_original_payload": None,
+                    "postrun_original_learning": None,
+                    "postrun_completed_experiment_id": experiment_record.experiment_id,
+                }
             )
             completed_state.save(repo_root=repo_root, root=supervisor_root)
             return completed_state, experiment_record
@@ -1230,7 +1231,7 @@ def run_supervisor_loop(
                 experiments_root=snapshot.experiments_root,
                 experiment_record=record,
                 thread_id=prepared_candidate.thread_id,
-                original_payload=asdict(record),
+                original_payload=record.model_dump(mode="json"),
                 original_learning=read_learning_memo(
                     experiments_root=snapshot.experiments_root,
                 ),
