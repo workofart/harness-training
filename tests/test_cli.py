@@ -36,7 +36,18 @@ def test_main_exp_runs_experiment(monkeypatch, capsys):
             types.SimpleNamespace(),
             types.SimpleNamespace(
                 experiment_id="exp-1",
-                train_task_names=["task-a", "task-b"],
+                panels=[
+                    types.SimpleNamespace(
+                        id="train",
+                        purpose="promotion",
+                        task_names=["task-a", "task-b"],
+                    ),
+                    types.SimpleNamespace(
+                        id="test",
+                        purpose="regression_veto",
+                        task_names=["heldout-a"],
+                    ),
+                ],
             ),
             "api-key",
         ),
@@ -47,7 +58,7 @@ def test_main_exp_runs_experiment(monkeypatch, capsys):
     assert calls["require_clean_worktree"] is True
     output = capsys.readouterr().out
     assert "experiment: exp-1" in output
-    assert "tasks: task-a, task-b" in output
+    assert "panels: train(promotion): 2 tasks; test(regression_veto): 1 task" in output
     assert "evaluation: keep" in output
 
 
@@ -79,7 +90,13 @@ def test_main_exp_allows_dirty_worktree_with_env_override(monkeypatch, capsys):
             types.SimpleNamespace(),
             types.SimpleNamespace(
                 experiment_id="exp-1",
-                train_task_names=["task-a"],
+                panels=[
+                    types.SimpleNamespace(
+                        id="train",
+                        purpose="promotion",
+                        task_names=["task-a"],
+                    )
+                ],
             ),
             "api-key",
         ),

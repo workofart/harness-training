@@ -14,6 +14,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Sequence
@@ -21,16 +22,21 @@ from typing import TYPE_CHECKING, Any, Literal, Sequence
 from src.control import repo as control_repo
 from src.experiment.trial import run_task
 from src.harness.contracts import TaskResult
-from src.metrics import is_majority_decided
+from src.metrics import BaselineComparison, is_majority_decided
 
 from src.experiment.gate import (
     build_gate_pool,
     build_gate_verdicts,
-    decide_from_verdicts,
+    decide_panel_from_verdicts,
 )
 from src.experiment.record import (
     ExperimentRecord,
+    ExperimentStatus,
     ExperimentState,
+    PanelEvaluation,
+    PanelLifecycle,
+    PanelPurpose,
+    PanelRecord,
     TaskTrials,
     failed_experiment_git_ref,
     raise_if_no_valid_evidence,
@@ -45,6 +51,45 @@ if TYPE_CHECKING:
 DEFAULT_TASK_DURATION_PRIORS_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "task_duration_priors.json"
 )
+
+
+@dataclass(frozen=True)
+class PanelSpec:
+    panel_id: str
+    purpose: PanelPurpose
+    task_names: tuple[str, ...]
+    task_timeout_sec: float
+    initial_lifecycle: PanelLifecycle
+    requires_baseline: bool
+    after_panel: str | None
+    when_status: ExperimentStatus | None
+
+
+def _compile_panel_specs(harness_config: HarnessConfig) -> tuple[PanelSpec, ...]:
+    specs: list[PanelSpec] = []
+    for panel in harness_config.panels:
+        if panel.run.when == "always":
+            initial_lifecycle: PanelLifecycle = "active"
+            after_panel = None
+            when_status = None
+        else:
+            initial_lifecycle = "pending"
+            after_panel = panel.run.after_panel
+            when_status = panel.run.when_status
+
+        specs.append(
+            PanelSpec(
+                panel_id=panel.id,
+                purpose=panel.purpose,
+                task_names=tuple(panel.task_names),
+                task_timeout_sec=panel.task_timeout_sec,
+                initial_lifecycle=initial_lifecycle,
+                requires_baseline=panel.baseline.required,
+                after_panel=after_panel,
+                when_status=when_status,
+            )
+        )
+    return tuple(specs)
 
 
 def _prepare_task_dirs(
@@ -79,7 +124,7 @@ def _schedule_order(
     makespan on a fixed worker pool is tail-dominated: a long task admitted late
     hangs off the end with nothing to overlap it. Ordering by historical
     per-task wall-time (descending) starts the long poles first so short tasks
-    fill the tail. Reorders only the launch sequence — `train_task_ids`, the
+    fill the tail. Reorders only the launch sequence — persisted panel task ids, the
     record, and the (task-id-keyed) gate are order-independent, so outcomes are
     untouched. Falls back to config order for tasks absent from the prior.
     """
@@ -91,6 +136,33 @@ def _schedule_order(
     # Stable sort (reverse=True keeps equal-cost ties in config order).
     return sorted(
         names, key=lambda task_id: resolved_priors.get(task_id, 0.0), reverse=True
+    )
+
+
+def _panel_record_for_spec(
+    *,
+    spec: PanelSpec,
+    expected_trial_count: int,
+    lifecycle: PanelLifecycle | None = None,
+) -> PanelRecord:
+    return PanelRecord.initialize(
+        panel_id=spec.panel_id,
+        purpose=spec.purpose,
+        task_ids=spec.task_names,
+        expected_trial_count=expected_trial_count,
+        lifecycle=spec.initial_lifecycle if lifecycle is None else lifecycle,
+    )
+
+
+def _record_matches_panel_specs(
+    record: ExperimentRecord,
+    panel_specs: Sequence[PanelSpec],
+) -> bool:
+    if set(record.panel_order) != {spec.panel_id for spec in panel_specs}:
+        return False
+    return all(
+        set(record.panels[spec.panel_id].task_ids) == set(spec.task_names)
+        for spec in panel_specs
     )
 
 
@@ -322,10 +394,22 @@ class PanelProgressReporter:
         self._drawn = False
         self._finalized = False
 
-    def render(self, record: ExperimentRecord) -> None:
+    def render(
+        self,
+        record: ExperimentRecord | None = None,
+        *,
+        task_results: Mapping[str, TaskTrials] | None = None,
+        solved_count: int | None = None,
+    ) -> None:
         if not self._enabled or self._finalized:
             return
-        trials = record.train_task_results.values()
+        if record is not None:
+            first_panel = record.panels[record.panel_order[0]]
+            task_results = first_panel.task_results
+            solved_count = first_panel.solved_count
+        if task_results is None:
+            raise TypeError("task_results is required when record is omitted")
+        trials = task_results.values()
         tasks_done = sum(1 for t in trials if t.is_finished)
         trials_done = sum(len(t.finished_trials) for t in trials)
         valid_done = sum(len(t.valid_trials) for t in trials)
@@ -339,7 +423,7 @@ class PanelProgressReporter:
             total_tasks=self._total_tasks,
             trials_done=trials_done,
             trials_planned=trials_planned,
-            solved=record.train_solved_count or 0,
+            solved=solved_count or 0,
             decided=decided,
             error_trials=trials_done - valid_done,
             in_flight=in_flight,
@@ -368,6 +452,8 @@ async def _run_panel(
     record: ExperimentRecord,
     experiments_root: Path,
     task_names: Sequence[str],
+    task_results: dict[str, TaskTrials],
+    task_timeout_sec: float,
     task_dirs: Mapping[str, Path],
     harness_config: HarnessConfig,
     make_llm: Callable[[], Any],
@@ -401,7 +487,12 @@ async def _run_panel(
     def persist_task_result(task_result: TaskResult) -> None:
         record.record_task_result(task_result)
         commit_record_change()
-        reporter.render(record)
+        reporter.render(
+            task_results=task_results,
+            solved_count=sum(
+                1 for trials in task_results.values() if trials.majority_solved is True
+            ),
+        )
 
     async def run_one_trial(task_id: str) -> None:
         # Manual acquire/release (not `async with`) so `run_task` can hand the
@@ -430,7 +521,7 @@ async def _run_panel(
                     env=env,
                     max_steps=harness_config.max_steps,
                     max_output_retries=harness_config.max_output_retries,
-                    task_timeout_sec=harness_config.task_timeout_sec,
+                    task_timeout_sec=task_timeout_sec,
                     env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
                     slot_release=release_slot,
                 )
@@ -537,6 +628,7 @@ class ExperimentRunner:
     ) -> ExperimentRecord:
         """Run the current HEAD as the active baseline over the full panel."""
         experiments_root = harbor_config.experiments_dir
+        panel_specs = _compile_panel_specs(harness_config)
         state = ExperimentState.load(root=experiments_root)
         baseline_id = state.active_baseline_experiment_id
         baseline = (
@@ -554,7 +646,7 @@ class ExperimentRunner:
             current_record = ExperimentRecord.load(current_id, root=experiments_root)
             if not current_record.is_concluded() and any(
                 task_trials.trial_count > 0
-                for task_trials in current_record.train_task_results.values()
+                for task_trials in current_record._all_task_results()
             ):
                 raise RuntimeError(
                     "cannot run baseline while the current experiment has recorded task activity"
@@ -562,9 +654,10 @@ class ExperimentRunner:
         control_repo.require_clean_worktree(cwd=repo_root)
         git_commit_hash = control_repo.get_head_commit(cwd=repo_root)
         if baseline is not None:
-            if baseline.git_commit_hash == git_commit_hash and set(
-                harness_config.train_task_names
-            ) == set(baseline.train_task_ids):
+            if (
+                baseline.git_commit_hash == git_commit_hash
+                and _record_matches_panel_specs(baseline, panel_specs)
+            ):
                 state.current_experiment_id = baseline.experiment_id
                 state.updated_at = datetime.now(timezone.utc).isoformat()
                 state.save(root=experiments_root)
@@ -588,10 +681,16 @@ class ExperimentRunner:
             experiment_id=resolved_experiment_id,
             git_commit_hash=git_commit_hash,
             parent_baseline_experiment_id=baseline_id,
-            train_task_ids=list(harness_config.train_task_names),
+            panels=[
+                _panel_record_for_spec(
+                    spec=spec,
+                    expected_trial_count=0,
+                    lifecycle="pending",
+                )
+                for spec in panel_specs
+            ],
             focus_name=harness_config.focus_name,
             started_at=baseline_at,
-            expected_trial_count=harness_config.task_trials,
         )
         experiment_dir = experiments_root / resolved_experiment_id
         experiment_dir.mkdir(parents=True, exist_ok=False)
@@ -605,28 +704,45 @@ class ExperimentRunner:
             )
             task_dirs = _prepare_task_dirs(
                 trial_harbor_config=trial_harbor_config,
-                task_names=harness_config.train_task_names,
+                task_names=[
+                    task_name for spec in panel_specs for task_name in spec.task_names
+                ],
             )
-            asyncio.run(
-                _run_panel(
-                    record=record,
-                    experiments_root=experiments_root,
-                    task_names=_schedule_order(harness_config.train_task_names),
-                    task_dirs=task_dirs,
-                    harness_config=harness_config,
-                    make_llm=lambda: _make_llm_for_config(
-                        config=harness_config.llm_provider_config,
-                        api_key=api_key,
-                    ),
-                    make_env=lambda task_name, *, task_dir, exec_semaphore=None: Harbor(
-                        trial_harbor_config,
-                        task_name=task_name,
-                        task_dir=task_dir,
-                        exec_semaphore=exec_semaphore,
-                    ),
+            for spec in panel_specs:
+                panel = record.panels[spec.panel_id]
+                panel.lifecycle = "active"
+                panel.started_at = datetime.now(timezone.utc).isoformat()
+                for trials in panel.task_results.values():
+                    trials.expected_trial_count = harness_config.task_trials
+                record.write(root=experiments_root)
+                asyncio.run(
+                    _run_panel(
+                        record=record,
+                        experiments_root=experiments_root,
+                        task_names=_schedule_order(spec.task_names),
+                        task_results=record.panels[spec.panel_id].task_results,
+                        task_timeout_sec=spec.task_timeout_sec,
+                        task_dirs=task_dirs,
+                        harness_config=harness_config,
+                        make_llm=lambda: _make_llm_for_config(
+                            config=harness_config.llm_provider_config,
+                            api_key=api_key,
+                        ),
+                        make_env=lambda task_name,
+                        *,
+                        task_dir,
+                        exec_semaphore=None: Harbor(
+                            trial_harbor_config,
+                            task_name=task_name,
+                            task_dir=task_dir,
+                            exec_semaphore=exec_semaphore,
+                        ),
+                    )
                 )
-            )
-            raise_if_no_valid_evidence(record)
+                panel.lifecycle = "finished"
+                panel.finished_at = datetime.now(timezone.utc).isoformat()
+                record.write(root=experiments_root)
+                raise_if_no_valid_evidence(record)
         except BaseException as exc:
             record.finalize_crash(exc=exc, baseline=baseline, root=experiments_root)
             if isinstance(exc, Exception):
@@ -651,6 +767,7 @@ class ExperimentRunner:
         require_clean_worktree: bool = True,
     ) -> None:
         self.harness_config = harness_config
+        self.panel_specs = _compile_panel_specs(harness_config)
         self.harbor_config = harbor_config
         self.api_key = api_key
         if require_clean_worktree:
@@ -663,10 +780,17 @@ class ExperimentRunner:
             experiment_id=self.harness_config.experiment_id,
             git_commit_hash=control_repo.get_head_commit(),
             parent_baseline_experiment_id=self.frozen_baseline_experiment_id,
-            train_task_ids=list(self.harness_config.train_task_names),
+            panels=[
+                _panel_record_for_spec(
+                    spec=spec,
+                    expected_trial_count=self.harness_config.task_trials
+                    if spec.initial_lifecycle == "active"
+                    else 0,
+                )
+                for spec in self.panel_specs
+            ],
             focus_name=self.harness_config.focus_name,
             started_at=datetime.now(timezone.utc).isoformat(),
-            expected_trial_count=self.harness_config.task_trials,
         )
         self._task_dirs: dict[str, Path] = {}
         # Held for tests and terminal paths that need the parent baseline.
@@ -698,23 +822,30 @@ class ExperimentRunner:
             api_key=self.api_key,
         )
 
-    def _apply_baseline_derived_trial_counts(self, baseline: ExperimentRecord) -> None:
-        # Where the baseline shows a task as deterministic-solved (every
-        # observed trial passed), budget the candidate for a single trial.
-        # If that trial fails, run_task_trials' confirm-on-fail expands the
-        # budget back to task_trials to verify the suspected regression.
-        if self.harness_config.task_trials <= 1:
-            return
+    def _set_panel_trial_budget(
+        self,
+        *,
+        panel: PanelRecord,
+        baseline_panel: PanelRecord | None,
+    ) -> bool:
         changed = False
-        for task_id, baseline_trials in baseline.train_task_results.items():
-            candidate_trials = self.record.train_task_results.get(task_id)
-            if candidate_trials is None:
-                continue
-            if baseline_trials.is_deterministic_solved:
-                candidate_trials.expected_trial_count = 1
+        for task_id, trials in panel.task_results.items():
+            expected_trial_count = self.harness_config.task_trials
+            baseline_trials = (
+                None
+                if baseline_panel is None
+                else baseline_panel.task_results.get(task_id)
+            )
+            if (
+                self.harness_config.task_trials > 1
+                and baseline_trials is not None
+                and baseline_trials.is_deterministic_solved
+            ):
+                expected_trial_count = 1
+            if trials.expected_trial_count != expected_trial_count:
+                trials.expected_trial_count = expected_trial_count
                 changed = True
-        if changed:
-            self.record.write(root=self.experiments_root)
+        return changed
 
     def run(self) -> ExperimentRecord:
         self.experiment_dir.mkdir(parents=True, exist_ok=False)
@@ -734,7 +865,12 @@ class ExperimentRunner:
             )
             self._task_dirs = _prepare_task_dirs(
                 trial_harbor_config=self._trial_harbor_config(),
-                task_names=self.harness_config.train_task_names,
+                task_names=[
+                    task_name
+                    for spec in self.panel_specs
+                    if spec.initial_lifecycle == "active"
+                    for task_name in spec.task_names
+                ],
             )
             self.record.started_at = datetime.now(timezone.utc).isoformat()
             self.record.write(root=self.experiments_root)
@@ -757,23 +893,101 @@ class ExperimentRunner:
         baseline: ExperimentRecord | None,
     ) -> ExperimentRecord:
         try:
-            if baseline is not None:
-                self._apply_baseline_derived_trial_counts(baseline)
-            await _run_panel(
-                record=self.record,
-                experiments_root=self.experiments_root,
-                task_names=_schedule_order(self.harness_config.train_task_names),
-                task_dirs=self._task_dirs,
-                harness_config=self.harness_config,
-                make_llm=self._make_llm,
-                make_env=self._make_env,
-            )
-            self._validate_record_ready_for_evaluation(self.record)
-            pool = self._build_gate_pool(baseline=baseline)
-            verdicts = build_gate_verdicts(candidate=self.record, pool=pool)
-            status, decision_reason = decide_from_verdicts(
-                candidate=self.record, verdicts=verdicts
-            )
+            status: ExperimentStatus | None = None
+            decision_reason = ""
+            verdicts: dict[str, BaselineComparison] = {}
+            for spec in self.panel_specs:
+                if spec.after_panel is None:
+                    should_run = True
+                else:
+                    upstream_evaluation = self.record.panels[
+                        spec.after_panel
+                    ].evaluation
+                    should_run = (
+                        upstream_evaluation is not None
+                        and upstream_evaluation.status == spec.when_status
+                    )
+                if not should_run:
+                    panel = self.record.panels[spec.panel_id]
+                    panel.lifecycle = "skipped"
+                    panel.skip_reason = (
+                        f"{spec.after_panel} panel did not {spec.when_status}"
+                    )
+                    self.record.write(root=self.experiments_root)
+                    continue
+                if spec.requires_baseline and baseline is None:
+                    raise RuntimeError(
+                        f"{spec.panel_id} panel requires an active baseline"
+                    )
+                panel = self.record.panels[spec.panel_id]
+                baseline_panel = (
+                    None
+                    if baseline is None or spec.panel_id not in baseline.panels
+                    else baseline.panels[spec.panel_id]
+                )
+                panel.lifecycle = "active"
+                panel.skip_reason = ""
+                if panel.started_at is None:
+                    panel.started_at = datetime.now(timezone.utc).isoformat()
+                self._set_panel_trial_budget(
+                    panel=panel,
+                    baseline_panel=baseline_panel,
+                )
+                self.record.write(root=self.experiments_root)
+                missing_task_dirs = [
+                    task_name
+                    for task_name in spec.task_names
+                    if task_name not in self._task_dirs
+                ]
+                if missing_task_dirs:
+                    self._task_dirs.update(
+                        _prepare_task_dirs(
+                            trial_harbor_config=self._trial_harbor_config(),
+                            task_names=missing_task_dirs,
+                        )
+                    )
+                await _run_panel(
+                    record=self.record,
+                    experiments_root=self.experiments_root,
+                    task_names=_schedule_order(spec.task_names),
+                    task_results=panel.task_results,
+                    task_timeout_sec=spec.task_timeout_sec,
+                    task_dirs=self._task_dirs,
+                    harness_config=self.harness_config,
+                    make_llm=self._make_llm,
+                    make_env=self._make_env,
+                )
+                panel.lifecycle = "finished"
+                panel.finished_at = datetime.now(timezone.utc).isoformat()
+                self.record.write(root=self.experiments_root)
+                self._validate_record_ready_for_evaluation(self.record)
+                panel_pool = self._build_gate_pool(
+                    baseline=baseline,
+                    panel=spec.panel_id,
+                )
+                panel_verdicts = build_gate_verdicts(
+                    candidate=self.record,
+                    pool=panel_pool,
+                    panel=spec.panel_id,
+                )
+                panel_status, panel_reason = decide_panel_from_verdicts(
+                    candidate=self.record,
+                    verdicts=panel_verdicts,
+                    panel=spec.panel_id,
+                    purpose=spec.purpose,
+                )
+                panel.evaluation = PanelEvaluation(
+                    status=panel_status,
+                    decision_reason=panel_reason,
+                    verdicts=panel_verdicts,
+                )
+                verdicts = {**verdicts, **panel_verdicts}
+                if spec.purpose == "promotion" or panel_status == "discard":
+                    status = panel_status
+                    decision_reason = panel_reason
+                self.record.write(root=self.experiments_root)
+            if status is None:
+                raise RuntimeError("candidate produced no panel decision")
             self.record.finalize(status=status, decision_reason=decision_reason)
             # Thread the gate's verdict dict into the persisted evidence so
             # downstream readers, including supervisor artifact selection,
@@ -793,6 +1007,7 @@ class ExperimentRunner:
         self,
         *,
         baseline: ExperimentRecord | None,
+        panel: str,
     ) -> dict[str, tuple[int, int]]:
         # No baseline yet: no-baseline frontier path for every task.
         # compare_candidate_against_baseline handles (0,0) entries by
@@ -804,7 +1019,8 @@ class ExperimentRunner:
             workspace_root=Path.cwd(),
             active_baseline=baseline,
             candidate_experiment_id=self.record.experiment_id,
-            task_ids=tuple(self.harness_config.train_task_names),
+            task_ids=tuple(self.record.panels[panel].task_ids),
+            panel=panel,
         )
 
     def _conclude_experiment(self) -> None:
@@ -842,19 +1058,34 @@ class ExperimentRunner:
             raise ValueError(
                 "candidate parent baseline must match the frozen active baseline"
             )
-        if set(candidate.train_task_ids) != set(candidate.train_task_results):
-            raise ValueError(
-                "candidate task results must cover exactly the configured task ids"
-            )
+        for panel_id in candidate.panel_order:
+            panel = candidate.panels[panel_id]
+            if set(panel.task_ids) != set(panel.task_results):
+                raise ValueError(
+                    f"candidate {panel_id} panel task results must cover exactly the configured task ids"
+                )
         if baseline is None:
+            for spec in self.panel_specs:
+                if spec.requires_baseline:
+                    raise ValueError(
+                        f"{spec.panel_id} panel requires an active baseline"
+                    )
             return
-        if candidate.train_task_ids != baseline.train_task_ids:
+        if candidate.panel_order != baseline.panel_order:
             raise ValueError(
-                "candidate train panel must match the frozen baseline train panel"
+                "candidate panels must match the frozen baseline panel order"
             )
+        for panel_id in candidate.panel_order:
+            if (
+                candidate.panels[panel_id].task_ids
+                != baseline.panels[panel_id].task_ids
+            ):
+                raise ValueError(
+                    f"candidate {panel_id} panel must match the frozen baseline {panel_id} panel"
+                )
 
     def _validate_record_ready_for_evaluation(self, record: ExperimentRecord) -> None:
-        if any(not trials.is_finished for trials in record.train_task_results.values()):
+        if any(not trials.is_finished for trials in record._all_task_results()):
             raise RuntimeError("all task results must be finished before evaluation")
         if record.error:
             raise RuntimeError(

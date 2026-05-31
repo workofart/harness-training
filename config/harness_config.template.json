@@ -1,6 +1,8 @@
 // Commented template for config/harness_config.json.
 // The runtime config must be strict JSON, so remove comments before copying.
 {
+  "schema_version": 2,
+
   // Unique id for the next manual experiment directory.
   // Change this before each repeated `uv run exp`.
   // `uv run auto` overwrites this for supervisor-launched candidates.
@@ -13,8 +15,32 @@
   // https://www.tbench.ai/benchmarks/terminal-bench-2
   // Local task_overrides/<task_id> directories take precedence over the Harbor registry.
   // Start with one cheap smoke task; expand only after setup is working.
-  "train_task_names": [
-    "log-summary-date-ranges"
+  "panels": [
+    {
+      "id": "train",
+      "purpose": "promotion",
+      "task_names": [
+        "log-summary-date-ranges"
+      ],
+
+      // Wall-clock timeout for one train task trial.
+      "task_timeout_sec": 300.0,
+      "run": { "when": "always" },
+      "baseline": { "required": false }
+    }
+
+    // Held-out tasks run only after the train panel passes promotion criteria.
+    // They can block promotion on regression but cannot create promotion alone.
+    // Add a comma after the train panel and uncomment this block to enable one.
+    // ,
+    // {
+    //   "id": "test",
+    //   "purpose": "regression_veto",
+    //   "task_names": ["held-out-task-id"],
+    //   "task_timeout_sec": 600.0,
+    //   "run": { "after_panel": "train", "when_status": "keep" },
+    //   "baseline": { "required": true }
+    // }
   ],
 
   // Maximum policy/environment steps per task trial. Raise this for serious runs.
@@ -44,9 +70,6 @@
   // throughput is safe only while this stays low enough to keep concurrent heavy
   // ops under the core count. Default 10; ~half the cores is a safe start.
   "max_heavy_action_concurrency": 1,
-
-  // Wall-clock timeout for one task trial.
-  "task_timeout_sec": 300.0,
 
   // Retries after invalid model tool/output formatting.
   "max_output_retries": 2,

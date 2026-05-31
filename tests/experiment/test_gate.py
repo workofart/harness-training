@@ -5,10 +5,10 @@ import pytest
 from src.experiment.gate import (
     build_pooled_control_samples,
     build_gate_verdicts,
-    decide_from_verdicts,
+    decide_panel_from_verdicts,
     rule_names_from_added_lines,
 )
-from src.experiment.record import ExperimentRecord, terminal_task_result
+from src.experiment.record import ExperimentRecord, PanelRecord, terminal_task_result
 from src.harness.contracts import TaskResult
 from src.metrics import TaskMetrics
 
@@ -20,13 +20,11 @@ def test_evidence_outcome_follows_gate_verdict_not_majority_flip(tmp_path):
     # rate flipped majority without statistical significance. Now both
     # the gate decision and the persisted label come from one verdict
     # dict, so the disagreement can no longer happen.
-    baseline = ExperimentRecord.initialize(
+    baseline = _make_record(
         experiment_id="baseline",
-        git_commit_hash="base123",
-        parent_baseline_experiment_id=None,
-        train_task_ids=["wobbly"],
-        started_at="2026-04-10T00:00:00+00:00",
-        expected_trial_count=10,
+        parent=None,
+        train_ids=["wobbly"],
+        k=10,
     )
     # Baseline majority-solves 5/10 -> majority_solved is True (>= ceil(10/2)).
     for solved in [True] * 5 + [False] * 5:
@@ -42,13 +40,11 @@ def test_evidence_outcome_follows_gate_verdict_not_majority_flip(tmp_path):
             )
         )
 
-    candidate = ExperimentRecord.initialize(
+    candidate = _make_record(
         experiment_id="candidate",
-        git_commit_hash="candidate123",
-        parent_baseline_experiment_id="baseline",
-        train_task_ids=["wobbly"],
-        started_at="2026-04-10T00:00:00+00:00",
-        expected_trial_count=10,
+        parent="baseline",
+        train_ids=["wobbly"],
+        k=10,
     )
     # Candidate slips to 4/10 -> majority_solved is False. Old majority-flip
     # logic would label this "regression". The gate's binomial at p_hat=0.5
@@ -69,12 +65,12 @@ def test_evidence_outcome_follows_gate_verdict_not_majority_flip(tmp_path):
     candidate.finalize(status="discard", decision_reason="no train improvement")
     pool = {
         tid: (trials.solved_count, trials.trial_count)
-        for tid, trials in baseline.train_task_results.items()
+        for tid, trials in _train_results(baseline).items()
     }
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
     candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
 
-    outcome = candidate.evidence.task_outcomes[0]
+    outcome = _train_outcomes(candidate)[0]
     assert outcome.outcome == "unchanged_unsolved"
     assert verdicts["wobbly"].kind == "unchanged"
 
@@ -87,7 +83,7 @@ def test_single_source_of_truth_gate_and_evidence_agree():
     def _pool(baseline):
         return {
             tid: (trials.solved_count, trials.trial_count)
-            for tid, trials in baseline.train_task_results.items()
+            for tid, trials in _train_results(baseline).items()
         }
 
     # Three tasks crafted to exercise three different verdict kinds:
@@ -126,7 +122,12 @@ def test_single_source_of_truth_gate_and_evidence_agree():
 
     # Decision layer reads the same verdicts. Regression wins over
     # improvement within a candidate.
-    status, reason = decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    status, reason = decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="promotion",
+    )
     assert (status, reason) == ("discard", "train task solid regressed")
 
     # Evidence layer reads the same verdicts. Labels are the 5-state
@@ -134,7 +135,7 @@ def test_single_source_of_truth_gate_and_evidence_agree():
     candidate.finalize(status=status, decision_reason=reason)
     candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
     outcomes = {
-        outcome.task_id: outcome.outcome for outcome in candidate.evidence.task_outcomes
+        outcome.task_id: outcome.outcome for outcome in _train_outcomes(candidate)
     }
     assert outcomes["frontier"] == "new_solve"
     assert outcomes["solid"] == "regression"
@@ -192,7 +193,12 @@ def test_evidence_uses_pool_verdict_not_baseline_only_recomputation():
     )
     assert baseline_only["X"].kind == "regression"
 
-    status, reason = decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    status, reason = decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="promotion",
+    )
     assert (status, reason) == (
         "discard",
         "no train task improvement reached significance",
@@ -202,7 +208,7 @@ def test_evidence_uses_pool_verdict_not_baseline_only_recomputation():
     candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
 
     outcomes = {
-        outcome.task_id: outcome.outcome for outcome in candidate.evidence.task_outcomes
+        outcome.task_id: outcome.outcome for outcome in _train_outcomes(candidate)
     }
     assert outcomes["X"] == "unchanged_unsolved"
 
@@ -212,10 +218,26 @@ def _make_record(*, experiment_id, parent, train_ids, k):
         experiment_id=experiment_id,
         git_commit_hash=experiment_id,
         parent_baseline_experiment_id=parent,
-        train_task_ids=train_ids,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=train_ids,
+                expected_trial_count=k,
+                lifecycle="active",
+            )
+        ],
         started_at="2026-05-05T00:00:00+00:00",
-        expected_trial_count=k,
     )
+
+
+def _train_results(record: ExperimentRecord):
+    return record.panels["train"].task_results
+
+
+def _train_outcomes(record: ExperimentRecord):
+    assert record.evidence is not None
+    return record.evidence.panel_outcomes["train"]
 
 
 def _record_solves(record, task_id, solves):
@@ -242,7 +264,7 @@ def _pool_from_baseline(baseline) -> dict[str, tuple[int, int]]:
         return {}
     return {
         tid: (trials.solved_count, trials.trial_count)
-        for tid, trials in baseline.train_task_results.items()
+        for tid, trials in _train_results(baseline).items()
     }
 
 
@@ -252,7 +274,12 @@ def _gate(*, candidate, pool) -> tuple[str, str]:
     ``_run_experiment`` but holds onto the verdict dict so it can thread
     it into evidence; tests below only assert on (status, reason)."""
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
-    return decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    return decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="promotion",
+    )
 
 
 def test_majority_solving_candidate_not_flagged_regression_against_degenerate_pool():
@@ -273,7 +300,12 @@ def test_majority_solving_candidate_not_flagged_regression_against_degenerate_po
 
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
     assert verdicts["easy"].kind == "unchanged"
-    _, reason = decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    _, reason = decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="promotion",
+    )
     assert "regressed" not in reason
 
 
@@ -293,7 +325,12 @@ def test_binomial_regression_preserved_when_candidate_below_majority():
 
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
     assert verdicts["easy"].kind == "regression"
-    status, reason = decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    status, reason = decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="promotion",
+    )
     assert status == "discard" and "regressed" in reason
 
 
@@ -458,7 +495,7 @@ def test_evaluate_train_regression_wins_over_train_improvement():
 
 
 def test_evaluate_keeps_when_no_baseline_task_solved_with_no_baseline_entry():
-    # A task with no baseline train_task_results entry can still appear in a
+    # A task with no baseline train panel result can still appear in a
     # candidate panel after a panel edit. If the candidate majority-solves it,
     # evaluate() must treat that as "improvement" on first measurement.
     baseline = _make_record(
@@ -525,9 +562,16 @@ def _pool_record(
         experiment_id=experiment_id,
         git_commit_hash="cand-" + experiment_id,
         parent_baseline_experiment_id=parent_baseline_id,
-        train_task_ids=train_task_ids,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=train_task_ids,
+                expected_trial_count=1,
+                lifecycle="active",
+            )
+        ],
         started_at="2026-05-10T00:00:00+00:00",
-        expected_trial_count=1,
     )
     record.status = status
     record.decision_reason = decision_reason
@@ -844,6 +888,55 @@ def test_build_pooled_control_samples_filters_records_and_trials(pool_case):
     assert pool == pool_case["expected"]
 
 
+def test_build_pooled_control_samples_skips_recent_record_missing_panel():
+    baseline = ExperimentRecord.initialize(
+        experiment_id="baseline",
+        git_commit_hash="baseline-sha",
+        parent_baseline_experiment_id=None,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=["train-a"],
+                expected_trial_count=1,
+                lifecycle="finished",
+            ),
+            PanelRecord.initialize(
+                panel_id="test",
+                purpose="regression_veto",
+                task_ids=["test-a"],
+                expected_trial_count=1,
+                lifecycle="finished",
+            ),
+        ],
+        started_at="2026-05-10T00:00:00+00:00",
+    )
+    baseline.status = "keep"
+    baseline.decision_reason = "promoted"
+    baseline.finished_at = "2026-05-10T00:10:00+00:00"
+    baseline.record_task_result(_pool_trial("test-a", solved=True))
+    train_only_recent = _pool_record(
+        experiment_id="train-only-recent",
+        parent_baseline_id="baseline",
+        train_task_ids=["train-a"],
+        finished_at="2026-05-10T00:09:00+00:00",
+    )
+    _populate_pool_trials(
+        train_only_recent,
+        {"train-a": [_pool_trial("train-a", solved=False)]},
+    )
+
+    pool = build_pooled_control_samples(
+        active_baseline=baseline,
+        recent_candidates=[train_only_recent],
+        candidate_new_rule_names={},
+        task_ids=["test-a"],
+        panel="test",
+    )
+
+    assert pool == {"test-a": (1, 1)}
+
+
 def test_crash_fillers_do_not_change_gate_verdicts():
     # Safety net for the A-relax refactor. The gate reads only valid (error-free)
     # trials, so the crash placeholders `_complete_unfinished_task_results`
@@ -879,20 +972,20 @@ def test_crash_fillers_do_not_change_gate_verdicts():
 
     # The two records genuinely differ in their raw trial lists, so equal
     # verdicts are a real invariant rather than a tautology.
-    assert filled.train_task_results["task-c"].trial_count == 3
-    assert relaxed.train_task_results["task-c"].trial_count == 0
-    assert filled.train_task_results["task-b"].trial_count == 3
-    assert relaxed.train_task_results["task-b"].trial_count == 1
+    assert _train_results(filled)["task-c"].trial_count == 3
+    assert _train_results(relaxed)["task-c"].trial_count == 0
+    assert _train_results(filled)["task-b"].trial_count == 3
+    assert _train_results(relaxed)["task-b"].trial_count == 1
 
     # The gate's only trial inputs -- solved_count and len(valid_trials) -- match,
     # because the fillers carry `error` and are excluded.
     for task_id in train_ids:
         assert (
-            filled.train_task_results[task_id].solved_count
-            == relaxed.train_task_results[task_id].solved_count
+            _train_results(filled)[task_id].solved_count
+            == _train_results(relaxed)[task_id].solved_count
         )
-        assert len(filled.train_task_results[task_id].valid_trials) == len(
-            relaxed.train_task_results[task_id].valid_trials
+        assert len(_train_results(filled)[task_id].valid_trials) == len(
+            _train_results(relaxed)[task_id].valid_trials
         )
 
     # The full verdict objects (kind, p_value, all four counts) are identical.

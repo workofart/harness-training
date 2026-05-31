@@ -168,17 +168,22 @@ def _existing_artifact_paths(paths: tuple[str | None, ...]) -> tuple[str, ...]:
 
 def latest_evidence_task_artifact_paths(record: ExperimentRecord) -> tuple[str, ...]:
     evidence = record.evidence
-    if evidence is None or not evidence.task_outcomes:
+    if evidence is None or not evidence.panel_outcomes:
         return ()
+    outcomes = [
+        outcome
+        for panel_id in record.panel_order
+        for outcome in evidence.panel_outcomes.get(panel_id, [])
+    ]
     relevant_outcomes = [
         outcome
-        for outcome in evidence.task_outcomes
+        for outcome in outcomes
         if outcome.outcome in {"new_solve", "regression"}
     ]
     if not relevant_outcomes:
         relevant_outcomes = [
             outcome
-            for outcome in evidence.task_outcomes
+            for outcome in outcomes
             if outcome.candidate_solved is not True
             or (outcome.error is not None and outcome.error.strip())
         ]
@@ -265,7 +270,7 @@ def build_prelaunch_prompt(
         )
     if evidence_artifact_paths:
         lines.append(
-            "- candidate evidence artifact paths from `evidence.task_outcomes`:"
+            "- candidate evidence artifact paths from `evidence.panel_outcomes`:"
         )
         lines.extend(f"- {path}" for path in evidence_artifact_paths)
     if feedback_note is not None:
@@ -301,7 +306,7 @@ def build_experiment_diagnosis_prompt(
     ]
     if evidence_artifact_paths:
         lines.append(
-            "- experiment evidence artifact paths from `evidence.task_outcomes`:"
+            "- experiment evidence artifact paths from `evidence.panel_outcomes`:"
         )
         lines.extend(f"- {path}" for path in evidence_artifact_paths)
     if feedback_note is not None:
@@ -884,7 +889,9 @@ def run_prelaunch_phase(
         try:
             validate_no_task_ids_in_workspace_diff(
                 workspace_root=workspace_root,
-                task_ids=tuple(sorted(prepared.harness_config.train_task_names)),
+                task_ids=tuple(
+                    sorted(prepared.harness_config.promotion_panel.task_names)
+                ),
             )
         except RuntimeError as exc:
             audit_notes.append(str(exc))

@@ -11,6 +11,7 @@ from src.experiment.gate import build_gate_verdicts
 from src.experiment.record import (
     ExperimentAbandoned,
     ExperimentRecord,
+    PanelRecord,
     TaskTrials,
     terminal_task_result,
 )
@@ -19,63 +20,116 @@ from src.harness.contracts import TaskResult
 from conftest import _task_result, _write_task_artifacts
 
 
-def test_experiment_record_load_reads_panel_schema(tmp_path):
+def train_panel(
+    task_ids: list[str],
+    *,
+    expected_trial_count: int = 1,
+    lifecycle: str = "active",
+) -> PanelRecord:
+    return PanelRecord.initialize(
+        panel_id="train",
+        purpose="promotion",
+        task_ids=task_ids,
+        expected_trial_count=expected_trial_count,
+        lifecycle=lifecycle,
+    )
+
+
+def init_record(
+    *,
+    experiment_id: str,
+    git_commit_hash: str = "abc123",
+    parent_baseline_experiment_id: str | None = None,
+    train_task_ids: list[str],
+    started_at: str = "2026-04-10T00:00:00+00:00",
+) -> ExperimentRecord:
+    return ExperimentRecord.initialize(
+        experiment_id=experiment_id,
+        git_commit_hash=git_commit_hash,
+        parent_baseline_experiment_id=parent_baseline_experiment_id,
+        panels=[train_panel(train_task_ids)],
+        started_at=started_at,
+    )
+
+
+def train_results(record: ExperimentRecord) -> dict[str, TaskTrials]:
+    return record.panels["train"].task_results
+
+
+def train_outcomes(record: ExperimentRecord):
+    assert record.evidence is not None
+    return record.evidence.panel_outcomes["train"]
+
+
+def test_experiment_record_load_reads_v2_panel_schema(tmp_path):
     root = tmp_path / "experiments"
     record_dir = root / "exp-panels"
     record_dir.mkdir(parents=True)
     payload = {
+        "schema_version": 2,
         "experiment_id": "exp-panels",
         "parent_baseline_experiment_id": None,
         "git_commit_hash": "abc123",
         "focus_name": "action-set",
-        "train_task_ids": ["train-b", "train-a"],
         "status": "keep",
-        "train_solved_count": 1,
         "decision_reason": "train improvement",
         "error": "",
         "started_at": "2026-04-10T00:00:00+00:00",
         "finished_at": "2026-04-10T00:00:01+00:00",
-        "train_task_results": {
-            "train-a": {
-                "task_name": "train-a",
-                "expected_trial_count": 1,
-                "trials": [
-                    {
+        "panel_order": ["train"],
+        "panels": {
+            "train": {
+                "panel_id": "train",
+                "purpose": "promotion",
+                "lifecycle": "finished",
+                "task_ids": ["train-a", "train-b"],
+                "task_results": {
+                    "train-a": {
                         "task_name": "train-a",
-                        "reward": 1.0,
-                        "steps_used": 1,
-                        "error": None,
-                        "trial_dir": None,
-                        "trace_path": None,
-                        "metrics_path": None,
-                        "verifier_stdout_path": None,
-                        "metrics": {},
-                        "started_at": "2026-04-10T00:00:00+00:00",
-                        "finished_at": "2026-04-10T00:00:01+00:00",
-                        "solved": True,
-                    }
-                ],
-            },
-            "train-b": {
-                "task_name": "train-b",
-                "expected_trial_count": 1,
-                "trials": [
-                    {
+                        "expected_trial_count": 1,
+                        "trials": [
+                            {
+                                "task_name": "train-a",
+                                "reward": 1.0,
+                                "steps_used": 1,
+                                "error": None,
+                                "trial_dir": None,
+                                "trace_path": None,
+                                "metrics_path": None,
+                                "verifier_stdout_path": None,
+                                "metrics": {},
+                                "started_at": "2026-04-10T00:00:00+00:00",
+                                "finished_at": "2026-04-10T00:00:01+00:00",
+                                "solved": True,
+                            }
+                        ],
+                    },
+                    "train-b": {
                         "task_name": "train-b",
-                        "reward": 0.0,
-                        "steps_used": 1,
-                        "error": None,
-                        "trial_dir": None,
-                        "trace_path": None,
-                        "metrics_path": None,
-                        "verifier_stdout_path": None,
-                        "metrics": {},
-                        "started_at": "2026-04-10T00:00:00+00:00",
-                        "finished_at": "2026-04-10T00:00:01+00:00",
-                        "solved": False,
-                    }
-                ],
-            },
+                        "expected_trial_count": 1,
+                        "trials": [
+                            {
+                                "task_name": "train-b",
+                                "reward": 0.0,
+                                "steps_used": 1,
+                                "error": None,
+                                "trial_dir": None,
+                                "trace_path": None,
+                                "metrics_path": None,
+                                "verifier_stdout_path": None,
+                                "metrics": {},
+                                "started_at": "2026-04-10T00:00:00+00:00",
+                                "finished_at": "2026-04-10T00:00:01+00:00",
+                                "solved": False,
+                            }
+                        ],
+                    },
+                },
+                "started_at": None,
+                "finished_at": None,
+                "skip_reason": "",
+                "evaluation": None,
+            }
         },
         "evidence": {
             "candidate_change": {
@@ -83,16 +137,55 @@ def test_experiment_record_load_reads_panel_schema(tmp_path):
                 "parent_baseline_experiment_id": None,
                 "parent_baseline_commit": None,
             },
-            "task_outcomes": [],
+            "panel_outcomes": {"train": []},
         },
     }
     (record_dir / "experiment.json").write_text(json.dumps(payload))
 
     record = ExperimentRecord.load("exp-panels", root=root)
 
-    assert record.train_task_ids == ["train-a", "train-b"]
-    assert record.train_solved_count == 1
-    assert sorted(record.train_task_results) == ["train-a", "train-b"]
+    assert record.panels["train"].task_ids == ["train-a", "train-b"]
+    assert record.panels["train"].solved_count == 1
+    assert sorted(record.panels["train"].task_results) == ["train-a", "train-b"]
+
+
+def test_experiment_record_rejects_v1_payload():
+    with pytest.raises(ValidationError):
+        ExperimentRecord.model_validate(
+            {
+                "experiment_id": "exp",
+                "parent_baseline_experiment_id": None,
+                "git_commit_hash": "abc123",
+                "focus_name": "",
+                "train_task_ids": ["train-a"],
+                "status": None,
+                "train_solved_count": 0,
+                "decision_reason": "",
+                "error": "",
+                "started_at": "2026-04-10T00:00:00+00:00",
+                "finished_at": None,
+                "train_task_results": {},
+                "evidence": None,
+            }
+        )
+
+
+def test_experiment_record_rejects_duplicate_panel_order():
+    record = init_record(experiment_id="exp", train_task_ids=["train-a"])
+    payload = record.model_dump(mode="json")
+    payload["panel_order"].append("train")
+
+    with pytest.raises(ValidationError):
+        ExperimentRecord.model_validate(payload)
+
+
+def test_panel_record_rejects_duplicate_task_ids():
+    panel = train_panel(["train-a"])
+    payload = panel.model_dump(mode="json")
+    payload["task_ids"].append("train-a")
+
+    with pytest.raises(ValidationError):
+        PanelRecord.model_validate(payload)
 
 
 def test_load_fails_fast_on_missing_decision_bearing_fields():
@@ -101,7 +194,7 @@ def test_load_fails_fast_on_missing_decision_bearing_fields():
     # (gate/diagnosis) -- must be present on load. A corrupt record fails fast
     # rather than loading as a plausible-but-wrong trial filled from a
     # constructor default. `metrics` is diagnostic-only and stays optional.
-    record = ExperimentRecord.initialize(
+    record = init_record(
         experiment_id="exp",
         git_commit_hash="abc123",
         parent_baseline_experiment_id=None,
@@ -122,12 +215,12 @@ def test_load_fails_fast_on_missing_decision_bearing_fields():
         del node[path[-1]]
         return corrupt
 
-    trial_path = ("train_task_results", "train-a", "trials", 0)
+    trial_path = ("panels", "train", "task_results", "train-a", "trials", 0)
     for path in (
         ("evidence",),
-        ("evidence", "task_outcomes"),
-        ("train_task_results", "train-a", "expected_trial_count"),
-        ("train_task_results", "train-a", "trials"),
+        ("evidence", "panel_outcomes"),
+        ("panels", "train", "task_results", "train-a", "expected_trial_count"),
+        ("panels", "train", "task_results", "train-a", "trials"),
         (*trial_path, "solved"),
     ):
         with pytest.raises(ValidationError):
@@ -138,7 +231,7 @@ def test_load_fails_fast_on_missing_decision_bearing_fields():
 
 
 def test_experiment_record_updates_train_counts():
-    record = ExperimentRecord.initialize(
+    record = init_record(
         experiment_id="exp-panels",
         git_commit_hash="abc123",
         parent_baseline_experiment_id=None,
@@ -148,7 +241,7 @@ def test_experiment_record_updates_train_counts():
 
     record.record_task_result(_task_result(task_name="train-a", reward=1.0))
 
-    assert record.train_solved_count == 1
+    assert record.panels["train"].solved_count == 1
 
 
 @pytest.mark.parametrize(
@@ -162,7 +255,7 @@ def test_experiment_record_trusts_task_result_solved(
     reward: float,
     solved: bool,
 ):
-    record = ExperimentRecord.initialize(
+    record = init_record(
         experiment_id="exp-panels",
         git_commit_hash="abc123",
         parent_baseline_experiment_id=None,
@@ -178,15 +271,15 @@ def test_experiment_record_trusts_task_result_solved(
         )
     )
 
-    assert record.train_task_results["train-a"].trials[0].solved is solved
-    assert record.train_task_results["train-a"].majority_solved is solved
-    assert record.train_solved_count == (1 if solved else 0)
+    assert train_results(record)["train-a"].trials[0].solved is solved
+    assert train_results(record)["train-a"].majority_solved is solved
+    assert record.panels["train"].solved_count == (1 if solved else 0)
 
 
 def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
     tmp_path,
 ):
-    baseline = ExperimentRecord.initialize(
+    baseline = init_record(
         experiment_id="baseline",
         git_commit_hash="base123",
         parent_baseline_experiment_id=None,
@@ -222,7 +315,7 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
         )
     )
 
-    candidate = ExperimentRecord.initialize(
+    candidate = init_record(
         experiment_id="candidate",
         git_commit_hash="candidate123",
         parent_baseline_experiment_id="baseline",
@@ -275,16 +368,14 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
     # the active baseline as the entire pool for this unit test.
     pool = {
         tid: (trials.solved_count, trials.trial_count)
-        for tid, trials in baseline.train_task_results.items()
+        for tid, trials in train_results(baseline).items()
     }
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
     candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
 
     assert candidate.evidence.candidate_change.commit == "candidate123"
     assert candidate.evidence.candidate_change.parent_baseline_commit == "base123"
-    outcomes = {
-        outcome.task_id: outcome for outcome in candidate.evidence.task_outcomes
-    }
+    outcomes = {outcome.task_id: outcome for outcome in train_outcomes(candidate)}
     assert outcomes["hard-task"].outcome == "new_solve"
     assert (
         outcomes["hard-task"].agent_exec_log_path
@@ -297,8 +388,8 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
     payload = json.loads(
         (experiments_root / "candidate" / "experiment.json").read_text()
     )
-    assert payload["evidence"]["task_outcomes"][1]["outcome"] == "new_solve"
-    assert set(payload["evidence"]["task_outcomes"][1]) == {
+    assert payload["evidence"]["panel_outcomes"]["train"][1]["outcome"] == "new_solve"
+    assert set(payload["evidence"]["panel_outcomes"]["train"][1]) == {
         "task_id",
         "baseline_solved",
         "candidate_solved",
@@ -311,10 +402,87 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
         "error",
     }
     loaded = ExperimentRecord.load("candidate", root=experiments_root)
-    loaded_outcomes = {
-        outcome.task_id: outcome for outcome in loaded.evidence.task_outcomes
-    }
+    loaded_outcomes = {outcome.task_id: outcome for outcome in train_outcomes(loaded)}
     assert loaded_outcomes["hard-task"].outcome == "new_solve"
+
+
+def test_experiment_record_evidence_writes_train_and_test_panel_outcomes():
+    baseline = ExperimentRecord.initialize(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=["train-a"],
+                expected_trial_count=1,
+                lifecycle="active",
+            ),
+            PanelRecord.initialize(
+                panel_id="test",
+                purpose="regression_veto",
+                task_ids=["test-a"],
+                expected_trial_count=1,
+                lifecycle="active",
+            ),
+        ],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    baseline.record_task_result(
+        _task_result(task_name="train-a", reward=0.0, solved=False)
+    )
+    baseline.record_task_result(
+        _task_result(task_name="test-a", reward=1.0, solved=True)
+    )
+
+    candidate = ExperimentRecord.initialize(
+        experiment_id="candidate",
+        git_commit_hash="candidate123",
+        parent_baseline_experiment_id="baseline",
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=["train-a"],
+                expected_trial_count=1,
+                lifecycle="active",
+            ),
+            PanelRecord.initialize(
+                panel_id="test",
+                purpose="regression_veto",
+                task_ids=["test-a"],
+                expected_trial_count=1,
+                lifecycle="active",
+            ),
+        ],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    candidate.record_task_result(
+        _task_result(task_name="train-a", reward=1.0, solved=True)
+    )
+    candidate.record_task_result(
+        _task_result(task_name="test-a", reward=0.0, solved=False)
+    )
+
+    train_verdicts = build_gate_verdicts(
+        candidate=candidate,
+        pool={"train-a": (0, 1)},
+    )
+    test_verdicts = build_gate_verdicts(
+        candidate=candidate,
+        pool={"test-a": (1, 1)},
+        panel="test",
+    )
+    candidate.refresh_evidence(
+        baseline=baseline,
+        verdicts={**train_verdicts, **test_verdicts},
+    )
+
+    assert candidate.evidence is not None
+    assert set(candidate.evidence.panel_outcomes) == {"train", "test"}
+    assert candidate.evidence.panel_outcomes["train"][0].outcome == "new_solve"
+    assert candidate.evidence.panel_outcomes["test"][0].outcome == "regression"
 
 
 def test_experiment_record_evidence_omits_missing_artifact_paths(tmp_path):
@@ -327,7 +495,7 @@ def test_experiment_record_evidence_omits_missing_artifact_paths(tmp_path):
     for path in (steps_path, metrics_path, exec_log_path):
         path.write_text("{}\n")
 
-    candidate = ExperimentRecord.initialize(
+    candidate = init_record(
         experiment_id="candidate",
         git_commit_hash="candidate123",
         parent_baseline_experiment_id=None,
@@ -352,7 +520,7 @@ def test_experiment_record_evidence_omits_missing_artifact_paths(tmp_path):
     candidate.finalize(status="discard", decision_reason="no train improvement")
     candidate.refresh_evidence(baseline=None)
 
-    outcome = candidate.evidence.task_outcomes[0]
+    outcome = train_outcomes(candidate)[0]
     assert outcome.trial_dir == str(existing_trial_dir)
     assert outcome.agent_steps_path == str(steps_path)
     assert outcome.agent_exec_log_path == str(exec_log_path)
@@ -496,7 +664,7 @@ def test_finalize_crash_concludes_loaded_partial_panel(tmp_path):
     # holds whether finalize fabricates crash placeholders for the unrun task or
     # leaves it empty -- the regression net for the A-relax refactor.
     root = tmp_path / "experiments"
-    record = ExperimentRecord.initialize(
+    record = init_record(
         experiment_id="cand",
         git_commit_hash="abc123",
         parent_baseline_experiment_id=None,
@@ -522,8 +690,8 @@ def test_finalize_crash_concludes_loaded_partial_panel(tmp_path):
 
     # The one real trial is preserved; the unrun task yields no valid evidence
     # (true whether it stays empty or is crash-filled).
-    assert [t.solved for t in loaded.train_task_results["ran"].valid_trials] == [True]
-    assert loaded.train_task_results["never-ran"].valid_trials == []
+    assert [t.solved for t in train_results(loaded)["ran"].valid_trials] == [True]
+    assert train_results(loaded)["never-ran"].valid_trials == []
 
     # Evidence is populated and the gate still scores the single real trial.
     assert loaded.evidence is not None

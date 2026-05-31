@@ -23,17 +23,18 @@ from src.metrics import (
     is_majority_solved,
 )
 
-from src.experiment.record import ExperimentRecord, ExperimentStatus
+from src.experiment.record import ExperimentRecord, ExperimentStatus, PanelPurpose
 
 
 def build_gate_verdicts(
     *,
     candidate: ExperimentRecord,
     pool: Mapping[str, tuple[int, int]],
+    panel: str = "train",
 ) -> dict[str, BaselineComparison]:
     """Single source of truth for per-task verdicts.
 
-    For each task in the candidate's train panel, compute the
+    For each task in the candidate's requested panel, compute the
     :class:`BaselineComparison` against the pooled-control samples. The gate
     and persisted evidence both consume this dict so there is exactly one
     verdict per task per candidate.
@@ -43,7 +44,7 @@ def build_gate_verdicts(
     :func:`compare_candidate_against_baseline`.
     """
     verdicts: dict[str, BaselineComparison] = {}
-    for task_id, candidate_trials in candidate.train_task_results.items():
+    for task_id, candidate_trials in candidate.panels[panel].task_results.items():
         baseline_solved, baseline_total = pool.get(task_id, (0, 0))
         verdict = compare_candidate_against_baseline(
             candidate_solved=candidate_trials.solved_count,
@@ -85,27 +86,30 @@ def _floor_regression_when_candidate_solves(
     return verdict
 
 
-def decide_from_verdicts(
+def decide_panel_from_verdicts(
     *,
     candidate: ExperimentRecord,
     verdicts: Mapping[str, BaselineComparison],
+    panel: str,
+    purpose: PanelPurpose,
 ) -> tuple[ExperimentStatus, str]:
-    """Resolve verdicts into a promotion decision.
+    """Resolve panel verdicts into a policy decision.
 
-    Iterates the candidate's panel in ``train_task_ids`` order so the
-    decision reason deterministically names the first triggering task.
-    Regressions take priority over improvements.
+    Regressions always discard. Promotion panels can keep on improvement;
+    regression-veto panels can only block.
     """
-    panel_order = tuple(candidate.train_task_ids)
+    panel_order = tuple(candidate.panels[panel].task_ids)
     for task_id in panel_order:
         verdict = verdicts.get(task_id)
         if verdict is not None and verdict.kind == "regression":
-            return "discard", f"train task {task_id} regressed"
+            return "discard", f"{panel} task {task_id} regressed"
+    if purpose == "regression_veto":
+        return "keep", f"{panel} tasks did not regress"
     for task_id in panel_order:
         verdict = verdicts.get(task_id)
         if verdict is not None and verdict.kind == "improvement":
-            return "keep", f"train task {task_id} improved"
-    return "discard", "no train task improvement reached significance"
+            return "keep", f"{panel} task {task_id} improved"
+    return "discard", f"no {panel} task improvement reached significance"
 
 
 # ----------------------------------------------------------------------------
@@ -216,6 +220,7 @@ def build_pooled_control_samples(
     recent_candidates: Sequence["ExperimentRecord"],
     candidate_new_rule_names: Mapping[str, tuple[str, ...]],
     task_ids: Sequence[str],
+    panel: str = "train",
 ) -> dict[str, tuple[int, int]]:
     """Build (pooled_solved, pooled_total) per task for the noise model.
 
@@ -248,7 +253,7 @@ def build_pooled_control_samples(
         return any(fires.get(name, 0) > 0 for name in new_rule_names)
 
     for task_id in task_ids:
-        baseline_trials = active_baseline.train_task_results.get(task_id)
+        baseline_trials = active_baseline.panels[panel].task_results.get(task_id)
         if baseline_trials is None:
             continue
         for trial in baseline_trials.valid_trials:
@@ -265,9 +270,12 @@ def build_pooled_control_samples(
             continue
         if record.decision_reason in BASELINE_DECISION_REASONS:
             continue
+        record_panel = record.panels.get(panel)
+        if record_panel is None:
+            continue
         new_rules = candidate_new_rule_names.get(record.experiment_id, ())
         for task_id in task_ids:
-            trials = record.train_task_results.get(task_id)
+            trials = record_panel.task_results.get(task_id)
             if trials is None:
                 continue
             for trial in trials.valid_trials:
@@ -285,6 +293,7 @@ def build_gate_pool(
     active_baseline: "ExperimentRecord",
     candidate_experiment_id: str,
     task_ids: Sequence[str],
+    panel: str = "train",
     window: int = POOLED_CONTROL_WINDOW,
 ) -> dict[str, tuple[int, int]]:
     """Assemble the (solved, total) pool the promotion gate compares against.
@@ -315,4 +324,5 @@ def build_gate_pool(
         recent_candidates=recent,
         candidate_new_rule_names=rule_names_by_id,
         task_ids=task_ids,
+        panel=panel,
     )

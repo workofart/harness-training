@@ -12,13 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from src.harness.contracts import TaskResult
 from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majority_solved
@@ -26,6 +26,8 @@ from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majorit
 
 EXPERIMENT_FILENAME = "experiment.json"
 ExperimentStatus = Literal["keep", "discard", "crash"]
+PanelLifecycle = Literal["pending", "active", "finished", "skipped"]
+PanelPurpose = Literal["promotion", "regression_veto"]
 
 
 class ExperimentAbandoned(RuntimeError):
@@ -232,7 +234,7 @@ class ExperimentEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     candidate_change: CandidateChangeEvidence
-    task_outcomes: list[TaskOutcomeEvidence]
+    panel_outcomes: dict[str, list[TaskOutcomeEvidence]]
 
     @classmethod
     def empty(cls, *, record: "ExperimentRecord") -> "ExperimentEvidence":
@@ -241,26 +243,98 @@ class ExperimentEvidence(BaseModel):
                 commit=record.git_commit_hash,
                 parent_baseline_experiment_id=record.parent_baseline_experiment_id,
             ),
-            task_outcomes=[],
+            panel_outcomes={panel_id: [] for panel_id in record.panel_order},
+        )
+
+
+class PanelEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: ExperimentStatus
+    decision_reason: str
+    verdicts: dict[str, BaselineComparison]
+
+
+class PanelRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    panel_id: str
+    purpose: PanelPurpose
+    lifecycle: PanelLifecycle
+    task_ids: list[str]
+    task_results: dict[str, TaskTrials]
+    started_at: str | None = None
+    finished_at: str | None = None
+    skip_reason: str = ""
+    evaluation: PanelEvaluation | None = None
+
+    @classmethod
+    def initialize(
+        cls,
+        *,
+        panel_id: str,
+        purpose: PanelPurpose,
+        task_ids: Sequence[str],
+        expected_trial_count: int,
+        lifecycle: PanelLifecycle,
+    ) -> "PanelRecord":
+        canonical_task_ids = sorted(task_ids)
+        return cls(
+            panel_id=panel_id,
+            purpose=purpose,
+            lifecycle=lifecycle,
+            task_ids=canonical_task_ids,
+            task_results={
+                task_id: TaskTrials.empty(
+                    task_name=task_id,
+                    expected_trial_count=expected_trial_count,
+                )
+                for task_id in canonical_task_ids
+            },
+        )
+
+    @model_validator(mode="after")
+    def task_results_match_task_ids(self) -> "PanelRecord":
+        if len(set(self.task_ids)) != len(self.task_ids) or set(self.task_ids) != set(
+            self.task_results
+        ):
+            raise ValueError("panel task_results must cover exactly task_ids")
+        return self
+
+    @property
+    def solved_count(self) -> int:
+        return sum(
+            1 for trials in self.task_results.values() if trials.majority_solved is True
         )
 
 
 class ExperimentRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal[2]
     experiment_id: str
     parent_baseline_experiment_id: str | None
     git_commit_hash: str
     focus_name: str
-    train_task_ids: list[str]
     status: ExperimentStatus | None
-    train_solved_count: int | None
     decision_reason: str
     error: str
     started_at: str
     finished_at: str | None
-    train_task_results: dict[str, TaskTrials]
+    panel_order: list[str]
+    panels: dict[str, PanelRecord]
     evidence: ExperimentEvidence | None
+
+    @model_validator(mode="after")
+    def panel_order_matches_panels(self) -> "ExperimentRecord":
+        if len(set(self.panel_order)) != len(self.panel_order) or set(
+            self.panel_order
+        ) != set(self.panels):
+            raise ValueError("panel_order must cover exactly panels")
+        for panel_id in self.panel_order:
+            if self.panels[panel_id].panel_id != panel_id:
+                raise ValueError("panel key must match panel_id")
+        return self
 
     @classmethod
     def path(cls, experiment_id: str, *, root: Path) -> Path:
@@ -274,7 +348,6 @@ class ExperimentRecord(BaseModel):
         root: Path,
     ) -> "ExperimentRecord":
         payload = json.loads(cls.path(experiment_id, root=root).read_text())
-        payload["train_task_ids"] = sorted(payload["train_task_ids"])
         return cls.model_validate(payload)
 
     @classmethod
@@ -284,31 +357,23 @@ class ExperimentRecord(BaseModel):
         experiment_id: str,
         git_commit_hash: str,
         parent_baseline_experiment_id: str | None,
-        train_task_ids: list[str],
+        panels: Sequence[PanelRecord],
         focus_name: str = "",
         started_at: str,
-        expected_trial_count: int = 1,
     ) -> "ExperimentRecord":
-        canonical_train_task_ids = sorted(train_task_ids)
         return cls(
+            schema_version=2,
             experiment_id=experiment_id,
             parent_baseline_experiment_id=parent_baseline_experiment_id,
             git_commit_hash=git_commit_hash,
             focus_name=focus_name,
-            train_task_ids=canonical_train_task_ids,
             status=None,
-            train_solved_count=0,
             decision_reason="",
             error="",
             started_at=started_at,
             finished_at=None,
-            train_task_results={
-                task_id: TaskTrials.empty(
-                    task_name=task_id,
-                    expected_trial_count=expected_trial_count,
-                )
-                for task_id in canonical_train_task_ids
-            },
+            panel_order=[panel.panel_id for panel in panels],
+            panels={panel.panel_id: panel for panel in panels},
             evidence=None,
         )
 
@@ -321,11 +386,6 @@ class ExperimentRecord(BaseModel):
     def record_task_result(self, task_result: TaskResult) -> None:
         panel_results = self._panel_results(task_result.task_name)
         panel_results[task_result.task_name].append(task_result)
-        self.train_solved_count = sum(
-            1
-            for trials in self.train_task_results.values()
-            if trials.majority_solved is True
-        )
 
     def finalize(
         self,
@@ -334,7 +394,7 @@ class ExperimentRecord(BaseModel):
         error: str | None = None,
         decision_reason: str | None = None,
     ) -> None:
-        if any(not trials.is_finished for trials in self.train_task_results.values()):
+        if any(not trials.is_finished for trials in self._all_task_results()):
             raise RuntimeError(
                 "terminal experiment records require finished task results"
             )
@@ -382,8 +442,10 @@ class ExperimentRecord(BaseModel):
         )
 
     def _panel_results(self, task_id: str) -> dict[str, TaskTrials]:
-        if task_id in self.train_task_results:
-            return self.train_task_results
+        for panel_id in self.panel_order:
+            task_results = self.panels[panel_id].task_results
+            if task_id in task_results:
+                return task_results
         raise KeyError(
             f"task {task_id!r} is not part of experiment {self.experiment_id}"
         )
@@ -391,11 +453,23 @@ class ExperimentRecord(BaseModel):
     def _task_trials(self, task_id: str) -> TaskTrials:
         return self._panel_results(task_id)[task_id]
 
+    def _all_task_results(self) -> list[TaskTrials]:
+        return [
+            trials
+            for panel_id in self.panel_order
+            for trials in self.panels[panel_id].task_results.values()
+        ]
+
     def _complete_unfinished_task_results(self, *, exc: BaseException) -> None:
-        for task_id in self.train_task_results:
-            trials = self._task_trials(task_id)
-            while not trials.is_finished:
-                self.record_task_result(terminal_task_result(task_id=task_id, exc=exc))
+        for panel_id in self.panel_order:
+            if self.panels[panel_id].lifecycle == "skipped":
+                continue
+            for task_id in self.panels[panel_id].task_results:
+                trials = self._task_trials(task_id)
+                while not trials.is_finished:
+                    self.record_task_result(
+                        terminal_task_result(task_id=task_id, exc=exc)
+                    )
 
 
 def build_experiment_evidence(
@@ -414,8 +488,25 @@ def build_experiment_evidence(
     with the populated dict so the persisted record carries verdict-driven
     labels.
     """
-    baseline_train_results = {} if baseline is None else baseline.train_task_results
     verdicts_map: Mapping[str, BaselineComparison] = verdicts or {}
+    panel_outcomes: dict[str, list[TaskOutcomeEvidence]] = {}
+    for panel_id in candidate.panel_order:
+        candidate_panel = candidate.panels[panel_id]
+        baseline_results = (
+            {}
+            if baseline is None or panel_id not in baseline.panels
+            else baseline.panels[panel_id].task_results
+        )
+        panel_outcomes[panel_id] = [
+            TaskOutcomeEvidence.from_trials(
+                task_id=task_id,
+                candidate_trials=task_trials,
+                baseline_trials=baseline_results.get(task_id),
+                verdict=verdicts_map.get(task_id),
+            )
+            for task_id, task_trials in candidate_panel.task_results.items()
+            if task_trials.expected_trial_count > 0 or task_trials.trials
+        ]
     return ExperimentEvidence(
         candidate_change=CandidateChangeEvidence(
             commit=candidate.git_commit_hash,
@@ -424,15 +515,7 @@ def build_experiment_evidence(
             if baseline is None
             else baseline.git_commit_hash,
         ),
-        task_outcomes=[
-            TaskOutcomeEvidence.from_trials(
-                task_id=task_id,
-                candidate_trials=task_trials,
-                baseline_trials=baseline_train_results.get(task_id),
-                verdict=verdicts_map.get(task_id),
-            )
-            for task_id, task_trials in candidate.train_task_results.items()
-        ],
+        panel_outcomes=panel_outcomes,
     )
 
 
@@ -462,18 +545,26 @@ class ExperimentState(BaseModel):
 
 
 def raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
-    # A run must yield at least one valid trial somewhere on the panel. An
+    # Each active panel must yield at least one valid trial. An
     # isolated per-trial `crash` (`error is not None`) is tolerated: it is
     # excluded from the gate and the pool. But a run where *every* trial
-    # crashed produced no task evidence — the gate would compare against
+    # crashed in an active panel produced no task evidence — the gate would compare against
     # nothing, and a baseline would be installed empty so that every later
     # candidate compares against an all-zero pool. That is an experiment-level
     # failure, so it crashes (and a baseline is therefore not promoted).
-    has_valid = any(
-        trials.valid_trials for trials in record.train_task_results.values()
-    )
-    if not has_valid:
-        raise RuntimeError("experiment produced no valid trials (every trial crashed)")
+    for panel_name in record.panel_order:
+        panel = record.panels[panel_name]
+        if panel.lifecycle == "skipped":
+            continue
+        panel_trials = [
+            trials
+            for trials in panel.task_results.values()
+            if trials.expected_trial_count > 0 or trials.trials
+        ]
+        if panel_trials and not any(trials.valid_trials for trials in panel_trials):
+            raise RuntimeError(
+                f"experiment produced no valid trials in {panel_name} panel (every trial crashed)"
+            )
 
 
 def terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:

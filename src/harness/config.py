@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DEFAULT_HARNESS_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harness_config.json"
 )
 ReasoningEffort = Literal["none", "low", "medium", "high"]
 ServiceTier = Literal["auto", "default", "flex"]
+PanelPurpose = Literal["promotion", "regression_veto"]
+PanelRunStatus = Literal["keep", "discard", "crash"]
 
 
 class OpenRouterProviderRouting(BaseModel):
@@ -114,9 +116,59 @@ class ChatGptCodexConfig(BaseModel):
 LlmProviderConfig = OpenRouterConfig | ChatGptCodexConfig
 
 
+class PanelRunConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    when: Literal["always"] | None = None
+    after_panel: str | None = None
+    when_status: PanelRunStatus | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_run_mode(self) -> Self:
+        is_always = self.when == "always"
+        is_gated = self.after_panel is not None or self.when_status is not None
+        if is_always == is_gated:
+            raise ValueError(
+                "panel run config must be either {'when': 'always'} or "
+                "{'after_panel': ..., 'when_status': ...}"
+            )
+        if is_gated and (self.after_panel is None or self.when_status is None):
+            raise ValueError(
+                "gated panel run config requires after_panel and when_status"
+            )
+        return self
+
+
+class PanelBaselineConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    required: bool = False
+
+
+class PanelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    purpose: PanelPurpose
+    task_names: list[str] = Field(min_length=1)
+    task_timeout_sec: float = Field(default=600.0, gt=0)
+    run: PanelRunConfig = Field(default_factory=lambda: PanelRunConfig(when="always"))
+    baseline: PanelBaselineConfig = Field(default_factory=PanelBaselineConfig)
+
+
+class ExcludedTaskGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_names: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal[2] = Field(
+        description="Strict config schema version. v1 train/test fields are not accepted."
+    )
     experiment_id: str = Field(
         min_length=1,
         description="Stable identifier written into experiment records.",
@@ -125,17 +177,13 @@ class HarnessConfig(BaseModel):
         default="",
         description="Short label for the mechanism family being studied.",
     )
-    train_task_names: list[str] = Field(
+    panels: list[PanelConfig] = Field(
         min_length=1,
-        description="Task ids used for the train panel.",
+        description="Configured task panels. Runtime policy is compiled from purpose/run fields.",
     )
-    slow_task_names: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Task ids held out of the train panel because they consistently "
-            "exhaust task_timeout_sec. Storage only: these are not run. Kept in "
-            "the same relative order as train_task_names."
-        ),
+    excluded_task_groups: dict[str, ExcludedTaskGroup] = Field(
+        default_factory=dict,
+        description="Named task groups kept out of runnable panels.",
     )
     max_steps: int = Field(
         default=50,
@@ -164,11 +212,6 @@ class HarnessConfig(BaseModel):
             "slowing real builds. No effect when >= max_trial_concurrency."
         ),
     )
-    task_timeout_sec: float = Field(
-        default=600.0,
-        gt=0,
-        description="Wall-clock timeout for the agent loop of one task episode.",
-    )
     env_setup_timeout_sec: float = Field(
         default=600.0,
         gt=0,
@@ -192,3 +235,75 @@ class HarnessConfig(BaseModel):
     llm_provider_config: LlmProviderConfig = Field(
         description="LLM provider settings used by the harness policy."
     )
+
+    @model_validator(mode="after")
+    def panel_contract_is_valid(self) -> Self:
+        panel_ids = [panel.id for panel in self.panels]
+        duplicate_ids = sorted(
+            panel_id for panel_id in set(panel_ids) if panel_ids.count(panel_id) > 1
+        )
+        if duplicate_ids:
+            raise ValueError("panel ids must be unique: " + ", ".join(duplicate_ids))
+
+        promotion_panels = [
+            panel for panel in self.panels if panel.purpose == "promotion"
+        ]
+        if len(promotion_panels) != 1:
+            raise ValueError("exactly one promotion panel is required")
+        regression_veto_panels = [
+            panel for panel in self.panels if panel.purpose == "regression_veto"
+        ]
+        if len(regression_veto_panels) > 1:
+            raise ValueError("at most one regression_veto panel is supported")
+
+        panel_index_by_id = {panel.id: index for index, panel in enumerate(self.panels)}
+        promotion_panel = promotion_panels[0]
+        promotion_index = panel_index_by_id[promotion_panel.id]
+        for panel in promotion_panels:
+            if panel.run.when != "always" or panel.baseline.required:
+                raise ValueError(
+                    "promotion panel must run always and must not require a baseline"
+                )
+        for panel in regression_veto_panels:
+            if (
+                panel.run.after_panel != promotion_panel.id
+                or panel_index_by_id[panel.id] <= promotion_index
+            ):
+                raise ValueError(
+                    "regression_veto panel must run after the promotion panel "
+                    f"({promotion_panel.id}) and appear later in configured panels"
+                )
+            if panel.run.when_status != "keep" or not panel.baseline.required:
+                raise ValueError(
+                    "regression_veto panel must require baseline and run after "
+                    "an existing panel reaches keep"
+                )
+
+        task_groups: list[tuple[str, set[str]]] = [
+            (f"panels.{panel.id}.task_names", set(panel.task_names))
+            for panel in self.panels
+        ]
+        task_groups.extend(
+            (f"excluded_task_groups.{name}.task_names", set(group.task_names))
+            for name, group in self.excluded_task_groups.items()
+        )
+        for index, (left_name, left_tasks) in enumerate(task_groups):
+            for right_name, right_tasks in task_groups[index + 1 :]:
+                overlap = sorted(left_tasks & right_tasks)
+                if overlap:
+                    raise ValueError(
+                        f"{left_name} and {right_name} must be disjoint: "
+                        + ", ".join(overlap)
+                    )
+        return self
+
+    @property
+    def promotion_panel(self) -> PanelConfig:
+        return next(panel for panel in self.panels if panel.purpose == "promotion")
+
+    @property
+    def regression_veto_panel(self) -> PanelConfig | None:
+        return next(
+            (panel for panel in self.panels if panel.purpose == "regression_veto"),
+            None,
+        )

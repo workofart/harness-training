@@ -55,14 +55,23 @@ def _require_clean_worktree_for_exp() -> bool:
     }
 
 
+def _panel_task_summary(harness_config: HarnessConfig) -> str:
+    summaries = []
+    for panel in harness_config.panels:
+        task_label = "task" if len(panel.task_names) == 1 else "tasks"
+        summaries.append(
+            f"{panel.id}({panel.purpose}): {len(panel.task_names)} {task_label}"
+        )
+    return "; ".join(summaries)
+
+
 def main_exp() -> int:
     from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH
     from src.experiment.runner import ExperimentRunner
 
     harbor_config, harness_config, api_key = load_runtime_config()
-    task_names = list(harness_config.train_task_names)
     print(f"experiment: {harness_config.experiment_id}")
-    print(f"tasks: {', '.join(task_names)}")
+    print(f"panels: {_panel_task_summary(harness_config)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
     print(f"harness config: {DEFAULT_HARNESS_CONFIG_PATH}")
     record = ExperimentRunner(
