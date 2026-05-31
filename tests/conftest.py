@@ -1,0 +1,89 @@
+"""Shared test scaffolding.
+
+pytest puts this file's directory (``tests/``) on ``sys.path``, so test modules
+import these helpers with ``from conftest import _StubLlm, ...``. Keep only
+genuinely cross-cutting fakes here -- stubs used by a single test module belong
+next to that module.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from src.adapters.llm_base import BaseLlm, LlmCompletion, LlmToolCall
+from src.harness.contracts import RawState
+
+
+class _StubLlm(BaseLlm):
+    """Returns a pre-set sequence of LlmCompletions; records every call."""
+
+    def __init__(self, completions: list[LlmCompletion]) -> None:
+        self._completions = list(completions)
+        self.calls: list[list[dict[str, Any]]] = []
+        self.closed = False
+
+    async def complete(self, *, messages, tools=None, reasoning_effort=None):
+        del tools, reasoning_effort
+        self.calls.append([dict(m) for m in messages])
+        return self._completions.pop(0)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _StubEnv:
+    """Minimal HarnessEnv stub: returns canned states, records calls."""
+
+    def __init__(
+        self,
+        *,
+        reset_state: RawState | None = None,
+        exec_states: list[RawState] | None = None,
+        verify_state: RawState | None = None,
+        trial_dir: str = "/tmp/trial",
+        verifier_stdout_path: str | None = None,
+    ) -> None:
+        self._reset_state = reset_state or RawState(
+            instruction="do the thing", working_dir="/work"
+        )
+        self._exec_states = list(exec_states or [])
+        self._verify_state = verify_state or RawState(
+            done=True, passed=True, reward=1.0
+        )
+        self.trial_dir: str | None = trial_dir
+        self.verifier_stdout_path: str | None = verifier_stdout_path
+        self.exec_calls: list[dict[str, Any]] = []
+        self.verify_calls = 0
+        self.closed = False
+
+    async def reset(self) -> RawState:
+        return self._reset_state
+
+    async def exec(self, *, command, cwd=None, timeout_sec=None, workload="heavy"):
+        self.exec_calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "timeout_sec": timeout_sec,
+                "workload": workload,
+            }
+        )
+        if self._exec_states:
+            return self._exec_states.pop(0)
+        return RawState(return_code=0)
+
+    async def verify(self) -> RawState:
+        self.verify_calls += 1
+        return self._verify_state
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _tool_call(name: str, **args: Any) -> LlmToolCall:
+    return LlmToolCall(name=name, arguments=json.dumps(args))
+
+
+def _completion(*calls: LlmToolCall, content: str | None = None) -> LlmCompletion:
+    return LlmCompletion(tool_calls=tuple(calls), content=content)
