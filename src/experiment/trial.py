@@ -155,7 +155,6 @@ async def run_task(
         )
         async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
             outcome = await run_task_loop(
-                task_name=task_name,
                 llm=llm,
                 env=env,
                 reset_state=reset_state,

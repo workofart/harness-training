@@ -508,7 +508,6 @@ def test_run_task_loop_solved_when_verify_returns_passed_true():
     env = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
     result = asyncio.run(
         run_task_loop(
-            task_name="t",
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
@@ -526,7 +525,6 @@ def test_run_task_loop_unsolved_when_verify_returns_passed_false():
     env = _StubEnv(verify_state=RawState(done=True, passed=False, reward=0.0))
     result = asyncio.run(
         run_task_loop(
-            task_name="t",
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
@@ -543,7 +541,6 @@ def test_run_task_loop_unsolved_when_max_steps_reached_without_verify():
     env = _StubEnv()
     result = asyncio.run(
         run_task_loop(
-            task_name="t",
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
@@ -569,7 +566,6 @@ def test_run_task_loop_stops_batch_when_action_returns_done_true():
     env = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
     result = asyncio.run(
         run_task_loop(
-            task_name="t",
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
