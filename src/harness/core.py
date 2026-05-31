@@ -35,7 +35,7 @@ from dataclasses import MISSING, asdict, dataclass, fields
 from typing import Any, ClassVar, Literal, TypeAlias
 
 from src.adapters.llm_base import BaseLlm
-from src.harness.contracts import HarnessEnv, RawState
+from src.harness.contracts import EnvExecWorkload, HarnessEnv, RawState
 from src.trace import NOOP_HARNESS_RECORDER, NOOP_STEP_RECORDER
 
 
@@ -49,6 +49,7 @@ MISSING_TOOL_CALL_REPAIR_PROMPT = (
 )
 DEFAULT_READ_WINDOW_LINES = 200
 DEFAULT_RESULT_CHAR_LIMIT = 6000
+SHORT_RUN_LIGHT_TIMEOUT_SEC = 30
 
 
 # ============================================================================
@@ -359,7 +360,12 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
                 workload="light",
             )
         case RunAction(command=command, cwd=cwd, timeout_sec=timeout_sec):
-            return await env.exec(command=command, cwd=cwd, timeout_sec=timeout_sec)
+            return await env.exec(
+                command=command,
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+                workload=_run_workload(timeout_sec),
+            )
         case VerifyAction():
             return await env.verify()
     raise TypeError(f"Unsupported action: {type(action).__name__}")
@@ -557,6 +563,12 @@ def _validate_action_name(value: str) -> ActionName:
     return value  # type: ignore[return-value]
 
 
+def _run_workload(timeout_sec: int | None) -> EnvExecWorkload:
+    if timeout_sec is not None and timeout_sec <= SHORT_RUN_LIGHT_TIMEOUT_SEC:
+        return "light"
+    return "heavy"
+
+
 async def run_task_loop(
     *,
     llm: BaseLlm,
@@ -581,6 +593,36 @@ async def run_task_loop(
         progress.reward = reward
         progress.steps_used = steps_used
         progress.final_passed = final_passed
+
+    async def run_loop_action(action: Action) -> RawState:
+        nonlocal done, final_passed, reward, steps_used, trajectory
+
+        step_index = steps_used + 1
+        step_recorder = recorder.for_step(step_index)
+        action_summary = summarize_action(action)
+        step_recorder.action_chosen(
+            action_name=action.NAME,
+            action_summary=action_summary,
+        )
+        raw_state = await execute_action(env, action)
+        step_recorder.env_step_completed(
+            action_name=action.NAME,
+            action_summary=action_summary,
+            raw_state=raw_state,
+        )
+        trajectory = (*trajectory, (action, raw_state))
+        steps_used += 1
+        done = raw_state.done
+        if raw_state.reward is not None:
+            reward = raw_state.reward
+        if raw_state.done and raw_state.passed is not None:
+            final_passed = raw_state.passed
+        if progress is not None:
+            progress.reward = reward
+            progress.steps_used = steps_used
+            progress.final_passed = final_passed
+        return raw_state
+
     while steps_used < max_steps and not done:
         step_index = steps_used + 1
         step_recorder = recorder.for_step(step_index)
@@ -595,30 +637,7 @@ async def run_task_loop(
         for action in actions:
             if done or steps_used >= max_steps:
                 break
-            step_index = steps_used + 1
-            step_recorder = recorder.for_step(step_index)
-            action_summary = summarize_action(action)
-            step_recorder.action_chosen(
-                action_name=action.NAME,
-                action_summary=action_summary,
-            )
-            raw_state = await execute_action(env, action)
-            step_recorder.env_step_completed(
-                action_name=action.NAME,
-                action_summary=action_summary,
-                raw_state=raw_state,
-            )
-            trajectory = (*trajectory, (action, raw_state))
-            steps_used += 1
-            done = raw_state.done
-            if raw_state.reward is not None:
-                reward = raw_state.reward
-            if raw_state.done and raw_state.passed is not None:
-                final_passed = raw_state.passed
-            if progress is not None:
-                progress.reward = reward
-                progress.steps_used = steps_used
-                progress.final_passed = final_passed
+            await run_loop_action(action)
     solved = final_passed is True
     return TaskLoopResult(
         reward=reward,

@@ -234,7 +234,9 @@ async def _run_panel(
     make_env: Callable[..., Any],
 ) -> None:
     semaphore = asyncio.Semaphore(harness_config.max_trial_concurrency)
-    env_semaphore = asyncio.Semaphore(harness_config.max_env_concurrency)
+    heavy_action_semaphore = asyncio.Semaphore(
+        harness_config.max_heavy_action_concurrency
+    )
     reporter = PanelProgressReporter(
         total_tasks=len(task_names),
         max_trial_concurrency=harness_config.max_trial_concurrency,
@@ -262,7 +264,9 @@ async def _run_panel(
 
         try:
             task_dir = task_dirs[task_id]
-            env = make_env(task_id, task_dir=task_dir, exec_semaphore=env_semaphore)
+            env = make_env(
+                task_id, task_dir=task_dir, exec_semaphore=heavy_action_semaphore
+            )
             try:
                 trial_result = await run_task(
                     task_name=task_id,
@@ -287,19 +291,24 @@ async def _run_panel(
 
     async def run_task_trials(task_id: str) -> None:
         full_trial_count = harness_config.task_trials
+        admit_all_confirmations = False
         while not record._task_trials(task_id).is_finished:
             trials = record._task_trials(task_id)
             remaining_budget = trials.expected_trial_count - len(trials.finished_trials)
             if remaining_budget <= 0:
                 break
-            admission_count = min(
-                remaining_budget,
-                _next_trial_admission_count(
-                    solved=trials.solved_count,
-                    finished=len(trials.valid_trials),
-                    expected_total=trials.expected_trial_count,
-                ),
-            )
+            if admit_all_confirmations:
+                admission_count = remaining_budget
+                admit_all_confirmations = False
+            else:
+                admission_count = min(
+                    remaining_budget,
+                    _next_trial_admission_count(
+                        solved=trials.solved_count,
+                        finished=len(trials.valid_trials),
+                        expected_total=trials.expected_trial_count,
+                    ),
+                )
             if admission_count <= 0:
                 break
             in_flight: set[asyncio.Task[None]] = {
@@ -321,6 +330,7 @@ async def _run_panel(
                         and len(trials.valid_trials) == 1
                     ):
                         trials.expected_trial_count = full_trial_count
+                        admit_all_confirmations = True
                         record.write(root=experiments_root)
                         break
                     decided = is_majority_decided(

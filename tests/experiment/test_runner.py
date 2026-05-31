@@ -36,7 +36,7 @@ class FakeHarnessConfig:
     train_task_names: list[str]
     max_steps: int = 30
     max_trial_concurrency: int = 1
-    max_env_concurrency: int = 10
+    max_heavy_action_concurrency: int = 10
     task_timeout_sec: float = 600.0
     env_setup_timeout_sec: float = 600.0
     max_output_retries: int = 2
@@ -671,6 +671,68 @@ def test_run_experiment_confirms_on_fail_when_deterministic_trial_fails(
     assert trials.expected_trial_count == 2
     assert trials.trial_count == 2
     assert trials.majority_solved is False
+
+
+def test_run_experiment_launches_deterministic_confirmations_in_one_wave(
+    monkeypatch, tmp_path
+):
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-confirm-wave",
+        focus_name="focus",
+        train_task_names=["train-det"],
+        task_trials=5,
+        max_trial_concurrency=5,
+        task_dirs=["train-det"],
+    )
+    stub_trial_factories(monkeypatch, experiment_runner)
+
+    baseline = ExperimentRecord.initialize(
+        experiment_id="baseline",
+        git_commit_hash="bca",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-det"],
+        started_at="2026-04-10T00:00:00+00:00",
+        expected_trial_count=3,
+    )
+    for _ in range(3):
+        baseline.record_task_result(_task_result(task_name="train-det", reward=1.0))
+
+    started = 0
+    release_confirmations = asyncio.Event()
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        nonlocal started
+        started += 1
+        trial_index = started
+        if trial_index == 1:
+            await asyncio.sleep(0)
+            return _panel_trial_result(task_name, solved=False, index=trial_index)
+        await release_confirmations.wait()
+        return _panel_trial_result(task_name, solved=True, index=trial_index)
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+    monkeypatch.setattr(experiment_runner, "_conclude_experiment", lambda: None)
+
+    async def go():
+        panel_task = asyncio.create_task(
+            experiment_runner._run_experiment(baseline=baseline)
+        )
+
+        async def wait_for_started(count):
+            while started < count:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_started(5), timeout=1)
+        release_confirmations.set()
+        await panel_task
+
+    asyncio.run(go())
+
+    trials = experiment_runner.record._task_trials("train-det")
+    assert started == 5
+    assert trials.majority_solved is True
 
 
 def test_apply_baseline_derived_trial_counts_skips_non_deterministic(

@@ -275,13 +275,26 @@ def test_execute_action_edit_file_uses_python_script():
 def test_execute_action_run_passes_through_command_cwd_timeout():
     env = _StubEnv()
     asyncio.run(
-        execute_action(env, RunAction(command="pytest", cwd="/repo", timeout_sec=30))
+        execute_action(env, RunAction(command="pytest", cwd="/repo", timeout_sec=31))
     )
     assert env.exec_calls[0] == {
         "command": "pytest",
         "cwd": "/repo",
-        "timeout_sec": 30,
+        "timeout_sec": 31,
         "workload": "heavy",
+    }
+
+
+def test_execute_action_short_timeout_run_uses_light_workload():
+    env = _StubEnv()
+    asyncio.run(
+        execute_action(env, RunAction(command="python probe.py", timeout_sec=30))
+    )
+    assert env.exec_calls[0] == {
+        "command": "python probe.py",
+        "cwd": None,
+        "timeout_sec": 30,
+        "workload": "light",
     }
 
 

@@ -43,7 +43,7 @@ def test_default_harness_config_matches_baseline_run_profile():
     assert "vulnerable-secret" in config.slow_task_names
     assert "model-extraction-relu-logits" in config.slow_task_names
     assert config.max_trial_concurrency == 35
-    assert config.max_env_concurrency == 6
+    assert config.max_heavy_action_concurrency == 6
     assert config.task_timeout_sec == 1200.0
     assert config.env_setup_timeout_sec == 600.0
     assert config.task_trials == 5
