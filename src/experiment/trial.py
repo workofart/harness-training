@@ -124,21 +124,7 @@ async def run_task(
     final_passed: bool | None = None
     progress = TaskLoopProgress()
 
-    async def execute_trial() -> TaskResult:
-        nonlocal error
-        nonlocal final_passed
-        nonlocal finished_at
-        nonlocal metrics_path
-        nonlocal recorder
-        nonlocal reset_completed
-        nonlocal reward
-        nonlocal solved
-        nonlocal steps_used
-        nonlocal setup_timeout_ctx
-        nonlocal agent_timeout_ctx
-        nonlocal trial_dir
-        nonlocal verifier_stdout_path
-
+    try:
         # Environment setup (docker start + bootstrap) is budgeted separately
         # from the agent loop so a slow/hung bootstrap fails fast as a crash
         # without consuming the agent's step budget or being misreported as a
@@ -169,7 +155,6 @@ async def run_task(
         )
         async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
             outcome = await run_task_loop(
-                task_name=task_name,
                 llm=llm,
                 env=env,
                 reset_state=reset_state,
@@ -218,51 +203,11 @@ async def run_task(
             started_at=started_at,
             finished_at=finished_at,
         )
-
-    try:
-        return await execute_trial()
-    except TimeoutError as exc:
-        reward = progress.reward
-        steps_used = progress.steps_used
-        final_passed = progress.final_passed
-        trial_dir, verifier_stdout_path = _recover_artifact_paths(
-            env,
-            trial_dir=trial_dir,
-            verifier_stdout_path=verifier_stdout_path,
-        )
-        if trial_dir is None:
-            raise RuntimeError("environment must expose trial_dir before reset failure")
-        if trace_path is None:
-            trace_path, metrics_path = trace_module.task_artifact_paths(trial_dir)
-        if recorder.trace is None:
-            recorder = _recorder_for_paths(
-                trace_path=trace_path, metrics_path=metrics_path
-            )
-        # Each stage has its own timeout context; whichever expired tells us
-        # which stage timed out. The agent context only exists once reset has
-        # completed, so its expiry unambiguously means the agent loop ran out of
-        # time (hit_timeout); a setup-context expiry means reset/bootstrap did.
-        agent_expired = agent_timeout_ctx is not None and agent_timeout_ctx.expired()
-        setup_expired = setup_timeout_ctx is not None and setup_timeout_ctx.expired()
-        if agent_expired:
-            error = None
-            failure_mode = "hit_timeout"
-            detail = f"task timed out after {task_timeout_sec} seconds"
-        elif setup_expired:
-            error = (
-                "environment reset/bootstrap timed out after "
-                f"{env_setup_timeout_sec} seconds"
-            )
-            failure_mode = "crash"
-            detail = error
-        else:
-            error = str(exc) or type(exc).__name__
-            failure_mode = "crash"
-            detail = error
-        finished_at = datetime.now(timezone.utc).isoformat()
-        recorder.task_failed(exc=exc, detail=detail)
-        steps_used = _recorded_steps_used(recorder, fallback=steps_used)
     except Exception as exc:
+        # Timeout and crash exits recover the same partial state, then classify.
+        # asyncio.timeout cancels run_task_loop mid-flight so its TaskLoopResult
+        # never returns -- `progress` is the only carrier of the last observed
+        # reward/steps; `_recover_artifact_paths` re-reads the env's dirs.
         reward = progress.reward
         steps_used = progress.steps_used
         final_passed = progress.final_passed
@@ -283,20 +228,52 @@ async def run_task(
             recorder = _recorder_for_paths(
                 trace_path=trace_path, metrics_path=metrics_path
             )
-        error = str(exc) or type(exc).__name__
-        # A model that never emits a parseable action is an agent failure, not a
-        # broken environment: label it distinctly. `error` stays set, so it is
-        # still excluded from the gate's valid trials (an empty/refused response
-        # is not a fair measure of capability) -- just not lumped under `crash`.
-        failure_mode = (
-            "no_valid_action" if isinstance(exc, NoValidActionError) else "crash"
-        )
+        # Classification stays explicit: the four exits carry different result
+        # semantics (error set-or-None, failure_mode, detail).
+        if isinstance(exc, TimeoutError):
+            # Each stage has its own timeout context; whichever expired tells us
+            # which stage timed out. The agent context only exists once reset has
+            # completed, so its expiry unambiguously means the agent loop ran out
+            # of time (hit_timeout); a setup-context expiry means reset/bootstrap.
+            agent_expired = (
+                agent_timeout_ctx is not None and agent_timeout_ctx.expired()
+            )
+            setup_expired = (
+                setup_timeout_ctx is not None and setup_timeout_ctx.expired()
+            )
+            if agent_expired:
+                error = None
+                failure_mode = "hit_timeout"
+                detail = f"task timed out after {task_timeout_sec} seconds"
+            elif setup_expired:
+                error = (
+                    "environment reset/bootstrap timed out after "
+                    f"{env_setup_timeout_sec} seconds"
+                )
+                failure_mode = "crash"
+                detail = error
+            else:
+                error = str(exc) or type(exc).__name__
+                failure_mode = "crash"
+                detail = error
+        elif isinstance(exc, NoValidActionError):
+            # A model that never emits a parseable action is an agent failure,
+            # not a broken environment: label it distinctly. `error` stays set,
+            # so it is still excluded from the gate's valid trials (an empty or
+            # refused response is not a fair measure of capability).
+            error = str(exc) or type(exc).__name__
+            failure_mode = "no_valid_action"
+            detail = error
+        else:
+            error = str(exc) or type(exc).__name__
+            failure_mode = "crash"
+            detail = error
         finished_at = datetime.now(timezone.utc).isoformat()
-        recorder.task_failed(exc=exc, detail=error)
+        recorder.task_failed(exc=exc, detail=detail)
         steps_used = _recorded_steps_used(recorder, fallback=steps_used)
     finally:
         # The trial's result is already finalized at this point (happy path
-        # returned it; error paths captured state into the nonlocals the bottom
+        # returned it; error paths captured state into the locals the bottom
         # return packages). Free the concurrency slot *before* the docker
         # teardown so the next trial's `compose up` overlaps this trial's
         # `compose down` — teardown still runs here, in this same task.

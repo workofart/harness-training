@@ -19,6 +19,8 @@ from src.experiment.record import (
 from src.harness.contracts import TaskResult
 from src.metrics import TaskMetrics
 
+from conftest import _task_result
+
 
 @dataclass
 class FakeHarnessConfig:
@@ -43,28 +45,6 @@ class FakeHarnessConfig:
     llm_provider_config: object | None = None
 
 
-def _task_result(
-    *,
-    task_name: str,
-    reward: float | None,
-    solved: bool | None = None,
-    error: str | None = None,
-) -> TaskResult:
-    if solved is None:
-        solved = error is None and reward is not None and reward > 0.0
-    return TaskResult(
-        task_name=task_name,
-        reward=reward,
-        steps_used=1,
-        error=error,
-        trial_dir=None,
-        verifier_stdout_path=None,
-        started_at="2026-04-10T00:00:00+00:00",
-        finished_at="2026-04-10T00:00:01+00:00",
-        solved=solved,
-    )
-
-
 def _set_task_dirs(experiment_runner, root: Path, *task_names: str) -> None:
     experiment_runner._task_dirs = {
         task_name: root / "tasks" / task_name for task_name in task_names
@@ -84,6 +64,73 @@ def _run_panel_for_experiment_runner(
             make_llm=experiment_runner._make_llm,
             make_env=experiment_runner._make_env,
         )
+    )
+
+
+def make_runner(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    task_dirs: list[str] | None = None,
+    harbor_config: object | None = None,
+    **config_kwargs,
+) -> runner.ExperimentRunner:
+    """Construct an ExperimentRunner wired for unit tests.
+
+    Patches the clean-worktree / head-commit git probes, builds the runner
+    against a duck-typed FakeHarnessConfig (``config_kwargs`` flow straight
+    through) and a minimal harbor_config, and optionally pre-resolves task
+    directories under ``tmp_path/tasks``. Tests that drive trials follow up
+    with ``stub_trial_factories``.
+    """
+    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
+    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
+    experiment_runner = runner.ExperimentRunner(
+        harness_config=FakeHarnessConfig(**config_kwargs),
+        harbor_config=harbor_config
+        if harbor_config is not None
+        else SimpleNamespace(experiments_dir=tmp_path / "experiments"),
+        api_key="key",
+    )
+    if task_dirs is not None:
+        _set_task_dirs(experiment_runner, tmp_path, *task_dirs)
+    return experiment_runner
+
+
+def stub_trial_factories(monkeypatch, experiment_runner) -> None:
+    """Replace the per-trial llm/env factories with no-op ``object()`` stubs so
+    a test can monkeypatch ``runner.run_task`` directly."""
+    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
+    monkeypatch.setattr(
+        experiment_runner,
+        "_make_env",
+        lambda task_name, *, task_dir, exec_semaphore=None: object(),
+        raising=False,
+    )
+
+
+def _panel_trial_result(
+    task_name: str,
+    *,
+    solved: bool,
+    index: int,
+    failure_mode: str | None = None,
+) -> TaskResult:
+    """A finished TaskResult with the boilerplate fields the panel tests share;
+    only ``solved`` (and optional ``failure_mode``) carry behavior."""
+    return TaskResult(
+        task_name=task_name,
+        reward=1.0 if solved else 0.0,
+        solved=solved,
+        error=None,
+        steps_used=1,
+        trial_dir=f"/tmp/{task_name}/{index}",
+        trace_path=None,
+        metrics_path=None,
+        verifier_stdout_path=None,
+        metrics=TaskMetrics(failure_mode=failure_mode),
+        started_at="2026-05-05T00:00:00+00:00",
+        finished_at="2026-05-05T00:00:01+00:00",
     )
 
 
@@ -231,26 +278,17 @@ def test_next_trial_admission_count(solved, finished, expected_total, admission_
 def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
     monkeypatch, tmp_path
 ):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-trials",
-            focus_name="focus",
-            train_task_names=["task-a", "task-b"],
-            task_trials=3,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-trials",
+        focus_name="focus",
+        train_task_names=["task-a", "task-b"],
+        task_trials=3,
+        max_trial_concurrency=1,
+        task_dirs=["task-a", "task-b"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     call_log: list[str] = []
 
@@ -259,30 +297,9 @@ def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
         # gets a chance to observe each completion and cancel siblings.
         await asyncio.sleep(0)
         call_log.append(task_name)
-        return TaskResult(
-            task_name=task_name,
-            reward=1.0,
-            solved=True,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{len(call_log)}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-05T00:00:00+00:00",
-            finished_at="2026-05-05T00:00:01+00:00",
-        )
+        return _panel_trial_result(task_name, solved=True, index=len(call_log))
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a", "task-b")
 
     _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a", "task-b"])
 
@@ -302,26 +319,17 @@ def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
 def test_run_panel_admits_only_majority_threshold_trials_initially(
     monkeypatch, tmp_path
 ):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-adaptive-admission",
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=5,
-            max_trial_concurrency=5,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-adaptive-admission",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=5,
+        max_trial_concurrency=5,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     started = 0
     release = asyncio.Event()
@@ -331,30 +339,9 @@ def test_run_panel_admits_only_majority_threshold_trials_initially(
         started += 1
         trial_index = started
         await release.wait()
-        return TaskResult(
-            task_name=task_name,
-            reward=1.0,
-            solved=True,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{trial_index}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-05T00:00:00+00:00",
-            finished_at="2026-05-05T00:00:01+00:00",
-        )
+        return _panel_trial_result(task_name, solved=True, index=trial_index)
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     async def go():
         panel_task = asyncio.create_task(
@@ -389,26 +376,17 @@ def test_run_panel_admits_only_majority_threshold_trials_initially(
 
 
 def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-run-task-contract",
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=1,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-run-task-contract",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=1,
+        max_trial_concurrency=1,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     call_log: list[str] = []
 
@@ -435,30 +413,9 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
             slot_release,
         )
         call_log.append(task_name)
-        return TaskResult(
-            task_name=task_name,
-            reward=1.0,
-            solved=True,
-            error=None,
-            steps_used=1,
-            trial_dir=None,
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-05T00:00:00+00:00",
-            finished_at="2026-05-05T00:00:01+00:00",
-        )
+        return _panel_trial_result(task_name, solved=True, index=len(call_log))
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
 
@@ -469,27 +426,18 @@ def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
 
 
 def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_path):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-run-task-timeout",
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=1,
-            max_trial_concurrency=1,
-            task_timeout_sec=0.01,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-run-task-timeout",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=1,
+        max_trial_concurrency=1,
+        task_timeout_sec=0.01,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     seen_timeouts: list[float | None] = []
 
@@ -507,26 +455,11 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
     ):
         del llm, env, max_steps, max_output_retries, trace_path, slot_release
         seen_timeouts.append(task_timeout_sec)
-        return TaskResult(
-            task_name=task_name,
-            reward=0.0,
-            solved=False,
-            error=None,
-            steps_used=1,
-            metrics=TaskMetrics(failure_mode="hit_timeout"),
-            started_at="2026-05-05T00:00:00+00:00",
-            finished_at="2026-05-05T00:00:01+00:00",
+        return _panel_trial_result(
+            task_name, solved=False, index=1, failure_mode="hit_timeout"
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
 
@@ -537,156 +470,68 @@ def test_run_panel_passes_task_timeout_sec_to_trial_boundary(monkeypatch, tmp_pa
     assert trials.trials[0].metrics.failure_mode == "hit_timeout"
 
 
-def test_run_panel_runs_all_trials_when_first_two_split(monkeypatch, tmp_path):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-split",
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=3,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+@pytest.mark.parametrize(
+    ("solved_by_trial", "expected_calls", "expected_trials", "expected_majority"),
+    [
+        # First two trials split (pass, fail) -> undecided -> trial 3 runs.
+        pytest.param([True, False, True], 3, 3, True, id="split-runs-all"),
+        # First two trials fail -> decided False -> trial 3 cancelled.
+        pytest.param([False, False, False], 2, 2, False, id="two-fail-early-stop"),
+    ],
+)
+def test_run_panel_majority_decides_when_to_stop(
+    monkeypatch,
+    tmp_path,
+    solved_by_trial,
+    expected_calls,
+    expected_trials,
+    expected_majority,
+):
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-majority-stop",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=3,
+        max_trial_concurrency=1,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     call_log: list[str] = []
 
     async def fake_run_task(*, task_name, **_kwargs):
-        call_log.append(task_name)
-        solved = len(call_log) != 2  # trial 1 pass, trial 2 fail, trial 3 pass
-        return TaskResult(
-            task_name=task_name,
-            reward=1.0 if solved else 0.0,
-            solved=solved,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{len(call_log)}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-05T00:00:00+00:00",
-            finished_at="2026-05-05T00:00:01+00:00",
-        )
-
-    monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
-
-    _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
-
-    # First two trials split (1 pass, 1 fail) → majority undecided → trial 3
-    # must run. expected_trial_count stays at 3.
-    assert call_log == ["task-a", "task-a", "task-a"]
-    trials = experiment_runner.record._task_trials("task-a")
-    assert trials.trial_count == 3
-    assert trials.expected_trial_count == 3
-    assert trials.is_finished is True
-    assert trials.majority_solved is True
-
-
-def test_run_panel_early_stops_when_two_trials_fail(monkeypatch, tmp_path):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-fail",
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=3,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
-    )
-
-    call_log: list[str] = []
-
-    async def fake_run_task(*, task_name, **_kwargs):
-        # Yield to the event loop so the majority watcher in run_task_trials
-        # gets a chance to observe each completion and cancel siblings.
+        # Yield so the majority watcher can observe each completion and cancel
+        # the remaining trial once the outcome is decided.
         await asyncio.sleep(0)
         call_log.append(task_name)
-        return TaskResult(
-            task_name=task_name,
-            reward=0.0,
-            solved=False,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{len(call_log)}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-05T00:00:00+00:00",
-            finished_at="2026-05-05T00:00:01+00:00",
+        return _panel_trial_result(
+            task_name, solved=solved_by_trial[len(call_log) - 1], index=len(call_log)
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
 
-    # Trials 1+2 fail → majority decided False; trial 3 must be cancelled
-    # before it records a result.
-    assert call_log == ["task-a", "task-a"]
+    assert call_log == ["task-a"] * expected_calls
     trials = experiment_runner.record._task_trials("task-a")
-    assert trials.trial_count == 2
-    assert trials.expected_trial_count == 2
+    assert trials.trial_count == expected_trials
+    assert trials.expected_trial_count == expected_trials
     assert trials.is_finished is True
-    assert trials.majority_solved is False
+    assert trials.majority_solved is expected_majority
 
 
 def test_run_panel_requires_resolved_task_dir(monkeypatch, tmp_path):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-missing-task-dir",
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=1,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    # No task_dirs are pre-resolved, so the panel must raise on the lookup.
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-missing-task-dir",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=1,
+        max_trial_concurrency=1,
     )
     monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
 
@@ -697,26 +542,17 @@ def test_run_panel_requires_resolved_task_dir(monkeypatch, tmp_path):
 def test_run_experiment_runs_single_trial_for_deterministic_baseline_task(
     monkeypatch, tmp_path
 ):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-det",
-            focus_name="focus",
-            train_task_names=["train-det", "train-noise"],
-            task_trials=3,
-            max_trial_concurrency=2,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-det",
+        focus_name="focus",
+        train_task_names=["train-det", "train-noise"],
+        task_trials=3,
+        max_trial_concurrency=2,
+        task_dirs=["train-det", "train-noise"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     baseline = ExperimentRecord.initialize(
         experiment_id="baseline",
@@ -753,30 +589,9 @@ def test_run_experiment_runs_single_trial_for_deterministic_baseline_task(
 
         # All trials pass for both tasks; we want to see deterministic stop
         # at 1 and non-deterministic stop at 2 (via #3 early-stop).
-        return TaskResult(
-            task_name=task_name,
-            reward=1.0,
-            solved=True,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{len(call_log)}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-15T00:00:00+00:00",
-            finished_at="2026-05-15T00:00:01+00:00",
-        )
+        return _panel_trial_result(task_name, solved=True, index=len(call_log))
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "train-det", "train-noise")
     monkeypatch.setattr(experiment_runner, "_conclude_experiment", lambda: None)
 
     asyncio.run(
@@ -801,26 +616,17 @@ def test_run_experiment_runs_single_trial_for_deterministic_baseline_task(
 def test_run_experiment_confirms_on_fail_when_deterministic_trial_fails(
     monkeypatch, tmp_path
 ):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-confirm",
-            focus_name="focus",
-            train_task_names=["train-det"],
-            task_trials=3,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-confirm",
+        focus_name="focus",
+        train_task_names=["train-det"],
+        task_trials=3,
+        max_trial_concurrency=1,
+        task_dirs=["train-det"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     baseline = ExperimentRecord.initialize(
         experiment_id="baseline",
@@ -849,30 +655,9 @@ def test_run_experiment_confirms_on_fail_when_deterministic_trial_fails(
         # All trials fail to simulate a real regression. Trial 1 fails →
         # confirm-on-fail expands to k=3; trial 2 fails → majority decided
         # False after 2 trials (via #3 early-stop).
-        return TaskResult(
-            task_name=task_name,
-            reward=0.0,
-            solved=False,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{len(call_log)}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-15T00:00:00+00:00",
-            finished_at="2026-05-15T00:00:01+00:00",
-        )
+        return _panel_trial_result(task_name, solved=False, index=len(call_log))
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "train-det")
     monkeypatch.setattr(experiment_runner, "_conclude_experiment", lambda: None)
 
     asyncio.run(
@@ -891,25 +676,14 @@ def test_run_experiment_confirms_on_fail_when_deterministic_trial_fails(
 def test_apply_baseline_derived_trial_counts_skips_non_deterministic(
     monkeypatch, tmp_path
 ):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-mixed",
-            focus_name="focus",
-            train_task_names=["task-a", "task-b", "task-c"],
-            task_trials=3,
-            max_trial_concurrency=2,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-mixed",
+        focus_name="focus",
+        train_task_names=["task-a", "task-b", "task-c"],
+        task_trials=3,
+        max_trial_concurrency=2,
     )
 
     baseline = ExperimentRecord.initialize(
@@ -940,26 +714,17 @@ def test_apply_baseline_derived_trial_counts_skips_non_deterministic(
 
 
 def test_run_experiment_runs_train_when_baseline_absent(monkeypatch, tmp_path):
-    harness_config_cls = FakeHarnessConfig
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id="exp-no-baseline",
-            focus_name="focus",
-            train_task_names=["train-a"],
-            task_trials=3,
-            max_trial_concurrency=2,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-no-baseline",
+        focus_name="focus",
+        train_task_names=["train-a"],
+        task_trials=3,
+        max_trial_concurrency=2,
+        task_dirs=["train-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     call_log: list[str] = []
     counter = 0
@@ -972,30 +737,9 @@ def test_run_experiment_runs_train_when_baseline_absent(monkeypatch, tmp_path):
         counter += 1
         await asyncio.sleep(counter * 0.001)
         call_log.append(task_name)
-        return TaskResult(
-            task_name=task_name,
-            reward=1.0,
-            solved=True,
-            error=None,
-            steps_used=1,
-            trial_dir=f"/tmp/{task_name}/{len(call_log)}",
-            trace_path=None,
-            metrics_path=None,
-            verifier_stdout_path=None,
-            metrics=TaskMetrics(),
-            started_at="2026-05-15T00:00:00+00:00",
-            finished_at="2026-05-15T00:00:01+00:00",
-        )
+        return _panel_trial_result(task_name, solved=True, index=len(call_log))
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "train-a")
     monkeypatch.setattr(experiment_runner, "_conclude_experiment", lambda: None)
 
     asyncio.run(
@@ -1430,32 +1174,23 @@ def test_run_experiment_finalizes_crash_when_no_valid_evidence(
     nothing for the gate to compare. (An isolated crash alongside valid trials
     is instead excluded and tolerated; see the mixed-evidence test.)"""
 
-    harness_config_cls = FakeHarnessConfig
-    experiment_id = "exp-crash-on-trial-error"
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
     monkeypatch.setattr(
         runner.control_repo,
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
 
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id=experiment_id,
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=1,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-crash-on-trial-error",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=1,
+        max_trial_concurrency=1,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
 
     async def fake_run_task(*, task_name, **_kwargs):
@@ -1475,14 +1210,6 @@ def test_run_experiment_finalizes_crash_when_no_valid_evidence(
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     asyncio.run(experiment_runner._run_experiment(baseline=None))
 
@@ -1499,32 +1226,23 @@ def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
     Here trial 1 crashes and trials 2-3 solve, so the frontier task
     majority-solves on 2 valid trials and the run is kept."""
 
-    harness_config_cls = FakeHarnessConfig
-    experiment_id = "exp-mixed-evidence"
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
     monkeypatch.setattr(
         runner.control_repo,
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
 
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id=experiment_id,
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=3,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-mixed-evidence",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=3,
+        max_trial_concurrency=1,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
 
     call_count = 0
@@ -1556,14 +1274,6 @@ def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     asyncio.run(experiment_runner._run_experiment(baseline=None))
 
@@ -1582,32 +1292,23 @@ def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_
     """A task episode timeout is a measured unsolved trial, not an
     experiment-level infrastructure crash."""
 
-    harness_config_cls = FakeHarnessConfig
-    experiment_id = "exp-timeout-is-unsolved"
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
     monkeypatch.setattr(
         runner.control_repo,
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
 
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id=experiment_id,
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=1,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-timeout-is-unsolved",
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=1,
+        max_trial_concurrency=1,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
 
     async def fake_run_task(*, task_name, **_kwargs):
@@ -1623,14 +1324,6 @@ def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     asyncio.run(experiment_runner._run_experiment(baseline=None))
 
@@ -1644,27 +1337,18 @@ def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_
 def test_run_panel_persists_completed_trial_without_refreshing_evidence(
     trial_mode, monkeypatch, tmp_path
 ):
-    harness_config_cls = FakeHarnessConfig
     experiment_id = f"exp-g4-{trial_mode}"
-
-    monkeypatch.setattr(runner.control_repo, "require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner.control_repo, "get_head_commit", lambda: "abc")
-
-    experiment_runner = runner.ExperimentRunner(
-        harness_config=harness_config_cls(
-            experiment_id=experiment_id,
-            focus_name="focus",
-            train_task_names=["task-a"],
-            task_trials=1,
-            max_trial_concurrency=1,
-        ),
-        harbor_config=type(
-            "HarborConfig",
-            (),
-            {"experiments_dir": tmp_path / "experiments"},
-        )(),
-        api_key="key",
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id=experiment_id,
+        focus_name="focus",
+        train_task_names=["task-a"],
+        task_trials=1,
+        max_trial_concurrency=1,
+        task_dirs=["task-a"],
     )
+    stub_trial_factories(monkeypatch, experiment_runner)
 
     async def fake_run_task(*, task_name, **_kwargs):
         if trial_mode == "exception":
@@ -1685,14 +1369,6 @@ def test_run_panel_persists_completed_trial_without_refreshing_evidence(
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
-    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
-    monkeypatch.setattr(
-        experiment_runner,
-        "_make_env",
-        lambda task_name, *, task_dir, exec_semaphore=None: object(),
-        raising=False,
-    )
-    _set_task_dirs(experiment_runner, tmp_path, "task-a")
 
     _run_panel_for_experiment_runner(runner, experiment_runner, ["task-a"])
 

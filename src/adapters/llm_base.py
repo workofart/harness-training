@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -49,11 +48,6 @@ class LlmCompletion:
 
 
 class BaseLlm(ABC):
-    @property
-    @abstractmethod
-    def max_context_length(self) -> int:
-        pass
-
     @abstractmethod
     async def complete(
         self,
@@ -63,21 +57,6 @@ class BaseLlm(ABC):
         reasoning_effort: ReasoningEffort | None = None,
     ) -> LlmCompletion:
         pass
-
-    def get_token_count(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> int:
-        """Provider-agnostic token estimate (~3 serialized chars per token).
-
-        Concrete because every provider's heuristic was byte-identical; a
-        provider with a real tokenizer may override it.
-        """
-        payload = {"messages": messages, "tools": tools or []}
-        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return max(1, (len(serialized) + 2) // 3)
 
     async def close(self) -> None:
         pass

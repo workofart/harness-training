@@ -559,7 +559,6 @@ def _validate_action_name(value: str) -> ActionName:
 
 async def run_task_loop(
     *,
-    task_name: str,
     llm: BaseLlm,
     env: HarnessEnv,
     reset_state: RawState,
@@ -573,7 +572,6 @@ async def run_task_loop(
     Lifecycle concerns (reset, timeout, artifacts, cleanup, timestamps) live
     outside the harness; this core loop only decides and executes actions.
     """
-    del task_name
     trajectory: Trajectory = ()
     steps_used = 0
     reward: float = 0.0

@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import time
-from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +12,7 @@ from openrouter import OpenRouter as OpenRouterClient
 from openrouter import errors
 from dotenv import load_dotenv
 
+from src.adapters.infra_retry import retry_transient
 from src.adapters.llm_base import (
     BaseLlm,
     LlmCompletion,
@@ -52,27 +52,6 @@ def load_openrouter_api_key(
 
 def _normalize_openrouter_model_name(model_name: str) -> str:
     return model_name.removeprefix("openrouter/")
-
-
-@lru_cache(maxsize=64)
-def _fetch_openrouter_model_endpoints(
-    *,
-    base_url: str,
-    model_name: str,
-) -> tuple[dict[str, Any], ...]:
-    model_id = _normalize_openrouter_model_name(model_name)
-    author, slug = model_id.split("/", maxsplit=1)
-    try:
-        with OpenRouterClient(server_url=base_url, timeout_ms=10_000) as client:
-            payload = client.endpoints.list(author=author, slug=slug)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load OpenRouter endpoint metadata for model {model_name!r}."
-        ) from exc
-
-    return tuple(
-        endpoint.model_dump(mode="json") for endpoint in payload.data.endpoints
-    )
 
 
 def _is_retryable_openrouter_error(exc: Exception) -> bool:
@@ -248,48 +227,11 @@ class OpenRouter(BaseLlm):
         api_key: str,
     ) -> None:
         self.config = config
-        self._max_context_length: int | None = None
         self._client = OpenRouterClient(
             api_key=api_key,
             server_url=config.base_url,
             timeout_ms=int(config.timeout_seconds * 1000),
         )
-
-    @property
-    def max_context_length(self) -> int:
-        if self._max_context_length is not None:
-            return self._max_context_length
-        endpoints = _fetch_openrouter_model_endpoints(
-            base_url=self.config.base_url,
-            model_name=self.config.model_name,
-        )
-        provider = self.config.provider_kwargs.provider
-        provider_order = () if provider is None else provider.order
-        if not provider_order:
-            selected = tuple(endpoints)
-        else:
-            selected = tuple(
-                endpoint
-                for endpoint in endpoints
-                if any(
-                    (normalized_tag := endpoint["tag"].lower()) == candidate.lower()
-                    or normalized_tag.startswith(f"{candidate.lower()}/")
-                    for candidate in provider_order
-                )
-            )
-        if not selected:
-            available_tags = sorted(endpoint["tag"] for endpoint in endpoints)
-            raise RuntimeError(
-                "No OpenRouter endpoints matched configured provider order "
-                f"{list(provider_order)!r}. Available endpoint tags: {available_tags!r}."
-            )
-        self._max_context_length = min(
-            endpoint["context_length"]
-            if endpoint["max_prompt_tokens"] is None
-            else endpoint["max_prompt_tokens"]
-            for endpoint in selected
-        )
-        return self._max_context_length
 
     async def complete(
         self,
@@ -361,67 +303,72 @@ class OpenRouter(BaseLlm):
                     f"{self.config.timeout_seconds} seconds."
                 ) from exc
 
-        async def run_completion() -> LlmCompletion:
-            for attempt in range(1, OPENROUTER_MAX_ATTEMPTS + 1):
-                attempt_started_at = time.perf_counter()
-                try:
-                    completion = await attempt_completion(list(messages))
-                    if embedded_error := _embedded_provider_error(completion):
-                        raise embedded_error
-                except Exception as exc:
-                    elapsed_sec = time.perf_counter() - attempt_started_at
-                    retryable = _is_retryable_openrouter_error(exc)
-                    logger.warning(
-                        "OpenRouter attempt failed attempt=%s/%s elapsed_sec=%.3f "
-                        "retryable=%s tools=%s reasoning_effort=%s error_type=%s error=%s",
-                        attempt,
-                        OPENROUTER_MAX_ATTEMPTS,
-                        elapsed_sec,
-                        retryable,
-                        tools is not None,
-                        self.config.reasoning_effort
-                        if reasoning_effort is None
-                        else reasoning_effort,
-                        type(exc).__name__,
-                        exc,
-                    )
-                    # Terminal failures propagate from the attempt that observed them.
-                    if not retryable or attempt == OPENROUTER_MAX_ATTEMPTS:
-                        raise
-                    await asyncio.sleep(float(attempt))
-                    continue
+        # The retry state machine (bounded attempts, transient-error gate,
+        # linear backoff, terminal raise) lives in `retry_transient`; this
+        # closure is just the per-attempt OpenRouter call plus its logging.
+        # `budget` is retries, so MAX_ATTEMPTS-1 keeps the historical 3 attempts.
+        attempt_index = 0
 
+        async def run_attempt() -> Any:
+            nonlocal attempt_index
+            attempt_index += 1
+            attempt_started_at = time.perf_counter()
+            try:
+                completion = await attempt_completion(list(messages))
+                if embedded_error := _embedded_provider_error(completion):
+                    raise embedded_error
+            except Exception as exc:
                 elapsed_sec = time.perf_counter() - attempt_started_at
-                usage = getattr(completion, "usage", None)
-                completion_details = (
-                    None
-                    if usage is None
-                    else getattr(usage, "completion_tokens_details", None)
-                )
-                logger.info(
-                    "OpenRouter attempt completed attempt=%s/%s elapsed_sec=%.3f "
-                    "tools=%s reasoning_effort=%s finish_reason=%s prompt_tokens=%s "
-                    "completion_tokens=%s reasoning_tokens=%s",
-                    attempt,
+                logger.warning(
+                    "OpenRouter attempt failed attempt=%s/%s elapsed_sec=%.3f "
+                    "retryable=%s tools=%s reasoning_effort=%s error_type=%s error=%s",
+                    attempt_index,
                     OPENROUTER_MAX_ATTEMPTS,
                     elapsed_sec,
+                    _is_retryable_openrouter_error(exc),
                     tools is not None,
                     self.config.reasoning_effort
                     if reasoning_effort is None
                     else reasoning_effort,
-                    getattr(completion.choices[0], "finish_reason", None),
-                    None if usage is None else getattr(usage, "prompt_tokens", None),
-                    None
-                    if usage is None
-                    else getattr(usage, "completion_tokens", None),
-                    None
-                    if completion_details is None
-                    else getattr(completion_details, "reasoning_tokens", None),
+                    type(exc).__name__,
+                    exc,
                 )
+                raise
 
-                return _to_llm_completion(completion)
+            elapsed_sec = time.perf_counter() - attempt_started_at
+            usage = getattr(completion, "usage", None)
+            completion_details = (
+                None
+                if usage is None
+                else getattr(usage, "completion_tokens_details", None)
+            )
+            logger.info(
+                "OpenRouter attempt completed attempt=%s/%s elapsed_sec=%.3f "
+                "tools=%s reasoning_effort=%s finish_reason=%s prompt_tokens=%s "
+                "completion_tokens=%s reasoning_tokens=%s",
+                attempt_index,
+                OPENROUTER_MAX_ATTEMPTS,
+                elapsed_sec,
+                tools is not None,
+                self.config.reasoning_effort
+                if reasoning_effort is None
+                else reasoning_effort,
+                getattr(completion.choices[0], "finish_reason", None),
+                None if usage is None else getattr(usage, "prompt_tokens", None),
+                None if usage is None else getattr(usage, "completion_tokens", None),
+                None
+                if completion_details is None
+                else getattr(completion_details, "reasoning_tokens", None),
+            )
+            return completion
 
-        return await run_completion()
+        completion = await retry_transient(
+            run_attempt,
+            is_transient=_is_retryable_openrouter_error,
+            on_retry=lambda _retries, _exc: None,
+            budget=OPENROUTER_MAX_ATTEMPTS - 1,
+        )
+        return _to_llm_completion(completion)
 
     async def close(self) -> None:
         await self._client.__aexit__(None, None, None)

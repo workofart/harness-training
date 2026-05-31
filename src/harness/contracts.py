@@ -13,8 +13,10 @@ depending on the other.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.metrics import TaskMetrics
 
@@ -78,46 +80,29 @@ class HarnessEnv(Protocol):
         """Release all task resources."""
 
 
-@dataclass(frozen=True, slots=True)
-class TaskResult:
+class TaskResult(BaseModel):
     """Experiment trial output contract: one trial's full result.
 
     Returned by `src.experiment.trial.run_task()`, aggregated by the runner
     into `TaskTrials`, persisted to `experiment.json`, and reloaded via
-    `from_dict` for diagnosis.
+    `model_validate` for diagnosis.
     Every constructor passes concrete values for `solved` and `steps_used` —
     crash and timeout paths resolve to `solved=False` with a recorded step
     count — so neither is optional. (`reward` stays optional: a trial that
     never reached the verifier has no reward.)
     """
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     task_name: str
     reward: float | None = None
-    solved: bool = False
+    solved: bool
     error: str | None = None
     steps_used: int = 0
     trial_dir: str | None = None
     trace_path: str | None = None
     metrics_path: str | None = None
     verifier_stdout_path: str | None = None
-    metrics: TaskMetrics = field(default_factory=TaskMetrics)
+    metrics: TaskMetrics = Field(default_factory=TaskMetrics)
     started_at: str | None = None
     finished_at: str | None = None
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskResult":
-        metrics = TaskMetrics.from_dict(payload["metrics"])
-        return cls(
-            task_name=str(payload["task_name"]),
-            reward=payload.get("reward"),
-            solved=payload["solved"],
-            error=payload.get("error"),
-            steps_used=payload.get("steps_used", 0),
-            trial_dir=payload.get("trial_dir"),
-            trace_path=payload.get("trace_path"),
-            metrics_path=payload.get("metrics_path"),
-            verifier_stdout_path=payload.get("verifier_stdout_path"),
-            metrics=metrics,
-            started_at=payload.get("started_at"),
-            finished_at=payload.get("finished_at"),
-        )

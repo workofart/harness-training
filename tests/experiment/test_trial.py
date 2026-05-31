@@ -5,89 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
 
-from src.adapters.llm_base import BaseLlm, LlmCompletion, LlmToolCall
 from src.experiment.trial import run_task
 from src.harness.contracts import RawState
 
-
-class _StubLlm(BaseLlm):
-    def __init__(self, completions: list[LlmCompletion]) -> None:
-        self._completions = list(completions)
-        self.calls: list[list[dict[str, Any]]] = []
-        self.closed = False
-
-    @property
-    def max_context_length(self) -> int:
-        return 1000
-
-    async def complete(self, *, messages, tools=None, reasoning_effort=None):
-        del tools, reasoning_effort
-        self.calls.append([dict(m) for m in messages])
-        return self._completions.pop(0)
-
-    def get_token_count(self, messages, *, tools=None) -> int:
-        del messages, tools
-        return 1
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class _StubEnv:
-    def __init__(
-        self,
-        *,
-        reset_state: RawState | None = None,
-        exec_states: list[RawState] | None = None,
-        verify_state: RawState | None = None,
-        trial_dir: str = "/tmp/trial",
-        verifier_stdout_path: str | None = None,
-    ) -> None:
-        self._reset_state = reset_state or RawState(
-            instruction="do the thing", working_dir="/work"
-        )
-        self._exec_states = list(exec_states or [])
-        self._verify_state = verify_state or RawState(
-            done=True, passed=True, reward=1.0
-        )
-        self.trial_dir: str | None = trial_dir
-        self.verifier_stdout_path: str | None = verifier_stdout_path
-        self.exec_calls: list[dict[str, Any]] = []
-        self.verify_calls = 0
-        self.closed = False
-
-    async def reset(self) -> RawState:
-        return self._reset_state
-
-    async def exec(self, *, command, cwd=None, timeout_sec=None, workload="heavy"):
-        self.exec_calls.append(
-            {
-                "command": command,
-                "cwd": cwd,
-                "timeout_sec": timeout_sec,
-                "workload": workload,
-            }
-        )
-        if self._exec_states:
-            return self._exec_states.pop(0)
-        return RawState(return_code=0)
-
-    async def verify(self) -> RawState:
-        self.verify_calls += 1
-        return self._verify_state
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-def _tool_call(name: str, **args: Any) -> LlmToolCall:
-    return LlmToolCall(name=name, arguments=json.dumps(args))
-
-
-def _completion(*calls: LlmToolCall, content: str | None = None) -> LlmCompletion:
-    return LlmCompletion(tool_calls=tuple(calls), content=content)
+from conftest import _StubLlm, _StubEnv, _tool_call, _completion
 
 
 def test_run_task_populates_trial_dir_and_verifier_stdout_path(tmp_path):

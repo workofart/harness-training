@@ -5,7 +5,7 @@ from src.metrics import TaskMetrics
 
 
 def test_task_result_from_dict_loads_metric_fields():
-    task_result = TaskResult.from_dict(
+    task_result = TaskResult.model_validate(
         {
             "task_name": "task-a",
             "reward": 1.0,

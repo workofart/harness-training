@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from src.control.agent_backend import (
     color_enabled,
@@ -35,8 +36,9 @@ DEFAULT_SUPERVISOR_ROOT = supervisor_root_for_repo(DEFAULT_REPO_ROOT)
 Phase = Literal["prelaunch", "launch", "postrun"]
 
 
-@dataclass(frozen=True, slots=True)
-class SupervisorState:
+class SupervisorState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     phase: Phase
     thread_id: str | None
     updated_at: str
@@ -65,7 +67,7 @@ class SupervisorState:
         path = cls.path(repo_root=repo_root, root=root)
         if not path.exists():
             return None
-        return cls(**json.loads(path.read_text()))
+        return cls.model_validate_json(path.read_text())
 
     def save(
         self,
@@ -75,7 +77,7 @@ class SupervisorState:
     ) -> None:
         write_json_atomic(
             self.path(repo_root=repo_root, root=root),
-            asdict(self),
+            self.model_dump(mode="json"),
         )
 
     @classmethod

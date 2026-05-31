@@ -93,7 +93,7 @@ The supervisor enforces every rule above and will reject candidates that violate
 ## Post-Run Diagnosis
 
 1. Read the concluded experiment record, surfaced evidence artifacts, and `experiments/learning.md`.
-2. Use trace evidence (`agent/steps.jsonl`, `agent/metrics.json`) to reason about whether the candidate's mechanism reached its intended state transitions. Start with `metrics.json.rule_fires` (mechanism instrumentation) and `metrics.json.failure_mode` (per-trial terminal-state bucket: `solved | verified_rejected | never_verified | hit_step_cap | hit_timeout | crash`, where `crash` is an infra failure that exhausted internal retries and is excluded from evidence).
+2. Use trace evidence (`agent/steps.jsonl`, `agent/metrics.json`) to reason about whether the candidate's mechanism reached its intended state transitions. Start with `metrics.json.rule_fires` (mechanism instrumentation) and `metrics.json.failure_mode` (per-trial terminal-state bucket: `solved | verified_rejected | never_verified | hit_step_cap | hit_timeout | no_valid_action | interrupted | crash`, where `crash` is an infra failure that exhausted internal retries and `interrupted` is a trial stopped from the outside by Ctrl-C or a supervisor restart -- both excluded from evidence).
 3. Update only `experiments/learning.md`. Keep it concise, cumulative, generic, and organized by stable harness-design domains.
 4. Stop when the memo update is complete.
 

@@ -13,18 +13,26 @@ import asyncio
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
+from pydantic import BaseModel, ConfigDict
+
 from src.harness.contracts import TaskResult
-from src.metrics import BaselineComparison, TaskMetrics, is_majority_solved
+from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majority_solved
 
 
 EXPERIMENT_FILENAME = "experiment.json"
 ExperimentStatus = Literal["keep", "discard", "crash"]
+
+
+class ExperimentAbandoned(RuntimeError):
+    """A run was stopped by the outer supervisor loop (process restart) rather
+    than failing on its own. Trials filled to conclude such a record classify as
+    `interrupted` -- like a Ctrl-C -- not `crash` (see ``terminal_task_result``).
+    """
 
 
 def failed_experiment_git_ref(experiment_id: str) -> str:
@@ -46,11 +54,12 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temp_path, path)
 
 
-@dataclass
-class TaskTrials:
+class TaskTrials(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     task_name: str
-    expected_trial_count: int = 1
-    trials: list[TaskResult] = field(default_factory=list)
+    expected_trial_count: int
+    trials: list[TaskResult]
 
     @property
     def trial_count(self) -> int:
@@ -116,16 +125,6 @@ class TaskTrials:
         self.trials.append(trial)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskTrials":
-        trials_payload = payload["trials"]
-        trials = [TaskResult.from_dict(item) for item in trials_payload]
-        return cls(
-            task_name=str(payload["task_name"]),
-            expected_trial_count=int(payload["expected_trial_count"]),
-            trials=trials,
-        )
-
-    @classmethod
     def empty(cls, *, task_name: str, expected_trial_count: int) -> "TaskTrials":
         return cls(
             task_name=task_name,
@@ -134,19 +133,17 @@ class TaskTrials:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class CandidateChangeEvidence:
+class CandidateChangeEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     commit: str
     parent_baseline_experiment_id: str | None = None
     parent_baseline_commit: str | None = None
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CandidateChangeEvidence":
-        return cls(**payload)
 
+class TaskOutcomeEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-@dataclass(frozen=True, slots=True)
-class TaskOutcomeEvidence:
     task_id: str
     baseline_solved: bool | None
     candidate_solved: bool | None
@@ -163,10 +160,6 @@ class TaskOutcomeEvidence:
     metrics_path: str | None = None
     verifier_stdout_path: str | None = None
     error: str | None = None
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskOutcomeEvidence":
-        return cls(**payload)
 
     @classmethod
     def from_trials(
@@ -235,10 +228,11 @@ class TaskOutcomeEvidence:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ExperimentEvidence:
+class ExperimentEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     candidate_change: CandidateChangeEvidence
-    task_outcomes: list[TaskOutcomeEvidence] = field(default_factory=list)
+    task_outcomes: list[TaskOutcomeEvidence]
 
     @classmethod
     def empty(cls, *, record: "ExperimentRecord") -> "ExperimentEvidence":
@@ -246,24 +240,14 @@ class ExperimentEvidence:
             candidate_change=CandidateChangeEvidence(
                 commit=record.git_commit_hash,
                 parent_baseline_experiment_id=record.parent_baseline_experiment_id,
-            )
-        )
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ExperimentEvidence":
-        return cls(
-            candidate_change=CandidateChangeEvidence.from_dict(
-                payload["candidate_change"]
             ),
-            task_outcomes=[
-                TaskOutcomeEvidence.from_dict(task_payload)
-                for task_payload in payload["task_outcomes"]
-            ],
+            task_outcomes=[],
         )
 
 
-@dataclass
-class ExperimentRecord:
+class ExperimentRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     experiment_id: str
     parent_baseline_experiment_id: str | None
     git_commit_hash: str
@@ -276,7 +260,7 @@ class ExperimentRecord:
     started_at: str
     finished_at: str | None
     train_task_results: dict[str, TaskTrials]
-    evidence: ExperimentEvidence | None = None
+    evidence: ExperimentEvidence | None
 
     @classmethod
     def path(cls, experiment_id: str, *, root: Path) -> Path:
@@ -291,14 +275,7 @@ class ExperimentRecord:
     ) -> "ExperimentRecord":
         payload = json.loads(cls.path(experiment_id, root=root).read_text())
         payload["train_task_ids"] = sorted(payload["train_task_ids"])
-        payload["train_task_results"] = {
-            str(task_id): TaskTrials.from_dict(task_trials_payload)
-            for task_id, task_trials_payload in payload["train_task_results"].items()
-        }
-        evidence_payload = payload.pop("evidence")
-        record = cls(**payload)
-        record.evidence = ExperimentEvidence.from_dict(evidence_payload)
-        return record
+        return cls.model_validate(payload)
 
     @classmethod
     def initialize(
@@ -338,7 +315,7 @@ class ExperimentRecord:
     def write(self, *, root: Path) -> None:
         if self.evidence is None:
             self.evidence = ExperimentEvidence.empty(record=self)
-        payload = asdict(self)
+        payload = self.model_dump(mode="json")
         write_json_atomic(self.path(self.experiment_id, root=root), payload)
 
     def record_task_result(self, task_result: TaskResult) -> None:
@@ -459,8 +436,9 @@ def build_experiment_evidence(
     )
 
 
-@dataclass
-class ExperimentState:
+class ExperimentState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     active_baseline_experiment_id: str | None
     current_experiment_id: str | None = None
     updated_at: str | None = None
@@ -477,10 +455,10 @@ class ExperimentState:
                 active_baseline_experiment_id=None,
                 updated_at=None,
             )
-        return cls(**json.loads(path.read_text()))
+        return cls.model_validate_json(path.read_text())
 
     def save(self, *, root: Path) -> None:
-        write_json_atomic(self.path(root=root), asdict(self))
+        write_json_atomic(self.path(root=root), self.model_dump(mode="json"))
 
 
 def raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
@@ -500,17 +478,27 @@ def raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
 
 def terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
     finished_at = datetime.now(timezone.utc).isoformat()
-    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+    # An interrupt (Ctrl-C, KeyboardInterrupt, or a supervisor-restart abandon)
+    # means the trial was stopped from the outside, not that it failed on its
+    # own -- bucket it as `interrupted`, distinct from a genuine infra `crash`.
+    # Both keep `error` set, so both stay excluded from the gate's valid trials.
+    failure_mode: FailureMode
+    if isinstance(exc, ExperimentAbandoned):
+        error = str(exc) or type(exc).__name__
+        failure_mode = "interrupted"
+    elif isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
         error = "canceled"
+        failure_mode = "interrupted"
     else:
         error = str(exc) or type(exc).__name__
+        failure_mode = "crash"
     return TaskResult(
         task_name=task_id,
         reward=0.0,
         solved=False,
         error=error,
         steps_used=0,
-        metrics=TaskMetrics(failure_mode="crash"),
+        metrics=TaskMetrics(failure_mode=failure_mode),
         started_at=finished_at,
         finished_at=finished_at,
     )
