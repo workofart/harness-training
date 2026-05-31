@@ -7,18 +7,33 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from harbor.environments.base import ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
+from harbor.models.task.task import Task
+from harbor.models.trial.paths import TrialPaths
 
 from src.adapters.env import Harbor, HarborConfig, TaskDirectoryResolver
 
 
-def _write_minimal_task(task_dir: Path) -> None:
+def _write_minimal_task(
+    task_dir: Path,
+    *,
+    cpus: int = 1,
+    verifier_env: dict[str, str] | None = None,
+) -> None:
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "solution").mkdir()
     (task_dir / "tests").mkdir()
     (task_dir / "instruction.md").write_text("solve it\n")
-    (task_dir / "task.toml").write_text(
-        'version = "1.0"\n\n[environment]\ndocker_image = "example/task:latest"\n'
-    )
+    task_toml = [
+        'version = "1.0"',
+        "",
+        "[environment]",
+        'docker_image = "example/task:latest"',
+        f"cpus = {cpus}",
+    ]
+    if verifier_env:
+        task_toml.extend(["", "[verifier.env]"])
+        task_toml.extend(f'{key} = "{value}"' for key, value in verifier_env.items())
+    (task_dir / "task.toml").write_text("\n".join(task_toml) + "\n")
     (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.13-slim\n")
     (task_dir / "solution" / "solve.sh").write_text("#!/bin/bash\n")
     (task_dir / "tests" / "test.sh").write_text("#!/bin/bash\n")
@@ -168,6 +183,114 @@ def test_harbor_exec_propagates_non_timeout_runtime_error(tmp_path: Path) -> Non
         asyncio.run(harbor.exec(command="ls"))
 
 
+class RecordingEnvironment:
+    is_mounted = True
+
+    def __init__(self, reward_path: Path | None = None) -> None:
+        self.reward_path = reward_path
+        self.exec_calls: list[dict[str, object]] = []
+
+    async def upload_file(self, source_path: Path | str, target_path: str):
+        del source_path, target_path
+
+    async def upload_dir(self, source_dir: Path | str, target_dir: str):
+        del source_dir, target_dir
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        self.exec_calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout_sec": timeout_sec,
+            }
+        )
+        if self.reward_path is not None and command.startswith("/tests/test.sh"):
+            self.reward_path.write_text("1.0")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+
+def _attach_recording_harbor(
+    tmp_path: Path,
+    *,
+    cpus: int,
+    verifier_env: dict[str, str] | None = None,
+) -> tuple[Harbor, RecordingEnvironment]:
+    task_dir = tmp_path / "task"
+    _write_minimal_task(task_dir, cpus=cpus, verifier_env=verifier_env)
+    trial_paths = TrialPaths(trial_dir=tmp_path / "trial")
+    trial_paths.mkdir()
+    task = Task(task_dir=task_dir)
+    environment = RecordingEnvironment(reward_path=trial_paths.reward_text_path)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+    harbor._attach_session(
+        task=task,
+        trial_paths=trial_paths,
+        harbor_environment=environment,
+    )
+    return harbor, environment
+
+
+def test_harbor_exec_applies_declared_cpu_resource_caps(tmp_path: Path) -> None:
+    harbor, environment = _attach_recording_harbor(tmp_path, cpus=2)
+
+    asyncio.run(harbor.exec(command="python -c pass"))
+
+    env = environment.exec_calls[-1]["env"]
+    assert env["OPENBLAS_NUM_THREADS"] == "2"
+    assert env["OMP_NUM_THREADS"] == "2"
+    assert env["RAYON_NUM_THREADS"] == "2"
+    assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2"
+    assert env["MAKEFLAGS"] == "-j2"
+    assert env["TOKENIZERS_PARALLELISM"] == "false"
+
+
+def test_harbor_verifier_applies_caps_while_preserving_verifier_env(
+    tmp_path: Path,
+) -> None:
+    harbor, environment = _attach_recording_harbor(
+        tmp_path,
+        cpus=3,
+        verifier_env={"OMP_NUM_THREADS": "7", "CUSTOM_ENV": "set"},
+    )
+
+    asyncio.run(harbor.session.verifier.verify())
+
+    chmod_env = environment.exec_calls[0]["env"]
+    verifier_env = environment.exec_calls[1]["env"]
+    assert chmod_env["OMP_NUM_THREADS"] == "3"
+    assert verifier_env["OMP_NUM_THREADS"] == "7"
+    assert verifier_env["OPENBLAS_NUM_THREADS"] == "3"
+    assert verifier_env["CUSTOM_ENV"] == "set"
+
+
+def test_harbor_close_uses_raw_environment_for_lifecycle_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harbor, environment = _attach_recording_harbor(tmp_path, cpus=2)
+    stopped = []
+
+    async def fake_stop_environment(target):
+        stopped.append(target)
+
+    monkeypatch.setattr(harbor, "_stop_environment", fake_stop_environment)
+
+    asyncio.run(harbor.close())
+
+    assert stopped == [environment]
+
+
 def _stub_harbor_with_recording_exec(
     tmp_path: Path,
     *,
@@ -177,7 +300,8 @@ def _stub_harbor_with_recording_exec(
     """Build a Harbor whose inner exec records enter/exit order around an await
     boundary, so concurrent `harbor.exec` calls reveal whether they overlap."""
 
-    async def fake_exec(*, command, cwd=None, timeout_sec=None):
+    async def fake_exec(*, command, cwd=None, env=None, timeout_sec=None):
+        del cwd, env, timeout_sec
         order.append(f"enter:{command}")
         await asyncio.sleep(0.01)
         order.append(f"exit:{command}")
@@ -274,8 +398,8 @@ def test_harbor_reset_serializes_startup_under_shared_semaphore(
             await asyncio.sleep(0.01)
             order.append(f"exit:{self.name}")
 
-        async def exec(self, *, command, cwd=None, timeout_sec=None):
-            del cwd, timeout_sec
+        async def exec(self, *, command, cwd=None, env=None, timeout_sec=None):
+            del cwd, env, timeout_sec
             assert command == "pwd"
             return ExecResult(return_code=0, stdout="/app\n", stderr="")
 

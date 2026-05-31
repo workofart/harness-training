@@ -90,11 +90,64 @@ def _is_command_timeout(exc: Exception) -> bool:
     return isinstance(exc, RuntimeError) and "timed out" in str(exc).lower()
 
 
+# High trial concurrency exposes host CPU contention from libraries/build tools
+# that fan out inside each container. Cap those defaults at the Harbor boundary
+# from the declared task CPU budget so agent and verifier exec share one policy.
+_CPU_THREAD_ENV_KEYS = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+    "CARGO_BUILD_JOBS",
+    "GOMAXPROCS",
+    "CMAKE_BUILD_PARALLEL_LEVEL",
+)
+
+
+def _cpu_resource_env(cpus: int) -> dict[str, str]:
+    cap = str(cpus)
+    return {
+        **{key: cap for key in _CPU_THREAD_ENV_KEYS},
+        "MAKEFLAGS": f"-j{cap}",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+
+
+@dataclass
+class _ResourceCappedEnvironment:
+    environment: BaseEnvironment
+    resource_env: dict[str, str]
+
+    def __getattr__(self, name: str):
+        return getattr(self.environment, name)
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        merged_env = dict(self.resource_env)
+        if env is not None:
+            merged_env.update(env)
+        return await self.environment.exec(
+            command=command,
+            cwd=cwd,
+            env=merged_env,
+            timeout_sec=timeout_sec,
+        )
+
+
 @dataclass
 class HarborSession:
     task: Task
     trial_paths: TrialPaths
-    environment: BaseEnvironment
+    environment: _ResourceCappedEnvironment
+    raw_environment: BaseEnvironment
     verifier: Verifier
 
 
@@ -211,14 +264,19 @@ class Harbor:
         trial_paths: TrialPaths,
         harbor_environment: BaseEnvironment,
     ) -> None:
+        capped_environment = _ResourceCappedEnvironment(
+            harbor_environment,
+            _cpu_resource_env(task.config.environment.cpus),
+        )
         self._session = HarborSession(
             task=task,
             trial_paths=trial_paths,
-            environment=harbor_environment,
+            environment=capped_environment,
+            raw_environment=harbor_environment,
             verifier=Verifier(
                 task=task,
                 trial_paths=trial_paths,
-                environment=harbor_environment,
+                environment=capped_environment,
             ),
         )
 
@@ -507,7 +565,7 @@ class Harbor:
             return
 
         try:
-            await self._stop_environment(self._session.environment)
+            await self._stop_environment(self._session.raw_environment)
         finally:
             self._session = None
             self._trial_dir = None
