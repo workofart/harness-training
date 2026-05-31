@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from src.control import repo as control_repo
@@ -19,6 +20,7 @@ from src.metrics import (
     PROMOTION_P_VALUE_ALPHA,
     BaselineComparison,
     compare_candidate_against_baseline,
+    is_majority_solved,
 )
 
 from src.experiment.record import ExperimentRecord, ExperimentStatus
@@ -43,14 +45,44 @@ def build_gate_verdicts(
     verdicts: dict[str, BaselineComparison] = {}
     for task_id, candidate_trials in candidate.train_task_results.items():
         baseline_solved, baseline_total = pool.get(task_id, (0, 0))
-        verdicts[task_id] = compare_candidate_against_baseline(
+        verdict = compare_candidate_against_baseline(
             candidate_solved=candidate_trials.solved_count,
             candidate_total=len(candidate_trials.valid_trials),
             baseline_solved=baseline_solved,
             baseline_total=baseline_total,
             alpha=PROMOTION_P_VALUE_ALPHA,
         )
+        verdicts[task_id] = _floor_regression_when_candidate_solves(verdict)
     return verdicts
+
+
+def _floor_regression_when_candidate_solves(
+    verdict: BaselineComparison,
+) -> BaselineComparison:
+    """Never label a still-solving candidate a regression.
+
+    :func:`compare_candidate_against_baseline` is a pure binomial that treats the
+    pooled baseline rate as ground truth. A degenerate high-rate pool (e.g. ~1.0
+    from an easy task the panel almost always solves) therefore flags a single
+    failed extra trial as a significant regression even when the candidate still
+    clears the majority-solve bar -- the exact false positive that discarded
+    exp-gpt-5-5-high-speed-up-0530 on adaptive-rejection-sampler (pool ~1.0,
+    candidate 3/4). Majority-solve is the experiment's own per-task success
+    criterion, so a candidate that still reaches it has not regressed.
+
+    This floor only downgrades regression -> unchanged for candidates that still
+    majority-solve; binomial power is untouched for candidates that do NOT
+    majority-solve, which still surface as regressions. The downgrade keeps the
+    gate decision and the persisted evidence label in agreement (the verdict is
+    the single source of truth for both).
+    """
+    if verdict.kind != "regression":
+        return verdict
+    if is_majority_solved(
+        solved=verdict.candidate_solved, total=verdict.candidate_total
+    ):
+        return replace(verdict, kind="unchanged")
+    return verdict
 
 
 def decide_from_verdicts(

@@ -255,6 +255,48 @@ def _gate(*, candidate, pool) -> tuple[str, str]:
     return decide_from_verdicts(candidate=candidate, verdicts=verdicts)
 
 
+def test_majority_solving_candidate_not_flagged_regression_against_degenerate_pool():
+    # Reproduces the exp-gpt-5-5-high-speed-up-0530 discard artifact: an easy
+    # task whose pooled baseline rate is ~1.0 (3/3). The candidate runs one
+    # extra trial and lands 3/4 -- still a majority-solve. The pure binomial
+    # flags 3/4 vs 3/3 as significant (p~=0), but the candidate still SOLVES the
+    # task, so the caller-side floor must downgrade regression -> unchanged.
+    baseline = _make_record(
+        experiment_id="baseline", parent=None, train_ids=["easy"], k=3
+    )
+    _record_solves(baseline, "easy", [True] * 3)  # pool 3/3 -> rate 1.0
+    candidate = _make_record(
+        experiment_id="candidate", parent="baseline", train_ids=["easy"], k=4
+    )
+    _record_solves(candidate, "easy", [True] * 3 + [False])  # 3/4 -> majority-solve
+    pool = _pool_from_baseline(baseline)
+
+    verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
+    assert verdicts["easy"].kind == "unchanged"
+    _, reason = decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    assert "regressed" not in reason
+
+
+def test_binomial_regression_preserved_when_candidate_below_majority():
+    # Power check: a candidate that does NOT majority-solve a task the pool
+    # solves robustly still surfaces as a regression. The floor only protects
+    # still-solving candidates, so binomial power is intact for the rest.
+    baseline = _make_record(
+        experiment_id="baseline", parent=None, train_ids=["easy"], k=4
+    )
+    _record_solves(baseline, "easy", [True] * 4)  # pool 4/4 -> rate 1.0
+    candidate = _make_record(
+        experiment_id="candidate", parent="baseline", train_ids=["easy"], k=4
+    )
+    _record_solves(candidate, "easy", [True] + [False] * 3)  # 1/4 -> below majority
+    pool = _pool_from_baseline(baseline)
+
+    verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
+    assert verdicts["easy"].kind == "regression"
+    status, reason = decide_from_verdicts(candidate=candidate, verdicts=verdicts)
+    assert status == "discard" and "regressed" in reason
+
+
 def test_evaluate_keeps_candidate_with_significant_train_gain_at_k10():
     baseline = _make_record(
         experiment_id="baseline",
