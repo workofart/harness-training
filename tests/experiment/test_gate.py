@@ -8,7 +8,7 @@ from src.experiment.gate import (
     decide_from_verdicts,
     rule_names_from_added_lines,
 )
-from src.experiment.record import ExperimentRecord
+from src.experiment.record import ExperimentRecord, terminal_task_result
 from src.harness.contracts import TaskResult
 from src.metrics import TaskMetrics
 
@@ -842,3 +842,60 @@ def test_build_pooled_control_samples_filters_records_and_trials(pool_case):
     )
 
     assert pool == pool_case["expected"]
+
+
+def test_crash_fillers_do_not_change_gate_verdicts():
+    # Safety net for the A-relax refactor. The gate reads only valid (error-free)
+    # trials, so the crash placeholders `_complete_unfinished_task_results`
+    # fabricates for unfinished/never-run tasks are invisible to it. A candidate
+    # carrying those fillers must produce byte-identical verdicts to one without
+    # them -- exactly the before/after of removing the fillers. If this ever
+    # fails, dropping them would move a p-value and the refactor is unsafe.
+    train_ids = ["task-a", "task-b", "task-c"]
+    pool = {"task-a": (8, 10), "task-b": (2, 10), "task-c": (5, 10)}
+
+    def build(*, with_fillers):
+        record = _make_record(
+            experiment_id="candidate", parent="baseline", train_ids=train_ids, k=3
+        )
+        _record_solves(record, "task-a", [True, False])
+        _record_solves(record, "task-b", [True])
+        # task-c never produced a real trial.
+        if with_fillers:
+            # The placeholders finalize_crash would append to conclude unfinished
+            # slots: crashes carry `error`, so valid_trials excludes them.
+            for _ in range(2):
+                record.record_task_result(
+                    terminal_task_result(task_id="task-b", exc=RuntimeError("boom"))
+                )
+            for _ in range(3):
+                record.record_task_result(
+                    terminal_task_result(task_id="task-c", exc=RuntimeError("boom"))
+                )
+        return record
+
+    filled = build(with_fillers=True)
+    relaxed = build(with_fillers=False)
+
+    # The two records genuinely differ in their raw trial lists, so equal
+    # verdicts are a real invariant rather than a tautology.
+    assert filled.train_task_results["task-c"].trial_count == 3
+    assert relaxed.train_task_results["task-c"].trial_count == 0
+    assert filled.train_task_results["task-b"].trial_count == 3
+    assert relaxed.train_task_results["task-b"].trial_count == 1
+
+    # The gate's only trial inputs -- solved_count and len(valid_trials) -- match,
+    # because the fillers carry `error` and are excluded.
+    for task_id in train_ids:
+        assert (
+            filled.train_task_results[task_id].solved_count
+            == relaxed.train_task_results[task_id].solved_count
+        )
+        assert len(filled.train_task_results[task_id].valid_trials) == len(
+            relaxed.train_task_results[task_id].valid_trials
+        )
+
+    # The full verdict objects (kind, p_value, all four counts) are identical.
+    assert build_gate_verdicts(candidate=filled, pool=pool) == build_gate_verdicts(
+        candidate=relaxed, pool=pool
+    )
