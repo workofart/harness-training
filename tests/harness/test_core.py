@@ -50,18 +50,10 @@ class _StubLlm(BaseLlm):
         self.calls: list[list[dict[str, Any]]] = []
         self.closed = False
 
-    @property
-    def max_context_length(self) -> int:
-        return 1000
-
     async def complete(self, *, messages, tools=None, reasoning_effort=None):
         del tools, reasoning_effort
         self.calls.append([dict(m) for m in messages])
         return self._completions.pop(0)
-
-    def get_token_count(self, messages, *, tools=None) -> int:
-        del messages, tools
-        return 1
 
     async def close(self) -> None:
         self.closed = True

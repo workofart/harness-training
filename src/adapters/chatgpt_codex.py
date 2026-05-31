@@ -153,10 +153,6 @@ class ChatGptCodex(BaseLlm):
             else http_client
         )
 
-    @property
-    def max_context_length(self) -> int:
-        return self.config.max_context_length
-
     async def complete(
         self,
         *,
