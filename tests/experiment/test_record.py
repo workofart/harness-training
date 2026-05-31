@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from src.experiment.gate import build_gate_verdicts
-from src.experiment.record import ExperimentRecord, TaskTrials
+from src.experiment.record import (
+    ExperimentAbandoned,
+    ExperimentRecord,
+    TaskTrials,
+    terminal_task_result,
+)
 from src.harness.contracts import TaskResult
 
 
@@ -450,3 +456,27 @@ def test_task_trials_is_deterministic_solved_predicate():
         trials=[trial(solved=True), trial(solved=False)],
     )
     assert mixed.is_deterministic_solved is False
+
+
+def test_terminal_task_result_classifies_interrupts_distinct_from_crash():
+    # A trial stopped from the outside -- a cancellation/Ctrl-C or an outer-loop
+    # `ExperimentAbandoned` -- is bucketed `interrupted`, not `crash`; a genuine
+    # exception stays `crash`. All three keep `error` set, so all three remain
+    # excluded from the gate's valid trials.
+    canceled = terminal_task_result(task_id="t", exc=asyncio.CancelledError())
+    assert canceled.metrics.failure_mode == "interrupted"
+    assert canceled.error == "canceled"
+
+    abandoned = terminal_task_result(
+        task_id="t", exc=ExperimentAbandoned("abandoned after supervisor restart")
+    )
+    assert abandoned.metrics.failure_mode == "interrupted"
+    assert abandoned.error == "abandoned after supervisor restart"
+
+    crashed = terminal_task_result(task_id="t", exc=RuntimeError("boom"))
+    assert crashed.metrics.failure_mode == "crash"
+    assert crashed.error == "boom"
+
+    for result in (canceled, abandoned, crashed):
+        assert result.solved is False
+        assert result.error is not None  # error set => excluded from valid_trials

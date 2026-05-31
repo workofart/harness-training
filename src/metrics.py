@@ -13,7 +13,9 @@ if TYPE_CHECKING:
 # Single source of truth for the per-trial terminal-state bucket persisted as
 # `metrics.json.failure_mode` (mirrored in program.md "Post-Run Diagnosis").
 # `crash` is an infra failure that exhausted within-trial retries and is
-# excluded from evidence; `None` means the trial reached no terminal outcome.
+# excluded from evidence; `interrupted` is a trial stopped from the outside (a
+# Ctrl-C or a supervisor restart) rather than failing on its own, also excluded
+# from evidence; `None` means the trial reached no terminal outcome.
 FailureMode = Literal[
     "solved",
     "never_verified",
@@ -21,6 +23,7 @@ FailureMode = Literal[
     "hit_step_cap",
     "hit_timeout",
     "no_valid_action",
+    "interrupted",
     "crash",
 ]
 
@@ -48,9 +51,10 @@ class TaskMetrics:
     # Trial-final summary fields. Populated by the runner once `final_passed`
     # is known so the supervisor can answer "where did it die" without
     # walking steps.jsonl. `failure_mode` is one of: "solved",
-    # "never_verified", "verified_rejected", "hit_step_cap", "hit_timeout", or
-    # "crash" (an infra failure excluded from evidence), or None when the trial
-    # did not produce a terminal outcome.
+    # "never_verified", "verified_rejected", "hit_step_cap", "hit_timeout",
+    # "no_valid_action", "interrupted" (stopped from the outside), or "crash"
+    # (an infra failure) -- the last three excluded from evidence -- or None
+    # when the trial did not produce a terminal outcome.
     final_action_passed: bool | None = None
     verifier_passed: bool | None = None
     failure_mode: FailureMode | None = None

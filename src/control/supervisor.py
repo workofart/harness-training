@@ -31,6 +31,7 @@ from src.control.supervisor_state import (
     repo_fingerprint,
 )
 from src.experiment.record import (
+    ExperimentAbandoned,
     ExperimentRecord,
     ExperimentState,
     failed_experiment_git_ref,
@@ -38,7 +39,6 @@ from src.experiment.record import (
 )
 from src.experiment.runner import ExperimentRunner
 from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
-from src.harness.contracts import TaskResult
 
 DEFAULT_SUPERVISOR_WORKTREE_PARENT = DEFAULT_SUPERVISOR_ROOT
 # The candidate may write harness_config.json, but only these proposal fields
@@ -397,38 +397,6 @@ def _assign_candidate_experiment_id(
     return harness_config.model_copy(update={"experiment_id": experiment_id})
 
 
-def _abandoned_task_result(
-    *,
-    task_name: str,
-    finished_at: str,
-) -> TaskResult:
-    return TaskResult(
-        task_name=task_name,
-        reward=0.0,
-        solved=False,
-        error=ABANDONED_EXPERIMENT_REASON,
-        steps_used=0,
-        started_at=finished_at,
-        finished_at=finished_at,
-    )
-
-
-def _fill_unfinished_trials_with_abandoned(
-    *,
-    record: ExperimentRecord,
-    finished_at: str,
-) -> None:
-    for task_id in record.train_task_results:
-        trials = record._task_trials(task_id)
-        while not trials.is_finished:
-            record.record_task_result(
-                _abandoned_task_result(
-                    task_name=task_id,
-                    finished_at=finished_at,
-                )
-            )
-
-
 def _load_parent_baseline(
     *,
     record: ExperimentRecord,
@@ -459,11 +427,11 @@ def abandon_unfinished_candidate(
             "unfinished candidate cleanup requires a non-concluded current candidate"
         )
 
-    finished_at = datetime.now(timezone.utc).isoformat()
-    _fill_unfinished_trials_with_abandoned(record=record, finished_at=finished_at)
-    record.finalize(status="crash", error=ABANDONED_EXPERIMENT_REASON)
-    record.refresh_evidence(baseline=snapshot.active_baseline_record)
-    record.write(root=snapshot.experiments_root)
+    record.finalize_crash(
+        exc=ExperimentAbandoned(ABANDONED_EXPERIMENT_REASON),
+        baseline=snapshot.active_baseline_record,
+        root=snapshot.experiments_root,
+    )
 
     state = snapshot.experiment_state
     state.current_experiment_id = record.experiment_id
@@ -666,18 +634,14 @@ def recover_interrupted_launch(
     if record_path.exists():
         record = ExperimentRecord.load(experiment_id, root=snapshot.experiments_root)
         if not record.is_concluded():
-            finished_at = datetime.now(timezone.utc).isoformat()
-            _fill_unfinished_trials_with_abandoned(
-                record=record, finished_at=finished_at
-            )
-            record.finalize(status="crash", error=ABANDONED_EXPERIMENT_REASON)
-            record.refresh_evidence(
+            record.finalize_crash(
+                exc=ExperimentAbandoned(ABANDONED_EXPERIMENT_REASON),
                 baseline=_load_parent_baseline(
                     record=record,
                     experiments_root=snapshot.experiments_root,
-                )
+                ),
+                root=snapshot.experiments_root,
             )
-            record.write(root=snapshot.experiments_root)
         state = snapshot.experiment_state
         if record.status == "keep":
             state.active_baseline_experiment_id = record.experiment_id

@@ -20,11 +20,18 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
 from src.harness.contracts import TaskResult
-from src.metrics import BaselineComparison, TaskMetrics, is_majority_solved
+from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majority_solved
 
 
 EXPERIMENT_FILENAME = "experiment.json"
 ExperimentStatus = Literal["keep", "discard", "crash"]
+
+
+class ExperimentAbandoned(RuntimeError):
+    """A run was stopped by the outer supervisor loop (process restart) rather
+    than failing on its own. Trials filled to conclude such a record classify as
+    `interrupted` -- like a Ctrl-C -- not `crash` (see ``terminal_task_result``).
+    """
 
 
 def failed_experiment_git_ref(experiment_id: str) -> str:
@@ -500,17 +507,27 @@ def raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
 
 def terminal_task_result(*, task_id: str, exc: BaseException) -> TaskResult:
     finished_at = datetime.now(timezone.utc).isoformat()
-    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+    # An interrupt (Ctrl-C, KeyboardInterrupt, or a supervisor-restart abandon)
+    # means the trial was stopped from the outside, not that it failed on its
+    # own -- bucket it as `interrupted`, distinct from a genuine infra `crash`.
+    # Both keep `error` set, so both stay excluded from the gate's valid trials.
+    failure_mode: FailureMode
+    if isinstance(exc, ExperimentAbandoned):
+        error = str(exc) or type(exc).__name__
+        failure_mode = "interrupted"
+    elif isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
         error = "canceled"
+        failure_mode = "interrupted"
     else:
         error = str(exc) or type(exc).__name__
+        failure_mode = "crash"
     return TaskResult(
         task_name=task_id,
         reward=0.0,
         solved=False,
         error=error,
         steps_used=0,
-        metrics=TaskMetrics(failure_mode="crash"),
+        metrics=TaskMetrics(failure_mode=failure_mode),
         started_at=finished_at,
         finished_at=finished_at,
     )
