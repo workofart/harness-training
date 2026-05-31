@@ -96,7 +96,7 @@ class TaskResult(BaseModel):
 
     task_name: str
     reward: float | None = None
-    solved: bool = False
+    solved: bool
     error: str | None = None
     steps_used: int = 0
     trial_dir: str | None = None

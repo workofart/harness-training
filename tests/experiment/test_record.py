@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from src.experiment.gate import build_gate_verdicts
 from src.experiment.record import (
@@ -91,6 +93,48 @@ def test_experiment_record_load_reads_panel_schema(tmp_path):
     assert record.train_task_ids == ["train-a", "train-b"]
     assert record.train_solved_count == 1
     assert sorted(record.train_task_results) == ["train-a", "train-b"]
+
+
+def test_load_fails_fast_on_missing_decision_bearing_fields():
+    # Fields that drive a decision -- a trial's `solved` (scoring), the trial
+    # budget and `trials` list (completion/majority), and the `evidence` block
+    # (gate/diagnosis) -- must be present on load. A corrupt record fails fast
+    # rather than loading as a plausible-but-wrong trial filled from a
+    # constructor default. `metrics` is diagnostic-only and stays optional.
+    record = ExperimentRecord.initialize(
+        experiment_id="exp",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a"],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    record.record_task_result(_task_result(task_name="train-a", reward=1.0))
+    record.finalize(status="keep")
+    record.refresh_evidence(baseline=None)
+    payload = record.model_dump(mode="json")
+    ExperimentRecord.model_validate(payload)  # sanity: a complete record loads
+
+    def without(*path: str | int) -> dict:
+        corrupt = copy.deepcopy(payload)
+        node = corrupt
+        for key in path[:-1]:
+            node = node[key]
+        del node[path[-1]]
+        return corrupt
+
+    trial_path = ("train_task_results", "train-a", "trials", 0)
+    for path in (
+        ("evidence",),
+        ("evidence", "task_outcomes"),
+        ("train_task_results", "train-a", "expected_trial_count"),
+        ("train_task_results", "train-a", "trials"),
+        (*trial_path, "solved"),
+    ):
+        with pytest.raises(ValidationError):
+            ExperimentRecord.model_validate(without(*path))
+
+    # `metrics` is the lone diagnostic-only field: its absence still loads.
+    ExperimentRecord.model_validate(without(*trial_path, "metrics"))
 
 
 def test_experiment_record_updates_train_counts():
@@ -317,7 +361,7 @@ def test_experiment_record_evidence_omits_missing_artifact_paths(tmp_path):
 
 
 def test_task_trials_majority_solved_with_k_trials():
-    trials = TaskTrials(task_name="t", expected_trial_count=3)
+    trials = TaskTrials(task_name="t", expected_trial_count=3, trials=[])
     assert trials.majority_solved is None
     assert trials.is_finished is False
 
@@ -345,7 +389,7 @@ def test_task_trials_majority_solved_with_k_trials():
 
 
 def test_task_trials_unfinished_trials_do_not_block_completion_after_padding():
-    trials = TaskTrials(task_name="t", expected_trial_count=1)
+    trials = TaskTrials(task_name="t", expected_trial_count=1, trials=[])
     in_progress = TaskResult(
         task_name="t",
         reward=None,
@@ -390,7 +434,7 @@ def test_task_trials_is_deterministic_solved_predicate():
             finished_at=finished_at,
         )
 
-    empty = TaskTrials(task_name="t", expected_trial_count=3)
+    empty = TaskTrials(task_name="t", expected_trial_count=3, trials=[])
     assert empty.is_deterministic_solved is False
 
     one_pass = TaskTrials(

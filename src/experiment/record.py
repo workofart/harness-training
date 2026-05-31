@@ -18,7 +18,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from src.harness.contracts import TaskResult
 from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majority_solved
@@ -58,8 +58,8 @@ class TaskTrials(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_name: str
-    expected_trial_count: int = 1
-    trials: list[TaskResult] = Field(default_factory=list)
+    expected_trial_count: int
+    trials: list[TaskResult]
 
     @property
     def trial_count(self) -> int:
@@ -232,7 +232,7 @@ class ExperimentEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     candidate_change: CandidateChangeEvidence
-    task_outcomes: list[TaskOutcomeEvidence] = Field(default_factory=list)
+    task_outcomes: list[TaskOutcomeEvidence]
 
     @classmethod
     def empty(cls, *, record: "ExperimentRecord") -> "ExperimentEvidence":
@@ -240,7 +240,8 @@ class ExperimentEvidence(BaseModel):
             candidate_change=CandidateChangeEvidence(
                 commit=record.git_commit_hash,
                 parent_baseline_experiment_id=record.parent_baseline_experiment_id,
-            )
+            ),
+            task_outcomes=[],
         )
 
 
@@ -259,7 +260,7 @@ class ExperimentRecord(BaseModel):
     started_at: str
     finished_at: str | None
     train_task_results: dict[str, TaskTrials]
-    evidence: ExperimentEvidence | None = None
+    evidence: ExperimentEvidence | None
 
     @classmethod
     def path(cls, experiment_id: str, *, root: Path) -> Path:
