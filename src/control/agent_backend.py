@@ -94,6 +94,7 @@ def role_label(role: str, *, enabled: bool) -> str:
         "codex": "1;34",
         "claude": "1;36",
         "agent": "1;32",
+        "toolcall": "1;33",
         "codex stderr": "1;31",
         "claude stderr": "1;31",
     }
@@ -154,12 +155,12 @@ def print_terminal_lines(lines: list[str], *, use_stderr: bool) -> None:
         print(line, file=stream, flush=True)
 
 
-def _format_agent_message(text: str, *, enabled: bool) -> list[str]:
+def _format_agent_message(text: str, *, role: str, enabled: bool) -> list[str]:
     stripped = text.strip()
     if not stripped:
         return []
     lines = stripped.splitlines()
-    rendered = [f"{role_label('agent', enabled=enabled)} {lines[0].strip()}"]
+    rendered = [f"{role_label(role, enabled=enabled)} {lines[0].strip()}"]
     rendered.extend(f"  {line.rstrip()}" for line in lines[1:])
     return rendered
 
@@ -442,7 +443,7 @@ class CodexBackend:
             case ("item.completed", "agent_message"):
                 text = item.get("text")
                 if isinstance(text, str) and text.strip():
-                    return _format_agent_message(text, enabled=enabled)
+                    return _format_agent_message(text, role="codex", enabled=enabled)
                 return None
             case (_, "command_execution"):
                 cmd = item.get("command")
@@ -465,7 +466,7 @@ class CodexBackend:
                 }:
                     line_parts.append(status)
                 return [
-                    f"  {format_line('codex', ' '.join(line_parts), enabled=enabled)}"
+                    f"  {format_line('toolcall', ' '.join(line_parts), enabled=enabled)}"
                 ]
             case (_, "file_change"):
                 action = "edit>" if event_type == "item.started" else "edit+"
@@ -479,10 +480,10 @@ class CodexBackend:
                     ]
                     if paths:
                         return [
-                            f"  {format_line('codex', f'{_action_label(action, enabled=enabled)} {compact_paths(paths)}', enabled=enabled)}"
+                            f"  {format_line('toolcall', f'{_action_label(action, enabled=enabled)} {compact_paths(paths)}', enabled=enabled)}"
                         ]
                 return [
-                    f"  {format_line('codex', _action_label(action, enabled=enabled), enabled=enabled)}"
+                    f"  {format_line('toolcall', _action_label(action, enabled=enabled), enabled=enabled)}"
                 ]
             case _:
                 return None
@@ -607,7 +608,9 @@ class ClaudeBackend:
                         if block.get("type") == "text":
                             text = block.get("text")
                             if isinstance(text, str) and text.strip():
-                                return _format_agent_message(text, enabled=enabled)
+                                return _format_agent_message(
+                                    text, role="claude", enabled=enabled
+                                )
                         if block.get("type") == "tool_use":
                             tool_name = block.get("name", "")
                             tool_input = block.get("input", {})
@@ -622,7 +625,7 @@ class ClaudeBackend:
                             elif _fallback:
                                 label = f"{label} {_fallback}"
                             return [
-                                f"  {format_line('claude', label, enabled=enabled)}"
+                                f"  {format_line('toolcall', label, enabled=enabled)}"
                             ]
             return None
 

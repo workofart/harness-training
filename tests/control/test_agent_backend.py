@@ -174,7 +174,7 @@ def test_run_codex_turn_relinks_stale_supervisor_codex_home_entries(
     assert result.thread_id == "thread-1"
 
 
-def test_run_codex_turn_prints_codex_logs_to_terminal(
+def test_run_codex_turn_prints_agent_and_toolcall_logs_to_terminal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -191,6 +191,7 @@ def test_run_codex_turn_prints_codex_logs_to_terminal(
             self.stdout = FakeStream(
                 [
                     '{"type":"thread.started","thread_id":"thread-1"}\n',
+                    '{"type":"item.started","item":{"type":"command_execution","command":"echo hello"}}\n',
                     '{"type":"item.completed","item":{"type":"agent_message","text":"done now"}}\n',
                 ]
             )
@@ -217,10 +218,60 @@ def test_run_codex_turn_prints_codex_logs_to_terminal(
     captured = capsys.readouterr()
     assert result.thread_id == "thread-1"
     assert "[codex]" in captured.out
-    assert "[agent]" in captured.out
+    assert "[toolcall] cmd> echo hello" in captured.out
+    assert "[codex] done now" in captured.out
+    assert "[agent]" not in captured.out
     assert "done now" in captured.out
     assert "[codex stderr]" in captured.err
     assert "stderr line" in captured.err
+
+
+def test_run_claude_turn_prints_agent_and_toolcall_logs_to_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import src.control.agent_backend as agent_backend_mod
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    settings_path = tmp_path / "claude-settings.json"
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = FakeStream(
+                [
+                    '{"type":"system","subtype":"init","session_id":"session-1"}\n',
+                    '{"type":"assistant","message":{"content":[{"type":"text","text":"thinking now"}]}}\n',
+                    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pwd"}}]}}\n',
+                    '{"type":"result","subtype":"success","session_id":"session-1"}\n',
+                ]
+            )
+            self.stderr = FakeStream([])
+            self.returncode = 0
+
+        def wait(self) -> int:
+            return self.returncode
+
+    def fake_popen(command, *, stdout, stderr, text, cwd, env):
+        assert stdout == subprocess.PIPE
+        assert stderr == subprocess.PIPE
+        assert text is True
+        return FakeProcess()
+
+    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+
+    backend = ClaudeBackend(binary="claude", settings_path=settings_path)
+    result = backend.run_turn(
+        prompt="hello",
+        repo_root=repo_root,
+    )
+
+    captured = capsys.readouterr()
+    assert result.thread_id == "session-1"
+    assert "[claude] thinking now" in captured.out
+    assert "[toolcall] cmd> pwd" in captured.out
+    assert "[agent]" not in captured.out
 
 
 def test_run_codex_turn_reports_missing_resume_thread(
