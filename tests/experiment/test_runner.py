@@ -14,6 +14,7 @@ import src.experiment.runner as runner
 from src.experiment.record import (
     ExperimentRecord,
     ExperimentState,
+    TaskTrials,
     failed_experiment_git_ref,
 )
 from src.harness.contracts import TaskResult
@@ -275,6 +276,88 @@ def test_next_trial_admission_count(solved, finished, expected_total, admission_
     )
 
 
+def _budget_trials(*, expected, solved=0, failed=0, crashed=0):
+    # A TaskTrials with `solved`+`failed` valid (error-free) trials and `crashed`
+    # infra-error trials. Crashes count toward finished_trials (the budget) but
+    # are excluded from valid_trials/solved_count.
+    trials = TaskTrials(task_name="t", expected_trial_count=expected, trials=[])
+    for _ in range(solved):
+        trials.append(_task_result(task_name="t", reward=1.0))
+    for _ in range(failed):
+        trials.append(_task_result(task_name="t", reward=0.0))
+    for _ in range(crashed):
+        trials.append(_task_result(task_name="t", reward=0.0, error="boom"))
+    return trials
+
+
+def test_wants_confirmation_expand_only_for_failed_single_deterministic_trial():
+    # The single confirm-on-fail predicate that both the admission loop (which
+    # commits the expand) and the priority gate (which reads it speculatively)
+    # consult. True iff a single-trial deterministic budget produced exactly one
+    # valid failure and the full count exceeds one.
+    one_fail = _budget_trials(expected=1, failed=1)
+    assert runner._wants_confirmation_expand(one_fail, full_trial_count=3) is True
+    # Nothing to expand to when the full count is one.
+    assert runner._wants_confirmation_expand(one_fail, full_trial_count=1) is False
+    # A passing single trial is deterministic-solved, not a regression.
+    assert (
+        runner._wants_confirmation_expand(
+            _budget_trials(expected=1, solved=1), full_trial_count=3
+        )
+        is False
+    )
+    # An already-expanded budget (expected != 1) is no longer the single case.
+    assert (
+        runner._wants_confirmation_expand(
+            _budget_trials(expected=3, failed=1), full_trial_count=3
+        )
+        is False
+    )
+    # A crash is not a valid trial: one crash is not one valid failure.
+    assert (
+        runner._wants_confirmation_expand(
+            _budget_trials(expected=1, crashed=1), full_trial_count=3
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected", "solved", "failed", "crashed", "want"),
+    [
+        # Fresh task: the majority-threshold rule sets the initial admission.
+        (5, 0, 0, 0, 3),
+        # Crashes consume the budget: remaining caps admission below the
+        # threshold count, which is itself blind to crashes.
+        (5, 0, 0, 4, 1),
+        # Budget fully consumed by a crash -> nothing left to admit.
+        (1, 0, 0, 1, 0),
+        # Majority already decided -> threshold rule yields zero.
+        (3, 2, 0, 0, 0),
+    ],
+)
+def test_planned_admission_count(expected, solved, failed, crashed, want):
+    # The shared admission arithmetic: remaining budget capped by the
+    # majority-threshold rule, consulted by both the loop and the priority gate.
+    trials = _budget_trials(
+        expected=expected, solved=solved, failed=failed, crashed=crashed
+    )
+    assert runner._planned_admission_count(trials, full_trial_count=expected) == want
+
+
+def test_planned_admission_count_honors_pending_confirmation_expand():
+    # A failed single deterministic trial budgets toward the full count (the
+    # expand the loop is about to commit), not the committed expected_trial_count
+    # of 1. This is the _effective_expected_count seam: the caller passes only
+    # config (full_trial_count), never a speculative override of the object's
+    # count. The 1-vs-0 contrast is the whole point -- honoring the pending
+    # expand admits one more (threshold-paced) trial; ignoring it admits none
+    # because the committed single-trial budget is already spent.
+    trials = _budget_trials(expected=1, failed=1)
+    assert runner._planned_admission_count(trials, full_trial_count=3) == 1
+    assert runner._planned_admission_count(trials, full_trial_count=1) == 0
+
+
 def test_run_panel_early_stops_after_majority_decided_when_trials_agree(
     monkeypatch, tmp_path
 ):
@@ -373,6 +456,101 @@ def test_run_panel_admits_only_majority_threshold_trials_initially(
     assert trials.trial_count == 3
     assert trials.expected_trial_count == 3
     assert trials.majority_solved is True
+
+
+def test_run_panel_prioritizes_late_admissions_over_lower_priority_waiters(
+    monkeypatch, tmp_path
+):
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-priority-admission",
+        focus_name="focus",
+        train_task_names=["high", "low"],
+        task_trials=5,
+        max_trial_concurrency=1,
+        task_dirs=["high", "low"],
+    )
+    stub_trial_factories(monkeypatch, experiment_runner)
+
+    call_log: list[str] = []
+    high_outcomes = iter([True, False, False, False])
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        await asyncio.sleep(0)
+        call_log.append(task_name)
+        solved = next(high_outcomes) if task_name == "high" else True
+        return _panel_trial_result(task_name, solved=solved, index=len(call_log))
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+
+    _run_panel_for_experiment_runner(runner, experiment_runner, ["high", "low"])
+
+    assert call_log[:4] == ["high", "high", "high", "high"]
+    high_trials = experiment_runner.record._task_trials("high")
+    assert high_trials.trial_count == 4
+    assert high_trials.majority_solved is False
+
+
+def test_run_panel_grants_low_priority_waiter_after_higher_priority_result_persists(
+    monkeypatch, tmp_path
+):
+    # Regression for the early-release overlap. run_task hands the slot back
+    # (slot_release) *before* its result is persisted, so the grant pass that
+    # the release schedules evaluates the not-yet-updated record: "high" still
+    # looks like it wants a slot, the gate reserves it and parks "low", and the
+    # record is only updated afterwards in persist_task_result. Unless the gate
+    # is signaled after that update, "low" is never granted. capacity=1 +
+    # task_trials=1 makes "high" finishing the last gate event before the stall,
+    # so there is no later acquire/release to mask the missed wakeup -- the
+    # panel deadlocks, which wait_for surfaces as a failure.
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-priority-wakeup",
+        focus_name="focus",
+        train_task_names=["high", "low"],
+        task_trials=1,
+        max_trial_concurrency=1,
+        task_dirs=["high", "low"],
+    )
+    stub_trial_factories(monkeypatch, experiment_runner)
+
+    call_log: list[str] = []
+
+    async def fake_run_task(*, task_name, slot_release=None, **_kwargs):
+        call_log.append(task_name)
+        # Mirror run_task's overlap: free the slot, then suspend (the docker
+        # teardown await) before returning, so the release-scheduled grant pass
+        # runs against the record before persist_task_result records this trial.
+        if slot_release is not None:
+            slot_release()
+        await asyncio.sleep(0)
+        return _panel_trial_result(task_name, solved=True, index=len(call_log))
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+
+    async def go():
+        await asyncio.wait_for(
+            runner._run_panel(
+                record=experiment_runner.record,
+                experiments_root=experiment_runner.experiments_root,
+                task_names=["high", "low"],
+                task_dirs=experiment_runner._task_dirs,
+                harness_config=experiment_runner.harness_config,
+                make_llm=experiment_runner._make_llm,
+                make_env=experiment_runner._make_env,
+            ),
+            timeout=2,
+        )
+
+    asyncio.run(go())
+
+    assert call_log == ["high", "low"]
+    for task_id in ("high", "low"):
+        trials = experiment_runner.record._task_trials(task_id)
+        assert trials.trial_count == 1
+        assert trials.majority_solved is True
 
 
 def test_run_panel_calls_run_task_with_current_contract(monkeypatch, tmp_path):
@@ -733,6 +911,50 @@ def test_run_experiment_launches_deterministic_confirmations_in_one_wave(
     trials = experiment_runner.record._task_trials("train-det")
     assert started == 5
     assert trials.majority_solved is True
+
+
+def test_run_experiment_prioritizes_late_confirmations_by_duration_prior(
+    monkeypatch, tmp_path
+):
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-confirm-priority",
+        focus_name="focus",
+        train_task_names=["short", "long"],
+        task_trials=3,
+        max_trial_concurrency=1,
+        task_dirs=["short", "long"],
+    )
+    stub_trial_factories(monkeypatch, experiment_runner)
+    monkeypatch.setattr(
+        runner, "_load_task_duration_priors", lambda: {"long": 100.0, "short": 1.0}
+    )
+
+    baseline = ExperimentRecord.initialize(
+        experiment_id="baseline",
+        git_commit_hash="bca",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["short", "long"],
+        started_at="2026-04-10T00:00:00+00:00",
+        expected_trial_count=3,
+    )
+    for task_id in ("short", "long"):
+        for _ in range(3):
+            baseline.record_task_result(_task_result(task_name=task_id, reward=1.0))
+
+    call_log: list[str] = []
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        call_log.append(task_name)
+        return _panel_trial_result(task_name, solved=False, index=len(call_log))
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+    monkeypatch.setattr(experiment_runner, "_conclude_experiment", lambda: None)
+
+    asyncio.run(experiment_runner._run_experiment(baseline=baseline))
+
+    assert call_log[:2] == ["long", "long"]
 
 
 def test_apply_baseline_derived_trial_counts_skips_non_deterministic(

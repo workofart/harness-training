@@ -9,6 +9,7 @@ statistics in ``gate.py``.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import sys
 import time
@@ -30,6 +31,7 @@ from src.experiment.gate import (
 from src.experiment.record import (
     ExperimentRecord,
     ExperimentState,
+    TaskTrials,
     failed_experiment_git_ref,
     raise_if_no_valid_evidence,
     terminal_task_result,
@@ -95,6 +97,84 @@ def _schedule_order(
 PROGRESS_BAR_WIDTH = 24
 
 
+class _PriorityTrialGate:
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        priority_by_task: Mapping[str, int],
+        record: ExperimentRecord,
+        full_trial_count: int,
+    ) -> None:
+        self._available = capacity
+        self._priority_by_task = priority_by_task
+        self._task_by_priority = {
+            priority: task_id for task_id, priority in priority_by_task.items()
+        }
+        self._record = record
+        self._full_trial_count = full_trial_count
+        self._next_sequence = 0
+        self._admitted_by_task = {task_id: 0 for task_id in priority_by_task}
+        self._waiters: list[tuple[int, int, str, asyncio.Future[None]]] = []
+        self._grant_scheduled = False
+
+    async def acquire(self, task_id: str) -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._admitted_by_task[task_id] += 1
+        heapq.heappush(
+            self._waiters,
+            (self._priority_by_task[task_id], self._next_sequence, task_id, future),
+        )
+        self._next_sequence += 1
+        self._schedule_grant()
+        try:
+            await future
+        except BaseException:
+            if future.done() and not future.cancelled():
+                self.release(task_id)
+            else:
+                future.cancel()
+                self._admitted_by_task[task_id] -= 1
+                self._schedule_grant()
+            raise
+
+    def release(self, task_id: str) -> None:
+        self._admitted_by_task[task_id] -= 1
+        self._available += 1
+        self._schedule_grant()
+
+    def _schedule_grant(self) -> None:
+        if self._grant_scheduled:
+            return
+        self._grant_scheduled = True
+        asyncio.get_running_loop().call_soon(self._grant_waiters)
+
+    def _grant_waiters(self) -> None:
+        self._grant_scheduled = False
+        while self._available > 0 and self._waiters:
+            priority, _, _, future = self._waiters[0]
+            if future.done():
+                heapq.heappop(self._waiters)
+                continue
+            if self._has_unmet_higher_priority_admission(priority):
+                break
+            heapq.heappop(self._waiters)
+            self._available -= 1
+            future.set_result(None)
+
+    def _has_unmet_higher_priority_admission(self, priority: int) -> bool:
+        for higher_priority in range(priority):
+            task_id = self._task_by_priority[higher_priority]
+            trials = self._record._task_trials(task_id)
+            desired = _planned_admission_count(
+                trials, full_trial_count=self._full_trial_count
+            )
+            if desired > self._admitted_by_task[task_id]:
+                return True
+        return False
+
+
 def _next_trial_admission_count(
     *,
     solved: int,
@@ -111,6 +191,66 @@ def _next_trial_admission_count(
         expected_total - finished,
         final_threshold - solved,
         final_threshold - failed,
+    )
+
+
+def _wants_confirmation_expand(
+    trials: TaskTrials,
+    *,
+    full_trial_count: int,
+) -> bool:
+    # A task on the single-trial deterministic budget whose one trial just
+    # failed: expand back to the full trial count to confirm the suspected
+    # regression. Single definition of the rule -- the admission loop commits
+    # the expand to the record, the priority gate reads it speculatively to
+    # decide whether a higher-priority task still wants a slot. One copy keeps
+    # the two consumers from drifting apart.
+    return (
+        trials.expected_trial_count == 1
+        and full_trial_count > 1
+        and trials.solved_count == 0
+        and len(trials.valid_trials) == 1
+    )
+
+
+def _effective_expected_count(
+    trials: TaskTrials,
+    *,
+    full_trial_count: int,
+) -> int:
+    # The budget a task is actually working toward: its committed
+    # expected_trial_count, or full_trial_count when a failed single
+    # deterministic trial is pending a confirmation expand the admission loop
+    # has not committed yet. Folding the pending expand into one rule lets every
+    # caller pass only config (full_trial_count) -- no caller has to override
+    # the object's own count with a speculative total.
+    if _wants_confirmation_expand(trials, full_trial_count=full_trial_count):
+        return full_trial_count
+    return trials.expected_trial_count
+
+
+def _planned_admission_count(
+    trials: TaskTrials,
+    *,
+    full_trial_count: int,
+) -> int:
+    # How many trials to admit toward the effective budget right now: the
+    # remaining budget, capped by the majority-threshold rule. Shared by the
+    # admission loop and the priority gate so the admission arithmetic lives in
+    # one place.
+    expected_total = _effective_expected_count(
+        trials, full_trial_count=full_trial_count
+    )
+    remaining = expected_total - len(trials.finished_trials)
+    if remaining <= 0:
+        return 0
+    return min(
+        remaining,
+        _next_trial_admission_count(
+            solved=trials.solved_count,
+            finished=len(trials.valid_trials),
+            expected_total=expected_total,
+        ),
     )
 
 
@@ -233,7 +373,12 @@ async def _run_panel(
     make_llm: Callable[[], Any],
     make_env: Callable[..., Any],
 ) -> None:
-    semaphore = asyncio.Semaphore(harness_config.max_trial_concurrency)
+    trial_gate = _PriorityTrialGate(
+        capacity=harness_config.max_trial_concurrency,
+        priority_by_task={task_id: index for index, task_id in enumerate(task_names)},
+        record=record,
+        full_trial_count=harness_config.task_trials,
+    )
     heavy_action_semaphore = asyncio.Semaphore(
         harness_config.max_heavy_action_concurrency
     )
@@ -242,9 +387,20 @@ async def _run_panel(
         max_trial_concurrency=harness_config.max_trial_concurrency,
     )
 
+    def commit_record_change() -> None:
+        # Persist the record and re-run gate admission together. The gate
+        # reserves slots for higher-priority tasks from their record state
+        # (finished/expected counts), and no capacity event is guaranteed to
+        # follow a record change -- so every in-panel mutation (a trial result,
+        # an expected-count change) must re-run admission via _schedule_grant,
+        # else a waiter unblocked purely by the change is never woken. One door
+        # so a new mutation site can't write the record but forget the gate.
+        record.write(root=experiments_root)
+        trial_gate._schedule_grant()
+
     def persist_task_result(task_result: TaskResult) -> None:
         record.record_task_result(task_result)
-        record.write(root=experiments_root)
+        commit_record_change()
         reporter.render(record)
 
     async def run_one_trial(task_id: str) -> None:
@@ -253,14 +409,14 @@ async def _run_panel(
         # — letting the next trial start while this one tears down. `release_slot`
         # is idempotent; the `finally` is the safety net for paths that never
         # reach run_task's own release (e.g. the task_dir KeyError below).
-        await semaphore.acquire()
+        await trial_gate.acquire(task_id)
         slot_released = False
 
         def release_slot() -> None:
             nonlocal slot_released
             if not slot_released:
                 slot_released = True
-                semaphore.release()
+                trial_gate.release(task_id)
 
         try:
             task_dir = task_dirs[task_id]
@@ -294,20 +450,16 @@ async def _run_panel(
         admit_all_confirmations = False
         while not record._task_trials(task_id).is_finished:
             trials = record._task_trials(task_id)
-            remaining_budget = trials.expected_trial_count - len(trials.finished_trials)
+            expected_total = trials.expected_trial_count
+            remaining_budget = expected_total - len(trials.finished_trials)
             if remaining_budget <= 0:
                 break
             if admit_all_confirmations:
                 admission_count = remaining_budget
                 admit_all_confirmations = False
             else:
-                admission_count = min(
-                    remaining_budget,
-                    _next_trial_admission_count(
-                        solved=trials.solved_count,
-                        finished=len(trials.valid_trials),
-                        expected_total=trials.expected_trial_count,
-                    ),
+                admission_count = _planned_admission_count(
+                    trials, full_trial_count=full_trial_count
                 )
             if admission_count <= 0:
                 break
@@ -323,15 +475,12 @@ async def _run_panel(
                     for finished in done:
                         finished.result()
                     trials = record._task_trials(task_id)
-                    if (
-                        trials.expected_trial_count == 1
-                        and full_trial_count > 1
-                        and trials.solved_count == 0
-                        and len(trials.valid_trials) == 1
+                    if _wants_confirmation_expand(
+                        trials, full_trial_count=full_trial_count
                     ):
                         trials.expected_trial_count = full_trial_count
                         admit_all_confirmations = True
-                        record.write(root=experiments_root)
+                        commit_record_change()
                         break
                     decided = is_majority_decided(
                         solved=trials.solved_count,
@@ -345,7 +494,7 @@ async def _run_panel(
                             await asyncio.gather(*in_flight, return_exceptions=True)
                         in_flight = set()
                         trials.expected_trial_count = len(trials.finished_trials)
-                        record.write(root=experiments_root)
+                        commit_record_change()
             except BaseException:
                 for pending in in_flight:
                     pending.cancel()
