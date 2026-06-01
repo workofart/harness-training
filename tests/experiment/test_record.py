@@ -484,3 +484,56 @@ def test_terminal_task_result_classifies_interrupts_distinct_from_crash():
     for result in (canceled, abandoned, crashed):
         assert result.solved is False
         assert result.error is not None  # error set => excluded from valid_trials
+
+
+def test_finalize_crash_concludes_loaded_partial_panel(tmp_path):
+    # Mirrors the supervisor's cross-process crash cleanup
+    # (abandon_unfinished_candidate / recover_interrupted_launch), which both
+    # `ExperimentRecord.load(...)` a mid-run candidate and then call
+    # `finalize_crash` on that freshly loaded copy. The conclusion must rest
+    # only on the trials that actually ran. Every assertion here is filler-blind
+    # (valid_trials / status / conclusion / evidence presence), so the contract
+    # holds whether finalize fabricates crash placeholders for the unrun task or
+    # leaves it empty -- the regression net for the A-relax refactor.
+    root = tmp_path / "experiments"
+    record = ExperimentRecord.initialize(
+        experiment_id="cand",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["ran", "never-ran"],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    # "ran" produced one real solved trial before the crash; "never-ran" was
+    # never scheduled and has no trials at all.
+    record.record_task_result(_task_result(task_name="ran", reward=1.0))
+    record.write(root=root)
+
+    loaded = ExperimentRecord.load("cand", root=root)
+    loaded.finalize_crash(
+        exc=ExperimentAbandoned("abandoned after supervisor restart"),
+        baseline=None,
+        root=root,
+    )
+
+    # Concludes as a crash with a finish timestamp.
+    assert loaded.status == "crash"
+    assert loaded.finished_at is not None
+    assert loaded.is_concluded() is True
+
+    # The one real trial is preserved; the unrun task yields no valid evidence
+    # (true whether it stays empty or is crash-filled).
+    assert [t.solved for t in loaded.train_task_results["ran"].valid_trials] == [True]
+    assert loaded.train_task_results["never-ran"].valid_trials == []
+
+    # Evidence is populated and the gate still scores the single real trial.
+    assert loaded.evidence is not None
+    verdicts = build_gate_verdicts(
+        candidate=loaded, pool={"ran": (0, 0), "never-ran": (0, 0)}
+    )
+    assert verdicts["ran"].candidate_solved == 1
+    assert verdicts["ran"].candidate_total == 1
+
+    # The conclusion is durable on disk.
+    reloaded = ExperimentRecord.load("cand", root=root)
+    assert reloaded.status == "crash"
+    assert reloaded.is_concluded() is True
