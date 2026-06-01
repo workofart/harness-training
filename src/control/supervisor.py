@@ -50,11 +50,13 @@ SUPERVISOR_VISIBLE_TRACKED_PATHS = (
     "pyproject.toml",
     "uv.lock",
     "src/__init__.py",
+    "src/serialization.py",
     "src/adapters/llm_base.py",
     "src/experiment/trial.py",
     "src/harness/contracts.py",
     "src/trace.py",
     "src/metrics.py",
+    "tests/conftest.py",
     *SUPERVISOR_EDITABLE_PATHS,
 )
 ABANDONED_EXPERIMENT_REASON = "abandoned after supervisor restart"

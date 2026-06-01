@@ -294,6 +294,9 @@ def make_sparse_repo(tmp_path: Path) -> Path:
     (repo_root / "src" / "adapters").mkdir(parents=True)
     (repo_root / "tests" / "harness").mkdir(parents=True)
     (repo_root / "src" / "__init__.py").write_text("")
+    (repo_root / "src" / "serialization.py").write_text(
+        "def json_safe(value):\n    return value\n"
+    )
     (repo_root / "program.md").write_text("# program\n")
     (repo_root / "pyproject.toml").write_text("[project]\nname='research'\n")
     (repo_root / "uv.lock").write_text("version = 1\n")
@@ -309,6 +312,7 @@ def make_sparse_repo(tmp_path: Path) -> Path:
     (repo_root / "tests" / "harness" / "test_core.py").write_text(
         "def test_ok():\n    assert True\n"
     )
+    (repo_root / "tests" / "conftest.py").write_text("# shared fixtures\n")
     (repo_root / "src" / "experiment" / "runner.py").write_text("IGNORED = 1\n")
     (repo_root / "experiments").mkdir()
     (repo_root / "experiments" / "state.json").write_text("{}\n")
@@ -358,7 +362,9 @@ def test_ensure_sparse_workspace_keeps_only_visible_paths_and_experiments(
     assert (workspace_root / "config" / "harness_config.json").exists()
     assert (workspace_root / "src" / "harness" / "contracts.py").exists()
     assert (workspace_root / "src" / "harness" / "core.py").exists()
+    assert (workspace_root / "src" / "serialization.py").exists()
     assert (workspace_root / "src" / "experiment" / "trial.py").exists()
+    assert (workspace_root / "tests" / "conftest.py").exists()
     assert (workspace_root / "tests" / "harness" / "test_core.py").exists()
     assert (workspace_root / "experiments").is_symlink()
     assert not (workspace_root / "src" / "experiment" / "runner.py").exists()
