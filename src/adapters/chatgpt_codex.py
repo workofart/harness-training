@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import os
@@ -30,7 +32,7 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 TOKEN_REFRESH_SKEW_SECONDS = 60
 
-RETRYABLE_STATUS_CODES = frozenset({408, 500, 502, 503, 524, 529})
+RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 524, 529})
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +45,20 @@ class ChatGptCodexUnauthorizedError(ChatGptCodexError):
     pass
 
 
-class ChatGptCodexResponseError(ChatGptCodexError):
-    """A Codex completion returned a non-success HTTP status other than 401."""
-
-    def __init__(self, *, status_code: int, message: str) -> None:
-        super().__init__(f"Codex completion failed: HTTP {status_code}: {message}")
-        self.status_code = status_code
-
-
 def _is_retryable_infra_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.TransportError):
         return True
-    if isinstance(exc, ChatGptCodexResponseError):
-        return exc.status_code in RETRYABLE_STATUS_CODES
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRYABLE_STATUS_CODES
     return False
+
+
+def _codex_retry_delay(retries: int, exc: Exception) -> float:
+    if isinstance(exc, httpx.TransportError):
+        return float(retries)
+    assert isinstance(exc, httpx.HTTPStatusError)
+    retry_after = _parse_retry_after(exc.response.headers.get("Retry-After"))
+    return float(retries) if retry_after is None else retry_after
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +182,7 @@ class ChatGptCodex(BaseLlm):
             lambda: self._complete_with_auth(body=body),
             is_transient=_is_retryable_infra_error,
             on_retry=_log_infra_retry,
+            delay=_codex_retry_delay,
         )
 
     async def _complete_with_auth(self, *, body: dict[str, Any]) -> LlmCompletion:
@@ -220,9 +223,10 @@ class ChatGptCodex(BaseLlm):
                 raise ChatGptCodexUnauthorizedError("Codex backend returned HTTP 401")
             if response.status_code >= 400:
                 text = await _read_response_text(response)
-                raise ChatGptCodexResponseError(
-                    status_code=response.status_code,
-                    message=text,
+                raise httpx.HTTPStatusError(
+                    f"Codex completion failed: HTTP {response.status_code}: {text}",
+                    request=response.request,
+                    response=response,
                 )
             return _completion_from_events(
                 [event async for event in _iter_sse_json(response)]
@@ -354,6 +358,17 @@ def _build_headers(auth: _CodexAuth, *, originator: str) -> dict[str, str]:
 
 def _codex_responses_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/codex/responses"
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if value is None:
+        return None
+    if value.isdecimal():
+        return max(0.0, float(value))
+    retry_at = parsedate_to_datetime(value)
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
 
 async def _iter_sse_json(response: Any):

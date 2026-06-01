@@ -226,9 +226,14 @@ class _Response:
         *,
         status_code: int = 200,
         lines: list[str] | None = None,
+        headers: dict[str, str] | None = None,
     ):
         self.status_code = status_code
         self._lines = lines if lines is not None else _GOOD_SSE_LINES
+        self.headers = headers or {}
+        self.request = httpx.Request(
+            "POST", "https://chatgpt.com/backend-api/codex/responses"
+        )
 
     async def aiter_lines(self):
         for line in self._lines:
@@ -345,6 +350,46 @@ def test_complete_retries_retryable_status_then_succeeds():
     assert client.stream_calls == 2
 
 
+def test_complete_retries_http_429_then_succeeds():
+    client = _SequencedClient(
+        [
+            _Response(status_code=429, lines=['{"detail":"Rate limit exceeded"}']),
+            _Response(),
+        ]
+    )
+    llm = _make_llm(client=client, auth_store=_StaticAuthStore())
+
+    completion = asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert completion.content == "ok"
+    assert client.stream_calls == 2
+
+
+def test_complete_uses_retry_after_header_for_retry_delay(monkeypatch):
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+    client = _SequencedClient(
+        [
+            _Response(
+                status_code=429,
+                lines=['{"detail":"Rate limit exceeded"}'],
+                headers={"Retry-After": "7"},
+            ),
+            _Response(),
+        ]
+    )
+    llm = _make_llm(client=client, auth_store=_StaticAuthStore())
+
+    completion = asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
+
+    assert completion.content == "ok"
+    assert sleeps == [7.0]
+
+
 def test_complete_exhausts_budget_on_persistent_transport_error():
     client = _SequencedClient(
         [httpx.ReadError("eof") for _ in range(INFRA_RETRY_BUDGET + 1)]
@@ -361,10 +406,11 @@ def test_complete_does_not_retry_http_400():
     client = _SequencedClient([_Response(status_code=400, lines=["bad request"])])
     llm = _make_llm(client=client, auth_store=_StaticAuthStore())
 
-    with pytest.raises(chatgpt_codex_module.ChatGptCodexResponseError) as excinfo:
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
         asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))
 
-    assert excinfo.value.status_code == 400
+    assert excinfo.value.response.status_code == 400
+    assert "Codex completion failed: HTTP 400: bad request" in str(excinfo.value)
     assert client.stream_calls == 1
 
 
