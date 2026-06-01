@@ -48,6 +48,61 @@ class SupervisorState(BaseModel):
     launch_experiment_id: str | None = None
     launch_baseline_commit: str | None = None
 
+    # Phase constructors. The model keeps every phase's fields optional so the
+    # persisted shape is one flat object, but each phase only carries a disjoint
+    # subset as meaningful. These factories make that subset *required* at the
+    # call site, so a phase can never be saved with a field it needs silently
+    # dropped to the default. (A dropped `postrun_completed_experiment_id` on a
+    # prelaunch save is what let postrun re-fire 69× on one concluded record.)
+    @classmethod
+    def prelaunch(
+        cls,
+        *,
+        thread_id: str | None,
+        updated_at: str,
+        postrun_completed_experiment_id: str | None,
+    ) -> "SupervisorState":
+        return cls(
+            phase="prelaunch",
+            thread_id=thread_id,
+            updated_at=updated_at,
+            postrun_completed_experiment_id=postrun_completed_experiment_id,
+        )
+
+    @classmethod
+    def launch(
+        cls,
+        *,
+        thread_id: str | None,
+        updated_at: str,
+        launch_experiment_id: str,
+        launch_baseline_commit: str,
+    ) -> "SupervisorState":
+        return cls(
+            phase="launch",
+            thread_id=thread_id,
+            updated_at=updated_at,
+            launch_experiment_id=launch_experiment_id,
+            launch_baseline_commit=launch_baseline_commit,
+        )
+
+    @classmethod
+    def postrun(
+        cls,
+        *,
+        thread_id: str | None,
+        updated_at: str,
+        postrun_original_payload: dict[str, object] | None,
+        postrun_original_learning: str | None,
+    ) -> "SupervisorState":
+        return cls(
+            phase="postrun",
+            thread_id=thread_id,
+            updated_at=updated_at,
+            postrun_original_payload=postrun_original_payload,
+            postrun_original_learning=postrun_original_learning,
+        )
+
     @classmethod
     def path(
         cls,

@@ -515,13 +515,10 @@ def _recover_interrupted_postrun_state(
                 )
             except RuntimeError:
                 return saved_state, experiment_record
-            completed_state = saved_state.model_copy(
-                update={
-                    "phase": "prelaunch",
-                    "postrun_original_payload": None,
-                    "postrun_original_learning": None,
-                    "postrun_completed_experiment_id": experiment_record.experiment_id,
-                }
+            completed_state = SupervisorState.prelaunch(
+                thread_id=saved_state.thread_id,
+                updated_at=saved_state.updated_at,
+                postrun_completed_experiment_id=experiment_record.experiment_id,
             )
             completed_state.save(repo_root=repo_root, root=supervisor_root)
             return completed_state, experiment_record
@@ -568,8 +565,7 @@ def complete_postrun_diagnosis(
     supervisor_root: Path = DEFAULT_SUPERVISOR_ROOT,
     backend: AgentBackend | None = None,
 ) -> str:
-    SupervisorState(
-        phase="postrun",
+    SupervisorState.postrun(
         thread_id=thread_id,
         updated_at=datetime.now(timezone.utc).isoformat(),
         postrun_original_payload=original_payload,
@@ -596,8 +592,7 @@ def complete_postrun_diagnosis(
         commit_hash=control_repo.get_head_commit(cwd=repo_root),
     )
     if experiment_record.status in {"discard", "crash"}:
-        SupervisorState(
-            phase="prelaunch",
+        SupervisorState.prelaunch(
             thread_id=diagnosis_thread_id,
             updated_at=datetime.now(timezone.utc).isoformat(),
             postrun_completed_experiment_id=experiment_record.experiment_id,
@@ -649,8 +644,7 @@ def recover_interrupted_launch(
         state.current_experiment_id = record.experiment_id
         state.updated_at = record.finished_at
         state.save(root=snapshot.experiments_root)
-        SupervisorState(
-            phase="postrun",
+        SupervisorState.postrun(
             thread_id=saved_state.thread_id,
             updated_at=datetime.now(timezone.utc).isoformat(),
             postrun_original_payload=json.loads(record_path.read_text()),
@@ -672,10 +666,10 @@ def recover_interrupted_launch(
             workspace_root=workspace_root,
             commit_hash=baseline_commit,
         )
-    SupervisorState(
-        phase="prelaunch",
+    SupervisorState.prelaunch(
         thread_id=saved_state.thread_id,
         updated_at=datetime.now(timezone.utc).isoformat(),
+        postrun_completed_experiment_id=None,
     ).save(repo_root=repo_root, root=supervisor_root)
     append_supervisor_event(
         repo_root=repo_root,
@@ -1164,8 +1158,7 @@ def run_supervisor_loop(
                 evidence_artifact_paths=evidence_artifact_paths,
                 thread_id=prelaunch_thread_id,
                 backend=backend,
-                on_turn_complete=lambda current_thread_id: SupervisorState(
-                    phase="prelaunch",
+                on_turn_complete=lambda current_thread_id: SupervisorState.prelaunch(
                     thread_id=current_thread_id,
                     updated_at=datetime.now(timezone.utc).isoformat(),
                     postrun_completed_experiment_id=prior_postrun_completed,
@@ -1186,8 +1179,7 @@ def run_supervisor_loop(
                 workspace_root=workspace_root,
                 experiment_id=prepared_candidate.experiment_id,
             )
-            SupervisorState(
-                phase="launch",
+            SupervisorState.launch(
                 thread_id=prepared_candidate.thread_id,
                 updated_at=datetime.now(timezone.utc).isoformat(),
                 launch_experiment_id=prepared_candidate.experiment_id,
