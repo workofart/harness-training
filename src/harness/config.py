@@ -9,7 +9,8 @@ DEFAULT_HARNESS_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harness_config.json"
 )
 ReasoningEffort = Literal["none", "low", "medium", "high"]
-ServiceTier = Literal["auto", "default", "flex"]
+OpenRouterServiceTier = Literal["auto", "default", "flex"]
+ChatGptCodexServiceTier = Literal["auto", "default", "flex", "priority"]
 PanelPurpose = Literal["promotion", "regression_veto"]
 PanelRunStatus = Literal["keep", "discard", "crash"]
 
@@ -63,7 +64,7 @@ class OpenRouterConfig(BaseModel):
         default=None,
         description="Optional deterministic sampling seed.",
     )
-    service_tier: ServiceTier | None = Field(
+    service_tier: OpenRouterServiceTier | None = Field(
         default=None,
         description="Provider service tier requested for completions.",
     )
@@ -103,7 +104,7 @@ class ChatGptCodexConfig(BaseModel):
         default="medium",
         description="Responses text verbosity.",
     )
-    service_tier: ServiceTier | None = Field(
+    service_tier: ChatGptCodexServiceTier | None = Field(
         default=None,
         description="Optional Codex backend service tier.",
     )

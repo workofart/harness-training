@@ -143,6 +143,7 @@
     "model_name": "gpt-5.5",
     "max_context_length": 200000,
     "reasoning_effort": "high",
-    "timeout_seconds": 300.0
+    "timeout_seconds": 300.0,
+    "service_tier": "priority"
   }
 }
