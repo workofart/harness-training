@@ -31,7 +31,7 @@ The candidate patch must produce a behavioral change in `src/harness/core.py`.
 Do not change frozen runtime contract fields:
 
 - `experiment_id` (supervisor-owned)
-- `train_task_names` (panel edits trigger a full baseline rerun on the next `uv run auto`)
+- `panels[].task_names` and panel order (changing a panel's task set or order triggers a full baseline rerun on the next `uv run auto`)
 - model/provider config
 - max steps, timeouts, concurrency
 - retry budgets
@@ -45,7 +45,7 @@ Do not edit runner state by hand:
 
 ## Promotion
 
-A candidate is evaluated against the active baseline with per-task two-sided exact binomial tests at alpha = 0.05 against the baseline solve rate.
+A candidate is evaluated against the active baseline with per-task two-sided Fisher exact tests at alpha = 0.05, comparing the candidate's solved/total counts against the baseline's solved/total counts.
 
 1. A per-trial infrastructure failure is retried within the trial on a bounded internal budget. If it still fails, the trial concludes as a terminal `crash`, excluded from all evidence, with no effect on the experiment status or other trials (and it is not re-run). Experiment-level failures still make the experiment `crash`: setup, task resolution, evaluation, or a run that produced zero valid trials across the whole panel. A baseline run that crashes is not promoted; no baseline is installed and the next `uv run auto` reruns it.
 2. If there is no baseline yet, `uv run auto` first runs the current panel as a kept baseline, then starts candidate search.
@@ -55,9 +55,10 @@ There is no mean-reward promotion rule. Family-wise error is intentionally uncon
 
 ## Panel changes
 
-The train panel is fixed by default. If the user edits `train_task_names` and
-commits that change, the next `uv run auto` treats it as a new baseline regime
-and reruns the full current panel before candidate search continues.
+The train panel is fixed by default. If the user edits a panel's `task_names`
+(or changes panel order) and commits that change, the next `uv run auto` treats
+it as a new baseline regime and reruns the full current panel set before
+candidate search continues.
 
 ## Evidence
 
@@ -69,7 +70,7 @@ Use:
 - `agent/metrics.json`
 - `agent/exec.log`
 - verifier stdout captured in task artifacts
-- `experiment.json.evidence.task_outcomes`
+- `experiment.json.evidence.panel_outcomes` (per-panel lists of per-task outcome evidence)
 - local experiment records
 - preserved failed refs
 - repo-local code and git history
