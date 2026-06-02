@@ -106,36 +106,66 @@ class TaskMetrics(BaseModel):
         path.write_text(json.dumps(self.model_dump(mode="json"), indent=2) + "\n")
 
 
-def compute_binomial_p_value(
-    *, observed_solved: int, observed_total: int, p_hat: float
+def compute_fisher_exact_p_value(
+    *,
+    candidate_solved: int,
+    candidate_total: int,
+    baseline_solved: int,
+    baseline_total: int,
 ) -> float:
-    """Two-sided exact binomial p-value for observing `observed_solved`
-    successes in `observed_total` trials under H0: success rate is `p_hat`.
+    """Two-sided Fisher exact p-value for the 2x2 contingency table::
 
-    Returns `2 * min(P(X <= obs), P(X >= obs))`, clamped to [0, 1]. This is
-    the standard "doubling" definition that's symmetric and well-defined for
-    discrete distributions.
+                  solved                       failed
+        candidate candidate_solved             candidate_total - candidate_solved
+        baseline  baseline_solved              baseline_total  - baseline_solved
+
+    Unlike a one-sample binomial against the baseline *rate* (which treats that
+    rate as a known point and so calls a candidate miss against a 3/3 baseline
+    "impossible"), Fisher's exact test conditions on both margins and accounts
+    for sampling uncertainty in BOTH arms. A small high-rate baseline is
+    therefore correctly treated as weak evidence, which removes the
+    small-sample false regressions that discarded solve-positive candidates.
+
+    Two-sided p = sum of the probabilities of every table (with the margins
+    fixed) that is no more likely than the observed one, clamped to [0, 1].
     """
-    if observed_total <= 0:
-        raise ValueError("observed_total must be positive")
-    if observed_solved < 0 or observed_solved > observed_total:
-        raise ValueError("observed_solved must be in [0, observed_total]")
-    if not 0.0 <= p_hat <= 1.0:
-        raise ValueError("p_hat must be in [0, 1]")
+    if candidate_total <= 0:
+        raise ValueError("candidate_total must be positive")
+    if baseline_total <= 0:
+        raise ValueError("baseline_total must be positive")
+    if not 0 <= candidate_solved <= candidate_total:
+        raise ValueError("candidate_solved must be in [0, candidate_total]")
+    if not 0 <= baseline_solved <= baseline_total:
+        raise ValueError("baseline_solved must be in [0, baseline_total]")
 
-    n = observed_total
-    k = observed_solved
+    n = candidate_total + baseline_total
+    row1 = candidate_total  # candidate-arm trials
+    col1 = candidate_solved + baseline_solved  # total solved across both arms
 
-    def _binom_pmf(i: int) -> float:
-        return math.comb(n, i) * (p_hat**i) * ((1.0 - p_hat) ** (n - i))
+    def _table_prob(solved_in_candidate: int) -> float:
+        # Hypergeometric: P(candidate arm holds `solved_in_candidate` of the
+        # `col1` solved trials) with both margins held fixed.
+        return (
+            math.comb(col1, solved_in_candidate)
+            * math.comb(n - col1, row1 - solved_in_candidate)
+            / math.comb(n, row1)
+        )
 
-    p_lower = sum(_binom_pmf(i) for i in range(0, k + 1))
-    p_upper = sum(_binom_pmf(i) for i in range(k, n + 1))
-    return min(1.0, 2.0 * min(p_lower, p_upper))
+    p_observed = _table_prob(candidate_solved)
+    k_min = max(0, row1 - (n - col1))
+    k_max = min(row1, col1)
+    total = sum(
+        prob
+        for k in range(k_min, k_max + 1)
+        if (prob := _table_prob(k)) <= p_observed * (1.0 + 1e-9)
+    )
+    return min(1.0, total)
 
 
-# Per-task two-sided binomial alpha used by the promotion gate. Family-wise
-# error is intentionally uncontrolled.
+# Per-task two-sided alpha used by the promotion gate's Fisher exact test.
+# There is no explicit family-wise-error correction across the panel; the gate
+# instead relies on Fisher exact being strongly conservative at the small
+# per-task trial counts (n~3-5) so chance regressions stay rare per run.
 PROMOTION_P_VALUE_ALPHA = 0.05
 
 
@@ -158,8 +188,8 @@ class BaselineComparison:
       (`baseline_solved == 0`, covering both no-baseline frontier with empty
       baseline and tasks with trial history but no solves yet), the
       significance test is replaced by a majority-solve requirement on
-      the candidate, since a single noisy solve against a point-zero rate
-      would otherwise trigger improvement on any p_hat==0 boundary.
+      the candidate, since a single noisy solve against a never-solved
+      baseline would otherwise read as an improvement on noise alone.
     - "regression": candidate underperformed the baseline at `alpha`.
       Never fires when `baseline_solved == 0` — there is no rate below 0%.
     - "unchanged": neither direction reached significance, or baseline is
@@ -255,9 +285,9 @@ def compare_candidate_against_baseline(
         # Baseline has never solved this task. Covers two related cases:
         #   - baseline_total == 0: no-baseline frontier; no prior trials.
         #   - baseline_total >  0: task with trial history but no solves.
-        # In both, p_hat == 0 makes the exact binomial degenerate and a
-        # single candidate solve would trigger improvement on noise alone.
-        # Require majority-solve instead.
+        # In both, a never-solved baseline cannot be regressed against and a
+        # single candidate solve would otherwise read as improvement on noise
+        # alone. Require a candidate majority-solve instead.
         kind: VerdictKind = (
             "improvement"
             if is_majority_solved(solved=candidate_solved, total=candidate_total)
@@ -274,10 +304,11 @@ def compare_candidate_against_baseline(
 
     baseline_rate = baseline_solved / baseline_total
     candidate_rate = candidate_solved / candidate_total
-    p_value = compute_binomial_p_value(
-        observed_solved=candidate_solved,
-        observed_total=candidate_total,
-        p_hat=baseline_rate,
+    p_value = compute_fisher_exact_p_value(
+        candidate_solved=candidate_solved,
+        candidate_total=candidate_total,
+        baseline_solved=baseline_solved,
+        baseline_total=baseline_total,
     )
     if p_value >= alpha or candidate_rate == baseline_rate:
         kind = "unchanged"

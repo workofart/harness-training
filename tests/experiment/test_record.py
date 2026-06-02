@@ -286,20 +286,24 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
         train_task_ids=["already-solved", "hard-task"],
         started_at="2026-04-10T00:00:00+00:00",
     )
-    baseline.record_task_result(
-        TaskResult(
-            task_name="already-solved",
-            reward=1.0,
-            solved=True,
-            steps_used=1,
-            error=None,
-            trial_dir="/tmp/baseline/already-solved",
-            trace_path="/tmp/baseline/already-solved/agent/steps.jsonl",
-            verifier_stdout_path="/tmp/baseline/already-solved/verifier.txt",
-            started_at="2026-04-10T00:00:00+00:00",
-            finished_at="2026-04-10T00:00:01+00:00",
+    # already-solved is solidly solved by the baseline (4/4); a clear,
+    # well-separated regression (candidate 0/4) is needed for the two-sample
+    # Fisher gate to flag it -- a single-trial dip no longer counts.
+    for _ in range(4):
+        baseline.record_task_result(
+            TaskResult(
+                task_name="already-solved",
+                reward=1.0,
+                solved=True,
+                steps_used=1,
+                error=None,
+                trial_dir="/tmp/baseline/already-solved",
+                trace_path="/tmp/baseline/already-solved/agent/steps.jsonl",
+                verifier_stdout_path="/tmp/baseline/already-solved/verifier.txt",
+                started_at="2026-04-10T00:00:00+00:00",
+                finished_at="2026-04-10T00:00:01+00:00",
+            )
         )
-    )
     baseline.record_task_result(
         TaskResult(
             task_name="hard-task",
@@ -340,6 +344,18 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
             finished_at="2026-04-10T00:00:01+00:00",
         )
     )
+    for _ in range(3):
+        candidate.record_task_result(
+            TaskResult(
+                task_name="already-solved",
+                reward=0.0,
+                solved=False,
+                steps_used=4,
+                error=None,
+                started_at="2026-04-10T00:00:00+00:00",
+                finished_at="2026-04-10T00:00:01+00:00",
+            )
+        )
     hard_task_artifacts = _write_task_artifacts(
         tmp_path / "candidate-artifacts", "hard-task"
     )
@@ -461,9 +477,12 @@ def test_experiment_record_evidence_writes_train_and_test_panel_outcomes():
     candidate.record_task_result(
         _task_result(task_name="train-a", reward=1.0, solved=True)
     )
-    candidate.record_task_result(
-        _task_result(task_name="test-a", reward=0.0, solved=False)
-    )
+    # test-a is a clear regression (candidate 0/4 vs a 4/4 control) so the
+    # two-sample Fisher gate flags it -- a single failed trial no longer does.
+    for _ in range(4):
+        candidate.record_task_result(
+            _task_result(task_name="test-a", reward=0.0, solved=False)
+        )
 
     train_verdicts = build_gate_verdicts(
         candidate=candidate,
@@ -471,7 +490,7 @@ def test_experiment_record_evidence_writes_train_and_test_panel_outcomes():
     )
     test_verdicts = build_gate_verdicts(
         candidate=candidate,
-        pool={"test-a": (1, 1)},
+        pool={"test-a": (4, 4)},
         panel="test",
     )
     candidate.refresh_evidence(

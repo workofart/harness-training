@@ -3,14 +3,12 @@ from __future__ import annotations
 import pytest
 
 from src.experiment.gate import (
-    build_pooled_control_samples,
+    build_baseline_pool,
     build_gate_verdicts,
     decide_panel_from_verdicts,
-    rule_names_from_added_lines,
 )
 from src.experiment.record import ExperimentRecord, PanelRecord, terminal_task_result
 from src.harness.contracts import TaskResult
-from src.metrics import TaskMetrics
 
 
 def test_evidence_outcome_follows_gate_verdict_not_majority_flip(tmp_path):
@@ -142,75 +140,51 @@ def test_single_source_of_truth_gate_and_evidence_agree():
     assert outcomes["wobbly"] == "unchanged_unsolved"
 
 
-def test_evidence_uses_pool_verdict_not_baseline_only_recomputation():
-    # Companion to the multi-kind end-to-end test above: that test happens
-    # to construct `pool` as an exact mirror of the baseline record, so a
-    # future refactor that reverted evidence to compare against the
-    # baseline record directly (same function, different inputs) would
-    # produce identical labels and slip past the assertions. This test
-    # forces the pool to disagree with baseline-only so the false-negative
-    # has nowhere to hide.
-    #
-    # Setup: baseline solved task "X" 1/1. The pool includes 7 additional
-    # rule-untouched failing trials from prior candidates -> pool = 1/8
-    # (12.5% rate). Current candidate fails 0/1.
-    #   pool-based verdict:    candidate 0/1 vs pool 1/8, binomial not
-    #                          significant -> kind="unchanged",
-    #                          outcome="unchanged_unsolved"
-    #   baseline-only verdict: candidate 0/1 vs baseline 1/1, p_hat=1.0,
-    #                          p_value=0 -> kind="regression",
-    #                          outcome="regression"
-    # If evidence silently recomputes from the baseline record, this assertion
-    # flips to "regression" and the test fails.
+def test_build_baseline_pool_counts_only_active_baseline_trials():
+    # The promotion control is the frozen baseline's own valid trials and
+    # nothing else -- no borrowing from other candidates (that borrowing was
+    # the non-stationary, contamination-prone pool we removed). Tasks the
+    # baseline never ran map to (0, 0) = no-baseline frontier.
     baseline = _make_record(
         experiment_id="baseline",
         parent=None,
-        train_ids=["X"],
-        k=1,
+        train_ids=["solid", "frontier"],
+        k=3,
     )
-    _record_solves(baseline, "X", [True])
+    _record_solves(baseline, "solid", [True, True, False])
+    # "frontier" has no baseline trials.
+    pool = build_baseline_pool(
+        active_baseline=baseline,
+        task_ids=("solid", "frontier", "never-ran"),
+    )
+    assert pool == {"solid": (2, 3), "frontier": (0, 0), "never-ran": (0, 0)}
 
+
+def test_baseline_only_small_high_rate_pool_does_not_false_regress():
+    # Decision-level anti-lottery guarantee. Against the fixed baseline a 3/3
+    # task whose candidate dips to 1/4 is NOT a significant regression -- the
+    # two-sample Fisher test treats the tiny baseline as the weak evidence it
+    # is -- so the candidate is not discarded on noise. The old one-sample
+    # binomial (baseline rate as a known point) discarded exactly these.
+    baseline = _make_record(
+        experiment_id="baseline", parent=None, train_ids=["easy"], k=3
+    )
+    _record_solves(baseline, "easy", [True, True, True])  # 3/3
     candidate = _make_record(
-        experiment_id="cand",
-        parent="baseline",
-        train_ids=["X"],
-        k=1,
+        experiment_id="cand", parent="baseline", train_ids=["easy"], k=4
     )
-    _record_solves(candidate, "X", [False])
-
-    # Pool deliberately differs from baseline alone: baseline contributes
-    # 1/1 and seven prior candidates contributed 0/1 each.
-    pool = {"X": (1, 8)}
+    _record_solves(candidate, "easy", [True, False, False, False])  # 1/4
+    pool = build_baseline_pool(active_baseline=baseline, task_ids=("easy",))
 
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
-    assert verdicts["X"].kind == "unchanged"
-    # Sanity-check: had the gate been pointed at baseline alone, the verdict
-    # would have flipped. Keeping this assertion documents the contrast that
-    # the test relies on.
-    baseline_only = build_gate_verdicts(
-        candidate=candidate,
-        pool={"X": (1, 1)},
-    )
-    assert baseline_only["X"].kind == "regression"
-
-    status, reason = decide_panel_from_verdicts(
+    assert verdicts["easy"].kind == "unchanged"
+    status, _ = decide_panel_from_verdicts(
         candidate=candidate,
         verdicts=verdicts,
         panel="train",
         purpose="promotion",
     )
-    assert (status, reason) == (
-        "discard",
-        "no train task improvement reached significance",
-    )
-
-    candidate.finalize(status=status, decision_reason=reason)
-    candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
-
-    outcomes = {
-        outcome.task_id: outcome.outcome for outcome in _train_outcomes(candidate)
-    }
-    assert outcomes["X"] == "unchanged_unsolved"
+    assert status == "discard"  # no improvement, but NOT a regression discard
 
 
 def _make_record(*, experiment_id, parent, train_ids, k):
@@ -256,16 +230,15 @@ def _record_solves(record, task_id, solves):
 
 
 def _pool_from_baseline(baseline) -> dict[str, tuple[int, int]]:
-    """Convert a baseline record's per-task trial counts into the (solved,
-    total) pool dict the gate primitives expect. Tests that used to thread
-    the baseline record directly into evaluate() now thread it through this
-    helper instead."""
+    """Build the gate control from a baseline record via the production
+    `build_baseline_pool`, so these tests exercise the same baseline-only
+    path the runner uses."""
     if baseline is None:
         return {}
-    return {
-        tid: (trials.solved_count, trials.trial_count)
-        for tid, trials in _train_results(baseline).items()
-    }
+    return build_baseline_pool(
+        active_baseline=baseline,
+        task_ids=tuple(_train_results(baseline).keys()),
+    )
 
 
 def _gate(*, candidate, pool) -> tuple[str, str]:
@@ -283,11 +256,11 @@ def _gate(*, candidate, pool) -> tuple[str, str]:
 
 
 def test_majority_solving_candidate_not_flagged_regression_against_degenerate_pool():
-    # Reproduces the exp-gpt-5-5-high-speed-up-0530 discard artifact: an easy
-    # task whose pooled baseline rate is ~1.0 (3/3). The candidate runs one
-    # extra trial and lands 3/4 -- still a majority-solve. The pure binomial
-    # flags 3/4 vs 3/3 as significant (p~=0), but the candidate still SOLVES the
-    # task, so the caller-side floor must downgrade regression -> unchanged.
+    # An easy task whose baseline rate is ~1.0 (3/3); the candidate runs one
+    # extra trial and lands 3/4 -- still a majority-solve. Fisher already does
+    # not flag 3/4 vs 3/3 (small baseline), and even if it did the caller-side
+    # floor downgrades regression -> unchanged for any still-majority-solving
+    # candidate, so this can never read as a regression.
     baseline = _make_record(
         experiment_id="baseline", parent=None, train_ids=["easy"], k=3
     )
@@ -309,18 +282,19 @@ def test_majority_solving_candidate_not_flagged_regression_against_degenerate_po
     assert "regressed" not in reason
 
 
-def test_binomial_regression_preserved_when_candidate_below_majority():
-    # Power check: a candidate that does NOT majority-solve a task the pool
-    # solves robustly still surfaces as a regression. The floor only protects
-    # still-solving candidates, so binomial power is intact for the rest.
+def test_well_separated_regression_is_flagged():
+    # Power check: a clear, well-separated regression is still caught. A task
+    # the baseline solves 5/5 that the candidate fails 0/5 is a significant
+    # Fisher regression (p ~= 0.008). The lottery fix removes false regressions
+    # from small-sample noise (1/4 vs 4/4), NOT genuine large-effect drops.
     baseline = _make_record(
-        experiment_id="baseline", parent=None, train_ids=["easy"], k=4
+        experiment_id="baseline", parent=None, train_ids=["easy"], k=5
     )
-    _record_solves(baseline, "easy", [True] * 4)  # pool 4/4 -> rate 1.0
+    _record_solves(baseline, "easy", [True] * 5)  # pool 5/5 -> rate 1.0
     candidate = _make_record(
-        experiment_id="candidate", parent="baseline", train_ids=["easy"], k=4
+        experiment_id="candidate", parent="baseline", train_ids=["easy"], k=5
     )
-    _record_solves(candidate, "easy", [True] + [False] * 3)  # 1/4 -> below majority
+    _record_solves(candidate, "easy", [False] * 5)  # 0/5 -> clear regression
     pool = _pool_from_baseline(baseline)
 
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
@@ -341,9 +315,10 @@ def test_evaluate_keeps_candidate_with_significant_train_gain_at_k10():
         train_ids=["frontier"],
         k=10,
     )
-    # 1/10 baseline (not 0/10) so the binomial path applies — at p_hat=0
-    # compare_candidate_against_baseline switches to a majority-solve rule,
-    # which 4/10 would not satisfy.
+    # 1/10 baseline (not 0/10) so the Fisher two-sample path applies (the
+    # baseline_solved==0 majority-solve shortcut does not). The candidate needs
+    # a large enough separation to reach significance at these counts: 8/10 vs
+    # 1/10 is a clear Fisher improvement (p ~= 0.006).
     _record_solves(baseline, "frontier", [True] + [False] * 9)
     candidate = _make_record(
         experiment_id="cand",
@@ -351,7 +326,7 @@ def test_evaluate_keeps_candidate_with_significant_train_gain_at_k10():
         train_ids=["frontier"],
         k=10,
     )
-    _record_solves(candidate, "frontier", [True] * 4 + [False] * 6)
+    _record_solves(candidate, "frontier", [True] * 8 + [False] * 2)
 
     status, reason = _gate(candidate=candidate, pool=_pool_from_baseline(baseline))
     assert status == "keep"
@@ -407,7 +382,12 @@ def test_evaluate_discards_without_significant_train_improvement(
     )
 
 
-def test_evaluate_discards_when_baseline_solved_task_loses_majority():
+def test_evaluate_does_not_regress_on_small_sample_majority_loss():
+    # Behavioral change from the lottery fix: a baseline-solved task (3/3) where
+    # the candidate slips to 1/3 is no longer a significant regression -- the
+    # two-sample Fisher test does not reach alpha against a 3-trial baseline.
+    # The candidate is still discarded (no task improved), but NOT vetoed as a
+    # regression, which is what previously discarded solve-positive candidates.
     baseline = _make_record(
         experiment_id="baseline",
         parent=None,
@@ -425,7 +405,7 @@ def test_evaluate_discards_when_baseline_solved_task_loses_majority():
 
     assert _gate(candidate=candidate, pool=_pool_from_baseline(baseline)) == (
         "discard",
-        "train task guard regressed",
+        "no train task improvement reached significance",
     )
 
 
@@ -547,394 +527,6 @@ def test_evaluate_discards_when_no_baseline_task_unsolved():
         "discard",
         "no train task improvement reached significance",
     )
-
-
-def _pool_record(
-    *,
-    experiment_id: str,
-    parent_baseline_id: str | None,
-    train_task_ids: list[str],
-    finished_at: str = "2026-05-10T00:00:00+00:00",
-    status: str = "discard",
-    decision_reason: str = "no train improvement",
-):
-    record = ExperimentRecord.initialize(
-        experiment_id=experiment_id,
-        git_commit_hash="cand-" + experiment_id,
-        parent_baseline_experiment_id=parent_baseline_id,
-        panels=[
-            PanelRecord.initialize(
-                panel_id="train",
-                purpose="promotion",
-                task_ids=train_task_ids,
-                expected_trial_count=1,
-                lifecycle="active",
-            )
-        ],
-        started_at="2026-05-10T00:00:00+00:00",
-    )
-    record.status = status
-    record.decision_reason = decision_reason
-    record.finished_at = finished_at
-    return record
-
-
-def _pool_trial(
-    task_name: str, *, solved: bool, rule_fires: dict[str, int] | None = None
-) -> TaskResult:
-    return TaskResult(
-        task_name=task_name,
-        reward=1.0 if solved else 0.0,
-        solved=solved,
-        error=None,
-        steps_used=1,
-        started_at="2026-05-10T00:00:00+00:00",
-        finished_at="2026-05-10T00:00:01+00:00",
-        metrics=TaskMetrics(rule_fires=dict(rule_fires or {})),
-    )
-
-
-def _populate_pool_trials(record, trials_by_task: dict[str, list[TaskResult]]) -> None:
-    for trials in trials_by_task.values():
-        for trial in trials:
-            record.record_task_result(trial)
-
-
-def test_rule_names_from_added_lines_matches_three_declaration_styles() -> None:
-    added = [
-        'ARGUMENT_NORMALIZERS = (ArgumentRule(name="unwrap_input", order=10, apply=fn),)',
-        'VERIFY_NUDGE_RULE_NAME = "verify_absent_nudge"',
-        '    recorder.metrics.record_rule_fire("direct_literal_rule")',
-    ]
-    assert rule_names_from_added_lines(added) == {
-        "unwrap_input",
-        "verify_absent_nudge",
-        "direct_literal_rule",
-    }
-
-
-def test_rule_names_from_added_lines_handles_pep8_wrapped_constant() -> None:
-    added = [
-        "SYSTEM_PROMPT_PRE_VERIFY_VALIDATION_RULE_NAME = (",
-        '    "system_prompt_pre_verify_validation"',
-        ")",
-    ]
-    assert rule_names_from_added_lines(added) == {
-        "system_prompt_pre_verify_validation",
-    }
-
-
-def test_rule_names_from_added_lines_ignores_plain_string_literals() -> None:
-    added = [
-        '    """docstring describing a feature without a rule name"""',
-        '    return f"trial {task_id}: solved"',
-        "    if final_passed is True:",
-    ]
-    assert rule_names_from_added_lines(added) == set()
-
-
-def _pool_trial_from_spec(task_name: str, spec) -> TaskResult:
-    if isinstance(spec, bool):
-        return _pool_trial(task_name, solved=spec)
-    return TaskResult(
-        task_name=task_name,
-        reward=1.0 if spec["solved"] else 0.0,
-        solved=spec["solved"],
-        error=spec.get("error"),
-        steps_used=spec.get("steps_used", 1),
-        started_at="2026-05-10T00:00:00+00:00",
-        finished_at="2026-05-10T00:00:01+00:00",
-        metrics=TaskMetrics(
-            rule_fires=dict(spec.get("rule_fires") or {}),
-            failure_mode=spec.get("failure_mode"),
-        ),
-    )
-
-
-def _pool_record_from_spec(spec):
-    record = _pool_record(
-        experiment_id=spec["experiment_id"],
-        parent_baseline_id=spec.get("parent_baseline_id"),
-        train_task_ids=spec.get("train_task_ids", ["t"]),
-        status=spec.get("status", "discard"),
-        decision_reason=spec.get("decision_reason", "no train improvement"),
-    )
-    _populate_pool_trials(
-        record,
-        {
-            task_name: [
-                _pool_trial_from_spec(task_name, trial_spec)
-                for trial_spec in trial_specs
-            ]
-            for task_name, trial_specs in spec.get("trials", {}).items()
-        },
-    )
-    return record
-
-
-@pytest.mark.parametrize(
-    "pool_case",
-    [
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {"t": [True, True, False]},
-                },
-                "expected": {"t": (2, 3)},
-            },
-            id="includes-baseline-trials",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {"t": [True]},
-                },
-                "recent": [
-                    {
-                        "experiment_id": "baseline-rerun",
-                        "parent_baseline_id": "baseline",
-                        "status": "keep",
-                        "decision_reason": "baseline rerun",
-                        "trials": {"t": [True, True]},
-                    }
-                ],
-                "rules": {"baseline-rerun": ()},
-                "expected": {"t": (1, 1)},
-            },
-            id="excludes-baseline-bookkeeping",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {"t": [True]},
-                },
-                "recent": [
-                    {
-                        "experiment_id": "cand-1",
-                        "parent_baseline_id": "baseline",
-                        "trials": {
-                            "t": [
-                                {"solved": True, "rule_fires": {"new_rule": 5}},
-                                True,
-                                False,
-                            ]
-                        },
-                    }
-                ],
-                "rules": {"cand-1": ("new_rule",)},
-                "expected": {"t": (2, 3)},
-            },
-            id="excludes-mechanism-touched-trials",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "parent_baseline_id": "prior-baseline",
-                    "status": "keep",
-                    "trials": {"t": [True, False]},
-                },
-                "include_active_baseline_as_recent": True,
-                "rules": {"baseline": ()},
-                "expected": {"t": (1, 2)},
-            },
-            id="does-not-double-count-active-baseline",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {"t": [True]},
-                },
-                "recent": [
-                    {
-                        "experiment_id": "crashed",
-                        "parent_baseline_id": "baseline",
-                        "status": "crash",
-                        "decision_reason": "",
-                        "trials": {"t": [True, True]},
-                    }
-                ],
-                "rules": {"crashed": ()},
-                "expected": {"t": (1, 1)},
-            },
-            id="excludes-crashed-records",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {
-                        "t": [
-                            {"solved": True, "steps_used": 19},
-                            {
-                                "solved": False,
-                                "failure_mode": "hit_timeout",
-                                "steps_used": 13,
-                            },
-                            {
-                                "solved": False,
-                                "error": "environment reset/bootstrap timed out",
-                                "steps_used": 0,
-                            },
-                        ]
-                    },
-                },
-                "expected": {"t": (1, 2)},
-            },
-            id="includes-task-timeouts-excludes-infrastructure-errors",
-        ),
-        pytest.param(
-            {
-                # `run_task` produces `error=""` from bare `RuntimeError()`
-                # (`str(exc)` is the empty string). A truthiness check on
-                # `trial.error` would silently let this slip into the pool.
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {
-                        "t": [
-                            True,
-                            {"solved": False, "error": "", "steps_used": 30},
-                        ]
-                    },
-                },
-                "expected": {"t": (1, 1)},
-            },
-            id="excludes-trial-with-empty-string-error",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {"t": [True]},
-                },
-                "recent": [
-                    {
-                        "experiment_id": "cand",
-                        "parent_baseline_id": "baseline",
-                        "decision_reason": "train regressed",
-                        "trials": {
-                            "t": [
-                                False,
-                                {
-                                    "solved": False,
-                                    "error": "abandoned after supervisor restart",
-                                    "steps_used": 0,
-                                },
-                            ]
-                        },
-                    }
-                ],
-                "rules": {"cand": ()},
-                "expected": {"t": (1, 2)},
-            },
-            id="excludes-trials-with-error-marker",
-        ),
-        pytest.param(
-            {
-                "baseline": {
-                    "experiment_id": "baseline",
-                    "status": "keep",
-                    "decision_reason": "baseline seed",
-                    "trials": {"t": [True]},
-                },
-                "recent": [
-                    {
-                        "experiment_id": "cand-1",
-                        "parent_baseline_id": "baseline",
-                        "trials": {"t": [False]},
-                    }
-                ],
-                "rules": {"cand-1": ()},
-                "task_ids": ["t", "unseen-task"],
-                "expected": {"t": (1, 2), "unseen-task": (0, 0)},
-            },
-            id="handles-missing-task",
-        ),
-    ],
-)
-def test_build_pooled_control_samples_filters_records_and_trials(pool_case):
-    baseline = _pool_record_from_spec(pool_case["baseline"])
-    recent_records = [
-        _pool_record_from_spec(spec) for spec in pool_case.get("recent", [])
-    ]
-    if pool_case.get("include_active_baseline_as_recent"):
-        recent_records.append(baseline)
-
-    pool = build_pooled_control_samples(
-        active_baseline=baseline,
-        recent_candidates=recent_records,
-        candidate_new_rule_names=pool_case.get("rules", {}),
-        task_ids=pool_case.get("task_ids", ["t"]),
-    )
-
-    assert pool == pool_case["expected"]
-
-
-def test_build_pooled_control_samples_skips_recent_record_missing_panel():
-    baseline = ExperimentRecord.initialize(
-        experiment_id="baseline",
-        git_commit_hash="baseline-sha",
-        parent_baseline_experiment_id=None,
-        panels=[
-            PanelRecord.initialize(
-                panel_id="train",
-                purpose="promotion",
-                task_ids=["train-a"],
-                expected_trial_count=1,
-                lifecycle="finished",
-            ),
-            PanelRecord.initialize(
-                panel_id="test",
-                purpose="regression_veto",
-                task_ids=["test-a"],
-                expected_trial_count=1,
-                lifecycle="finished",
-            ),
-        ],
-        started_at="2026-05-10T00:00:00+00:00",
-    )
-    baseline.status = "keep"
-    baseline.decision_reason = "promoted"
-    baseline.finished_at = "2026-05-10T00:10:00+00:00"
-    baseline.record_task_result(_pool_trial("test-a", solved=True))
-    train_only_recent = _pool_record(
-        experiment_id="train-only-recent",
-        parent_baseline_id="baseline",
-        train_task_ids=["train-a"],
-        finished_at="2026-05-10T00:09:00+00:00",
-    )
-    _populate_pool_trials(
-        train_only_recent,
-        {"train-a": [_pool_trial("train-a", solved=False)]},
-    )
-
-    pool = build_pooled_control_samples(
-        active_baseline=baseline,
-        recent_candidates=[train_only_recent],
-        candidate_new_rule_names={},
-        task_ids=["test-a"],
-        panel="test",
-    )
-
-    assert pool == {"test-a": (1, 1)}
 
 
 def test_crash_fillers_do_not_change_gate_verdicts():

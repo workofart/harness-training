@@ -414,25 +414,30 @@ def test_run_experiment_uses_configured_panel_ids(monkeypatch, tmp_path):
         regression_veto_panel_id="holdout",
         train_task_names=["promotion-a"],
         test_task_names=["holdout-a"],
-        task_trials=1,
+        task_trials=4,
         max_trial_concurrency=1,
         task_dirs=["promotion-a", "holdout-a"],
     )
     stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
+    # Baseline never solves promotion-a (0/4 -> frontier) and solves holdout-a
+    # 4/4, so the candidate's holdout 0/3 is a genuine Fisher regression.
     baseline = init_generic_record(
         experiment_id="baseline",
         git_commit_hash="base123",
         parent_baseline_experiment_id=None,
         panel_specs=[
-            ("promotion", "promotion", ["promotion-a"], 1),
-            ("holdout", "regression_veto", ["holdout-a"], 1),
+            ("promotion", "promotion", ["promotion-a"], 4),
+            ("holdout", "regression_veto", ["holdout-a"], 4),
         ],
     )
-    baseline.record_task_result(
-        _panel_trial_result("promotion-a", solved=False, index=0)
-    )
-    baseline.record_task_result(_panel_trial_result("holdout-a", solved=True, index=0))
+    for index in range(4):
+        baseline.record_task_result(
+            _panel_trial_result("promotion-a", solved=False, index=index)
+        )
+        baseline.record_task_result(
+            _panel_trial_result("holdout-a", solved=True, index=index)
+        )
 
     async def fake_run_task(*, task_name, **_kwargs):
         return _panel_trial_result(
@@ -1932,8 +1937,10 @@ def test_run_experiment_skips_test_panel_when_train_gate_discards(
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
+    # Baseline solves train-a 4/4 so the candidate's 0/3 is a genuine
+    # Fisher regression (a 0/3-vs-3/3 small-sample dip no longer is).
     baseline = _baseline_with_train_and_test(
-        train_solves=[True, True, True],
+        train_solves=[True, True, True, True],
         test_solves=[True, True, True],
     )
     experiment_runner = make_runner(
@@ -1981,9 +1988,11 @@ def test_run_experiment_runs_test_panel_after_train_pass_and_blocks_regression(
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
+    # Baseline solves test-a 4/4 so the candidate's 0/3 is a genuine Fisher
+    # regression on the regression-veto panel (a small-sample dip no longer is).
     baseline = _baseline_with_train_and_test(
         train_solves=[False, False, False],
-        test_solves=[True, True, True],
+        test_solves=[True, True, True, True],
     )
     experiment_runner = make_runner(
         monkeypatch,

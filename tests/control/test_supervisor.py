@@ -513,6 +513,20 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_panel_outcomes(
         parent_baseline_experiment_id=None,
         train_task_ids=["task-a", "task-b", "task-c", "task-d"],
     )
+    # task-a is solved 4/4 by the baseline so the candidate's 0/4 below is a
+    # genuine Fisher regression (a single-trial 0/1-vs-1/1 dip no longer is).
+    for _ in range(3):
+        baseline.record_task_result(
+            TaskResult(
+                task_name="task-a",
+                reward=1.0,
+                solved=True,
+                error=None,
+                steps_used=1,
+                started_at="2026-04-11T00:00:00+00:00",
+                finished_at="2026-04-11T00:00:01+00:00",
+            )
+        )
     for task_name, solved in (
         ("task-a", True),
         ("task-b", False),
@@ -543,6 +557,21 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_panel_outcomes(
         train_task_ids=["task-a", "task-b", "task-c", "task-d"],
     )
     candidate_artifacts = {}
+    # Candidate fails task-a 0/4 (vs the baseline's 4/4) -> a real regression.
+    # Record the bare failures first so the artifact-bearing trial below stays
+    # the last failing trial, i.e. the representative used for evidence paths.
+    for _ in range(3):
+        candidate.record_task_result(
+            TaskResult(
+                task_name="task-a",
+                reward=0.0,
+                solved=False,
+                error=None,
+                steps_used=1,
+                started_at="2026-04-11T00:00:00+00:00",
+                finished_at="2026-04-11T00:00:01+00:00",
+            )
+        )
     for task_name, solved in (
         ("task-a", False),
         ("task-b", True),

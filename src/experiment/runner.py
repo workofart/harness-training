@@ -25,7 +25,7 @@ from src.harness.contracts import TaskResult
 from src.metrics import BaselineComparison, is_majority_decided
 
 from src.experiment.gate import (
-    build_gate_pool,
+    build_baseline_pool,
     build_gate_verdicts,
     decide_panel_from_verdicts,
 )
@@ -1014,11 +1014,8 @@ class ExperimentRunner:
         # requiring a candidate majority-solve for improvement.
         if baseline is None:
             return {}
-        return build_gate_pool(
-            experiments_root=self.experiments_root,
-            workspace_root=Path.cwd(),
+        return build_baseline_pool(
             active_baseline=baseline,
-            candidate_experiment_id=self.record.experiment_id,
             task_ids=tuple(self.record.panels[panel].task_ids),
             panel=panel,
         )
