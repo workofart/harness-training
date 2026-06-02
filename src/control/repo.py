@@ -186,8 +186,11 @@ def add_worktree(
     cwd: Path | None = None,
     ref: str = "HEAD",
     detach: bool = True,
+    force: bool = False,
 ) -> None:
     args = ["worktree", "add"]
+    if force:
+        args.append("--force")
     if detach:
         args.append("--detach")
     args.extend([str(worktree_path), ref])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -493,6 +494,26 @@ def test_ensure_sparse_workspace_keeps_only_visible_paths_and_experiments(
     assert (workspace_root / "tests" / "harness" / "test_core.py").exists()
     assert (workspace_root / "experiments").is_symlink()
     assert not (workspace_root / "src" / "experiment" / "runner.py").exists()
+
+
+def test_ensure_sparse_workspace_recovers_missing_registered_worktree(
+    tmp_path: Path,
+) -> None:
+    repo_root = make_sparse_repo(tmp_path)
+    workspace_root = tmp_path / "workspace"
+    supervisor.ensure_sparse_workspace(
+        repo_root=repo_root,
+        workspace_root=workspace_root,
+    )
+    shutil.rmtree(workspace_root)
+
+    supervisor.ensure_sparse_workspace(
+        repo_root=repo_root,
+        workspace_root=workspace_root,
+    )
+
+    assert (workspace_root / "program.md").exists()
+    assert (workspace_root / "experiments").is_symlink()
 
 
 def test_workspace_changed_paths_reports_only_editable_changes(tmp_path: Path) -> None:
