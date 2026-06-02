@@ -359,7 +359,7 @@ def ensure_sparse_workspace(
 ) -> Path:
     if not workspace_root.exists():
         workspace_root.parent.mkdir(parents=True, exist_ok=True)
-        control_repo.add_worktree(workspace_root, cwd=repo_root)
+        control_repo.add_worktree(workspace_root, cwd=repo_root, force=True)
     elif not (workspace_root / ".git").exists():
         raise RuntimeError(f"sparse workspace is not a git worktree: {workspace_root}")
 
