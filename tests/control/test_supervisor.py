@@ -364,6 +364,44 @@ def test_launch_tracked_experiment_forwards_progress_bar_without_real_experiment
     assert "[#####-----] 1/2 tasks (50%)" in captured.err
 
 
+def test_launch_tracked_experiment_halts_on_credentials_expired_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.adapters.chatgpt_codex import (
+        CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
+        ChatGptCodexCredentialsExpiredError,
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    experiments_root = tmp_path / "experiments"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                f"sys.exit({CODEX_CREDENTIALS_EXPIRED_EXIT_CODE})",
+            ]
+        )
+    )
+    fake_uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+
+    # A dead-credentials exit must halt for operator intervention -- never
+    # return a crash record the supervisor would treat like a discard and
+    # advance past, looping into the same wall.
+    with pytest.raises(ChatGptCodexCredentialsExpiredError):
+        supervisor.launch_tracked_experiment(
+            repo_root=repo_root,
+            experiment_id="exp-dead-token",
+            experiments_root=experiments_root,
+        )
+
+
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],

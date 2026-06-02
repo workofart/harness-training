@@ -33,6 +33,18 @@ CODEX_JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 TOKEN_REFRESH_SKEW_SECONDS = 60
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 524, 529})
+# A token-endpoint refusal with one of these codes means the stored credentials
+# are dead (OAuth `invalid_grant` is 400; `invalid_client` is 401), not a
+# transient blip -- only re-login fixes it.
+CREDENTIAL_REJECTION_STATUS_CODES = frozenset({400, 401})
+# Exit code `main_exp` returns when the refresh token is dead, carried across
+# the `uv run exp` subprocess boundary so the supervisor can halt cleanly
+# instead of reading a crash record and advancing.
+CODEX_CREDENTIALS_EXPIRED_EXIT_CODE = 42
+CODEX_CREDENTIALS_EXPIRED_MESSAGE = (
+    "Codex credentials expired: the refresh token was rejected. "
+    "Run `codex login` to re-authenticate, then restart the supervisor."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +55,17 @@ class ChatGptCodexError(RuntimeError):
 
 class ChatGptCodexUnauthorizedError(ChatGptCodexError):
     pass
+
+
+class ChatGptCodexCredentialsExpiredError(BaseException):
+    """The refresh token is dead; only `codex login` can restore it.
+
+    Inherits BaseException (not Exception) on purpose: it must propagate past
+    the runner's per-trial and per-experiment `except Exception` containment --
+    the same idiom that lets KeyboardInterrupt through -- so a sustained auth
+    outage halts the supervisor for operator intervention rather than being
+    finalized as a crash record the loop advances past, looping into the same
+    wall (the provider-auth-401 incident: 14+ crashes over ~88 minutes)."""
 
 
 def _is_retryable_infra_error(exc: Exception) -> bool:
@@ -103,6 +126,11 @@ class _CodexAuthStore:
                 "client_id": CODEX_CLIENT_ID,
             },
         )
+        if response.status_code in CREDENTIAL_REJECTION_STATUS_CODES:
+            raise ChatGptCodexCredentialsExpiredError(
+                f"{CODEX_CREDENTIALS_EXPIRED_MESSAGE} "
+                f"(token endpoint returned HTTP {response.status_code})"
+            )
         if response.status_code >= 400:
             raise ChatGptCodexError(
                 f"Codex token refresh failed: HTTP {response.status_code}"

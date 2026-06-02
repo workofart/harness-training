@@ -6,6 +6,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from src.experiment.trial import run_task
 from src.harness.contracts import RawState
 
@@ -138,6 +140,27 @@ def test_run_task_marks_crash_with_exception_type_for_blank_error():
     assert result.solved is False
     assert result.error == "RuntimeError"
     assert result.metrics.failure_mode == "crash"
+
+
+def test_run_task_propagates_credentials_expired_instead_of_recording_crash():
+    # A dead-credentials error must escape run_task's `except Exception`
+    # containment (it inherits BaseException) so it bubbles up to halt the loop
+    # rather than being recorded as a crashed trial the gate would discard. The
+    # finally-block cleanup (slot release + resource close) must still run.
+    from src.adapters.chatgpt_codex import ChatGptCodexCredentialsExpiredError
+
+    class _DeadCredentialsLlm(_StubLlm):
+        async def complete(self, *, messages, tools=None, reasoning_effort=None):
+            raise ChatGptCodexCredentialsExpiredError("refresh token rejected")
+
+    llm = _DeadCredentialsLlm([])
+    env = _StubEnv()
+
+    with pytest.raises(ChatGptCodexCredentialsExpiredError):
+        asyncio.run(run_task(task_name="t", llm=llm, env=env, max_steps=5))
+
+    assert llm.closed is True
+    assert env.closed is True
 
 
 def test_run_task_classifies_no_valid_action_distinct_from_crash():

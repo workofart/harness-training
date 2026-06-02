@@ -66,6 +66,12 @@ def _panel_task_summary(harness_config: HarnessConfig) -> str:
 
 
 def main_exp() -> int:
+    import sys
+
+    from src.adapters.chatgpt_codex import (
+        CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
+        ChatGptCodexCredentialsExpiredError,
+    )
     from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH
     from src.experiment.runner import ExperimentRunner
 
@@ -74,12 +80,16 @@ def main_exp() -> int:
     print(f"panels: {_panel_task_summary(harness_config)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
     print(f"harness config: {DEFAULT_HARNESS_CONFIG_PATH}")
-    record = ExperimentRunner(
-        harness_config=harness_config,
-        harbor_config=harbor_config,
-        api_key=api_key,
-        require_clean_worktree=_require_clean_worktree_for_exp(),
-    ).run()
+    try:
+        record = ExperimentRunner(
+            harness_config=harness_config,
+            harbor_config=harbor_config,
+            api_key=api_key,
+            require_clean_worktree=_require_clean_worktree_for_exp(),
+        ).run()
+    except ChatGptCodexCredentialsExpiredError as exc:
+        print(str(exc), file=sys.stderr)
+        return CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
     print(f"evaluation: {record.status}")
     print("run complete")
     return 0
@@ -88,6 +98,10 @@ def main_exp() -> int:
 def main_auto() -> int:
     import sys
 
+    from src.adapters.chatgpt_codex import (
+        CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
+        ChatGptCodexCredentialsExpiredError,
+    )
     from src.control.agent_backend import create_backend
     from src.control.supervisor import run_supervisor_loop
 
@@ -106,6 +120,9 @@ def main_auto() -> int:
             repo_root=Path(__file__).resolve().parents[1],
             backend=backend,
         )
+    except ChatGptCodexCredentialsExpiredError as exc:
+        print(f"\nSupervisor halted. {exc}", file=sys.stderr)
+        return CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
     except KeyboardInterrupt:
         return 130
     return 0

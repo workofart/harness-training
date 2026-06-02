@@ -437,3 +437,115 @@ def test_complete_repeated_401_is_terminal():
     # One refresh after the first 401; the second 401 is not retried.
     assert auth_store.refresh_count == 1
     assert client.stream_calls == 2
+
+
+def _write_dead_auth_file(tmp_path: Path) -> Path:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": _jwt({"exp": 4_102_444_800}),
+                    "id_token": _jwt(
+                        {
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": "acct_123"
+                            }
+                        }
+                    ),
+                    "refresh_token": "dead-refresh-token",
+                },
+            }
+        )
+    )
+    return auth_path
+
+
+class _TokenResponse:
+    def __init__(self, *, status_code: int):
+        self.status_code = status_code
+
+    def json(self):
+        return {"error": "invalid_grant"}
+
+
+class _RefreshClient:
+    """Backend stream() always 401s (token rejected); the token-endpoint post()
+    returns the configured status, simulating a refresh attempt against an
+    expired/revoked refresh token."""
+
+    def __init__(self, *, token_status: int):
+        self._token_status = token_status
+        self.stream_calls = 0
+        self.post_calls = 0
+
+    def stream(self, method, url, *, json, headers) -> _Stream:
+        del method, url, json, headers
+        self.stream_calls += 1
+        return _Stream(response=_Response(status_code=401))
+
+    async def post(self, url, *, data) -> _TokenResponse:
+        del url, data
+        self.post_calls += 1
+        return _TokenResponse(status_code=self._token_status)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_credentials_expired_error_is_base_exception_not_exception():
+    # Inherits BaseException (not Exception) on purpose: it must escape the
+    # runner's per-trial and per-experiment `except Exception` containment so
+    # the subprocess exits non-zero and the supervisor halts for `codex login`,
+    # instead of finalizing a crash record and advancing into the same wall.
+    err = chatgpt_codex_module.ChatGptCodexCredentialsExpiredError("x")
+    assert isinstance(err, BaseException)
+    assert not isinstance(err, Exception)
+
+
+@pytest.mark.parametrize("token_status", [400, 401])
+def test_refresh_raises_credentials_expired_on_dead_token(tmp_path: Path, token_status):
+    # OAuth `invalid_grant` is HTTP 400; a 401 is `invalid_client`. Both mean
+    # the stored credentials are dead and only re-login fixes them.
+    store = chatgpt_codex_module._CodexAuthStore(_write_dead_auth_file(tmp_path))
+    client = _RefreshClient(token_status=token_status)
+
+    with pytest.raises(chatgpt_codex_module.ChatGptCodexCredentialsExpiredError):
+        asyncio.run(store.refresh(http_client=client))
+
+    assert client.post_calls == 1
+
+
+def test_refresh_raises_generic_error_on_transient_status(tmp_path: Path):
+    # A transient token-endpoint failure must NOT be treated as dead credentials
+    # (that would hard-halt the loop on a recoverable blip).
+    store = chatgpt_codex_module._CodexAuthStore(_write_dead_auth_file(tmp_path))
+    client = _RefreshClient(token_status=503)
+
+    with pytest.raises(chatgpt_codex_module.ChatGptCodexError) as excinfo:
+        asyncio.run(store.refresh(http_client=client))
+
+    assert not isinstance(
+        excinfo.value, chatgpt_codex_module.ChatGptCodexCredentialsExpiredError
+    )
+
+
+def test_complete_halts_when_refresh_token_is_dead(tmp_path: Path):
+    # End-to-end repro of the outage: backend 401 -> refresh -> dead token ->
+    # the credentials error propagates out of complete() rather than being
+    # swallowed by the bounded `except Exception` retry.
+    llm = chatgpt_codex_module.ChatGptCodex(
+        config=ChatGptCodexConfig(
+            model_name="gpt-5.5",
+            max_context_length=200_000,
+            timeout_seconds=10.0,
+        ),
+        auth_store=chatgpt_codex_module._CodexAuthStore(
+            _write_dead_auth_file(tmp_path)
+        ),
+        http_client=_RefreshClient(token_status=400),
+    )
+
+    with pytest.raises(chatgpt_codex_module.ChatGptCodexCredentialsExpiredError):
+        asyncio.run(llm.complete(messages=[{"role": "user", "content": "go"}]))

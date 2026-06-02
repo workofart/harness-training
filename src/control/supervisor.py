@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
+from src.adapters.chatgpt_codex import (
+    CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
+    CODEX_CREDENTIALS_EXPIRED_MESSAGE,
+    ChatGptCodexCredentialsExpiredError,
+)
 from src.adapters.env import DEFAULT_HARBOR_CONFIG_PATH, HarborConfig
 from src.control import repo as control_repo
 from src.control.agent_backend import (
@@ -701,6 +706,11 @@ def launch_tracked_experiment(
     experiments_root: Path,
 ) -> ExperimentRecord:
     completed = _run_with_live_tty_output(["uv", "run", "exp"], cwd=repo_root)
+    if completed.returncode == CODEX_CREDENTIALS_EXPIRED_EXIT_CODE:
+        # Dead credentials need a human (`codex login`); halt rather than
+        # finalizing a crash record the loop would treat like a discard and
+        # advance past, re-launching straight into the same auth wall.
+        raise ChatGptCodexCredentialsExpiredError(CODEX_CREDENTIALS_EXPIRED_MESSAGE)
     if completed.returncode != 0:
         raise RuntimeError(
             "uv run exp failed:\n"
@@ -1311,6 +1321,17 @@ def run_supervisor_loop(
                 backend=backend,
             )
             continue
+        except ChatGptCodexCredentialsExpiredError as exc:
+            # Terminal auth failure: record why the loop stopped, then let it
+            # propagate so the process exits for operator intervention rather
+            # than spinning through doomed cycles.
+            append_supervisor_event(
+                repo_root=resolved_repo_root,
+                root=supervisor_root,
+                event="loop_halted_credentials_expired",
+                error=str(exc),
+            )
+            raise
         except Exception as exc:
             append_supervisor_event(
                 repo_root=resolved_repo_root,

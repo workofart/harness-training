@@ -135,6 +135,64 @@ def test_main_auto_returns_130_on_keyboard_interrupt(monkeypatch):
     assert cli.main_auto() == 130
 
 
+def test_main_exp_returns_credentials_expired_code_when_token_dead(monkeypatch, capsys):
+    from src.adapters.chatgpt_codex import (
+        CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
+        CODEX_CREDENTIALS_EXPIRED_MESSAGE,
+        ChatGptCodexCredentialsExpiredError,
+    )
+
+    fake_runner_module = types.ModuleType("src.experiment.runner")
+
+    class FakeExperimentRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self):
+            raise ChatGptCodexCredentialsExpiredError(CODEX_CREDENTIALS_EXPIRED_MESSAGE)
+
+    fake_runner_module.ExperimentRunner = FakeExperimentRunner
+    monkeypatch.setitem(sys.modules, "src.experiment.runner", fake_runner_module)
+    monkeypatch.setattr(
+        cli,
+        "load_runtime_config",
+        lambda: (
+            types.SimpleNamespace(),
+            types.SimpleNamespace(
+                experiment_id="exp-1",
+                panels=[
+                    types.SimpleNamespace(
+                        id="train", purpose="promotion", task_names=["task-a"]
+                    )
+                ],
+            ),
+            "api-key",
+        ),
+    )
+
+    assert cli.main_exp() == CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
+    assert "codex login" in capsys.readouterr().err
+
+
+def test_main_auto_halts_on_credentials_expired(monkeypatch, capsys):
+    from src.adapters.chatgpt_codex import (
+        CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
+        CODEX_CREDENTIALS_EXPIRED_MESSAGE,
+        ChatGptCodexCredentialsExpiredError,
+    )
+
+    fake_supervisor_module = types.ModuleType("src.control.supervisor")
+
+    def fake_run_supervisor_loop(*, repo_root, **_kwargs):
+        raise ChatGptCodexCredentialsExpiredError(CODEX_CREDENTIALS_EXPIRED_MESSAGE)
+
+    fake_supervisor_module.run_supervisor_loop = fake_run_supervisor_loop
+    monkeypatch.setitem(sys.modules, "src.control.supervisor", fake_supervisor_module)
+
+    assert cli.main_auto() == CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
+    assert "codex login" in capsys.readouterr().err
+
+
 def test_load_llm_provider_secret_skips_openrouter_key_for_chatgpt():
     harness_config = types.SimpleNamespace(
         llm_provider_config=types.SimpleNamespace(provider="chatgpt_codex")
