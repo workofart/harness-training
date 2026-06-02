@@ -134,6 +134,21 @@ def test_build_request_body_converts_chat_messages_and_tools():
     ]
 
 
+def test_build_request_body_forwards_priority_service_tier():
+    body = chatgpt_codex_module._build_request_body(
+        config=ChatGptCodexConfig(
+            model_name="gpt-5.5",
+            max_context_length=200_000,
+            service_tier="priority",
+        ),
+        messages=[{"role": "user", "content": "go"}],
+        tools=None,
+        reasoning_effort=None,
+    )
+
+    assert body["service_tier"] == "priority"
+
+
 def test_complete_posts_codex_sse_and_normalizes_tool_call():
     captured: dict[str, Any] = {}
     lines = [

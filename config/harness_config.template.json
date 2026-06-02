@@ -102,6 +102,8 @@
     // "temperature": 0.0,
     // "top_p": 1.0,
     // "seed": 1,
+    // For ChatGPT Codex subscription priority routing:
+    // "service_tier": "priority",
     // "service_tier": "default",
 
     "provider_kwargs": {
