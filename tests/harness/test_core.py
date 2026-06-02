@@ -19,7 +19,6 @@ from src.harness.core import (
     ListDirAction,
     NoValidActionError,
     ReadFileAction,
-    RECOVERABLE_VERIFY_RULE_NAME,
     RunAction,
     SearchTextAction,
     TaskLoopState,
@@ -37,8 +36,6 @@ from src.harness.core import (
     run_task_loop,
     validate_action_args,
 )
-
-from src.trace import HarnessRecorder
 
 from conftest import _StubLlm, _StubEnv, _tool_call, _completion
 
@@ -540,8 +537,6 @@ def test_run_task_loop_solved_when_verify_returns_passed_true():
 
 
 def test_run_task_loop_unsolved_when_verify_returns_passed_false():
-    # recoverable-verify makes a failed verify non-terminal, so the trial ends here via
-    # the step cap (max_steps=1, agent never recovers) -- still unsolved.
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _StubEnv(verify_state=RawState(done=True, passed=False, reward=0.0))
     state = TaskLoopState()
@@ -550,7 +545,7 @@ def test_run_task_loop_unsolved_when_verify_returns_passed_false():
             llm=llm,
             env=env,
             reset_state=asyncio.run(env.reset()),
-            max_steps=1,
+            max_steps=5,
             state=state,
         )
     )
@@ -602,44 +597,3 @@ def test_run_task_loop_stops_batch_when_action_returns_done_true():
     assert state.solved is True
     assert env.verify_calls == 1
     assert env.exec_calls == []
-
-
-def test_run_task_loop_failed_verify_is_non_terminal_and_recovers():
-    # recoverable-verify: a failed verify does NOT end the trial -- the agent gets the
-    # verifier output back, fixes, and verifies again to a pass. The rule fires once on
-    # the suppressed (failed) verify so the trial self-filters from the pooled control.
-    class _SeqVerifyEnv(_StubEnv):
-        def __init__(self, *, verify_states, **kwargs):
-            super().__init__(**kwargs)
-            self._verify_states = list(verify_states)
-
-        async def verify(self):
-            self.verify_calls += 1
-            return self._verify_states.pop(0)
-
-    llm = _StubLlm(
-        [_completion(_tool_call("verify")), _completion(_tool_call("verify"))]
-    )
-    env = _SeqVerifyEnv(
-        verify_states=[
-            RawState(done=True, passed=False, reward=0.0),
-            RawState(done=True, passed=True, reward=1.0),
-        ]
-    )
-    recorder = HarnessRecorder.create()
-    state = TaskLoopState()
-    asyncio.run(
-        run_task_loop(
-            llm=llm,
-            env=env,
-            reset_state=asyncio.run(env.reset()),
-            max_steps=5,
-            recorder=recorder,
-            state=state,
-        )
-    )
-    assert env.verify_calls == 2  # did NOT stop at the first (failed) verify
-    assert state.solved is True  # recovered to a pass
-    assert state.steps_used == 2
-    assert recorder.metrics is not None
-    assert recorder.metrics.rule_fires.get(RECOVERABLE_VERIFY_RULE_NAME) == 1

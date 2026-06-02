@@ -50,9 +50,6 @@ MISSING_TOOL_CALL_REPAIR_PROMPT = (
 )
 DEFAULT_READ_WINDOW_LINES = 200
 DEFAULT_RESULT_CHAR_LIMIT = 6000
-# Fires when a FAILED verify (done=True, passed=False) is treated as non-terminal so
-# the agent can read the verifier output, fix the problem, and verify again.
-RECOVERABLE_VERIFY_RULE_NAME = "recoverable_verify"
 SHORT_RUN_LIGHT_TIMEOUT_SEC = 30
 
 
@@ -392,7 +389,7 @@ def build_system_prompt() -> str:
             "Return one or more tool calls. They execute in order with no intermediate observation, then the resulting state appears in the next turn.",
             "Batch calls only when later calls do not depend on earlier results; otherwise emit one call and wait for the observation.",
             "Use list_dir, find_files, search_text, and read_file before broad edits.",
-            "Call verify as soon as you believe the task is complete. If it passes, the trial ends; if it fails, the verifier output is returned to you -- read it, fix the problem, and verify again.",
+            "Call verify as soon as you believe the task is complete to confirm success and end the trial.",
         ]
     )
 
@@ -617,11 +614,7 @@ async def run_task_loop(
         )
         trajectory = (*trajectory, (action, raw_state))
         state.steps_used += 1
-        # recoverable-verify: a failed verify (done=True, passed=False) is NOT terminal
-        # -- the agent gets the verifier output back and can fix-and-re-verify.
-        done = raw_state.done and raw_state.passed is True
-        if raw_state.done and raw_state.passed is False:
-            step_recorder.rule_fired(RECOVERABLE_VERIFY_RULE_NAME)
+        done = raw_state.done
         if raw_state.reward is not None:
             state.reward = raw_state.reward
         if raw_state.done and raw_state.passed is not None:

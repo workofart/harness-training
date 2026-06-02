@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "experiment_id": "exp-20260601-160651",
-  "focus_name": "recoverable-verify-redux",
+  "experiment_id": "exp-gpt-5-5-high-speed-up-0531",
+  "focus_name": "increase-exp-speed",
   "panels": [
     {
       "id": "train",
