@@ -1,97 +1,115 @@
 # Harness Experiment
 
-An experimental project that explores the possibility of agent-driven self-improving harness.
+Experimental harness for improving an LLM shell agent on Terminal-Bench 2 tasks.
 
-Here's the blog post that might bring more color: [Link](https://www.henrypan.com/blog/2026-05-25-self-improvement-harness/)
+The harness is an LLM shell agent. `uv run auto` lets an automation agent propose one focused change, test it against the current baseline, and keep or discard it based on measured evidence.
 
+Technical details: [TECH_DESIGN.md](./TECH_DESIGN.md). Operating policy for the self-improvement run: [program.md](./program.md).
 
-## Key Concepts
+Blog Post: [Background, motivation and learnings of this project](https://www.henrypan.com/blog/2026-05-25-self-improvement-harness/).
 
-- **The harness** ([`src/harness/core.py`](./src/harness/core.py)): an LLM-driven shell agent with an 8-action vocabulary (`list_dir`, `find_files`, `search_text`, `read_file`, `write_file`, `edit_file`, `run`, `verify`) that attempts [Terminal-Bench 2](https://www.tbench.ai/benchmarks/terminal-bench-2) tasks. Tasks are fetched through the [Harbor](https://pypi.org/project/harbor/) registry and run inside Docker containers.
-- **The self-improvement loop** ([`src/control/supervisor.py`](./src/control/supervisor.py)): an *outer* coding agent — Codex by default, or Claude Code with `--agent claude` — reads [`program.md`](./program.md), proposes one mechanism-scoped patch to the harness, then `uv run exp` measures the candidate against the active baseline on a fixed train panel. The supervisor decides `keep` or `discard` using a per-task two-sided binomial test, commits or reverts accordingly, and loops.
+## Setup
 
-[`program.md`](./program.md) is the operating policy the outer agent reads on every iteration. It defines what files the agent may edit, the promotion rule, and the post-run diagnosis protocol. If you want to understand the system, read it after this README.
-
-
-## Before You Run
-
-This repository is intended to be run from a source checkout, not from an installed wheel. The commands below assume you are in the repo root so `config/`, `program.md`, and local experiment state are available.
-
-Important behavior:
-
-- **`uv run exp` uses paid/quota-limited LLM calls.** The harness calls the configured LLM provider on every task step.
-- **`uv run auto` adds a second paid/quota-limited agent loop.** The supervisor calls Codex or Claude while the harness calls its configured LLM provider. There is no built-in budget cap; stop it with Ctrl+C.
-- **`uv run auto` moves your git HEAD.** The supervisor `git reset --hard`s your primary worktree between baseline and candidate commits as it evaluates patches (see [`promote_workspace_commit_to_repo`](./src/control/supervisor.py)). Run `auto` in a dedicated checkout, not on a branch you care about.
-- **The supervisor agent CLIs run without permission prompts.** The Codex backend uses `--dangerously-bypass-approvals-and-sandbox`; the Claude backend uses `--dangerously-skip-permissions`.
-
-
-## How to Run
-
-1. Install the project:
-
-- If you do not have `uv`, install it from the [official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/).
-- Requires Python 3.13 or newer. If your system Python is older, `uv sync` will download a compatible interpreter automatically.
+Requires Python 3.13+, Docker, `uv`, and a source checkout.
 
 ```bash
 uv sync
 source .venv/bin/activate
 ```
 
-2. Prerequisites for running Terminal-Bench tasks:
+Configure the harness in [config/harness_config.json](./config/harness_config.json). Use [config/harness_config.template.json](./config/harness_config.template.json) as the commented reference.
 
-- LLM credentials: for OpenRouter, set `OPENROUTER_API_KEY` in the shell or in a repo-local `.env`; for experimental `chatgpt_codex`, run `codex login` first so `~/.codex/auth.json` exists.
-- Docker: install and start Docker. Harbor starts one container per task trial; `max_trial_concurrency` in [`config/harness_config.json`](./config/harness_config.json) caps trials in flight, and `max_heavy_action_concurrency` caps heavyweight harness actions (`reset`/`run`/`verify`) at once.
-- Optional but recommended for multi-trial runs — local apt cache: run [`scripts/setup-apt-cache.sh`](./scripts/setup-apt-cache.sh) once. Task images are minimal and reinstall `python3` via `apt` on every trial; the cache serves those repeats locally so concurrent bootstraps don't stall on the public mirror (the dominant infra failure). The bootstrap auto-detects it on `host.docker.internal:3142` and falls back to the direct mirror when absent.
-- Optional but recommended for multi-trial runs with ML tasks — local PyPI cache: run [`scripts/setup-pypi-cache.sh`](./scripts/setup-pypi-cache.sh) once. Task verifiers `uv run` the full dependency tree (torch + the CUDA stack, ~2 GB) from PyPI on every verify; the cache serves those repeats locally and coalesces concurrent fetches. The bootstrap auto-detects it on `host.docker.internal:3141` and falls back to direct PyPI when absent. (The apt cache can't cover PyPI — it's HTTPS — hence a separate index-level cache.)
+The committed default is a bounded smoke run, not benchmark-quality evidence.
 
-3. Prerequisites for the self-improvement loop:
+There are two layers here.
+- task-solving LLM
+  - A LLM provider is required because every task step sends model requests. Unless you're running a local LLM, in which case, you can extend the `src/adapters/llm_base.py` to support that yourself. Currently we support two types of LLM providers:
+    - <details>
+        <summary>OpenRouter setup</summary>
 
-- Install and authenticate one agent CLI:
-  - [`codex`](https://github.com/openai/codex) (default backend) — sign in once with `codex login`. The supervisor reads `~/.codex/auth.json` and `~/.codex/config.toml`.
-  - [`claude`](https://github.com/anthropics/claude-code) (optional, selected with `--agent claude`) — sign in once with `claude`.
+        Set `OPENROUTER_API_KEY` in your shell or a repo-local `.env`.
 
-4. Configure the run in [`config/harness_config.json`](./config/harness_config.json):
+        Use an OpenRouter provider config in `llm_provider_config`. If the checked-in provider routing is unavailable in your account, update `llm_provider_config.provider_kwargs.provider`.
 
-- The committed default is a one-task smoke run: `log-summary-date-ranges`, `max_trial_concurrency: 1`, `task_trials: 1`, `max_steps: 100`. This is meant to validate local setup with bounded Docker/API usage, not to produce benchmark-quality evidence.
-- The default OpenRouter config includes provider routing used by the checked-in tests. If that provider is unavailable in your OpenRouter account, update `llm_provider_config.provider_kwargs.provider`. Experimental `chatgpt_codex` requires explicit `model_name` and `max_context_length`.
-- For serious comparisons, expand `train_task_names`, raise budgets deliberately, and commit the config before running `uv run auto`.
-- See [`config/harness_config.template.json`](./config/harness_config.template.json) for a commented template.
+    </details>
 
-5. Baseline and worktree rules:
+    - <details>
+        <summary>Codex subscription setup</summary>
 
-- Experiments compare a candidate against the active baseline recorded in `experiments/state.json`.
-- Commit the harness you want measured before running `uv run exp` or `uv run auto`. Both commands assume a clean worktree so results map to a specific git commit.
-- `uv run auto` refreshes the baseline on a clean worktree when no active baseline exists, or when `HEAD` has advanced past the active baseline commit.
-- `uv run exp` runs one candidate against the current active baseline. Its train panel must match the active baseline's train panel. If you need to change the task panel, use `uv run auto` on a clean committed `HEAD` so it can refresh the baseline first.
-- Change `experiment_id` before each repeated manual `uv run exp`; experiment directories are not overwritten.
-- For throwaway local runs only, `EXP_ALLOW_DIRTY_WORKTREE=1 uv run exp` bypasses the clean-worktree gate for `exp`. Do not use that override for results you intend to compare or promote.
+        Run `codex login` once. The `chatgpt_codex` LLM provider (`src/adapters/chatgpt_codex.py`) reads Codex auth from `CODEX_HOME/auth.json` or `~/.codex/auth.json`
 
-6. Run one tracked experiment:
+    </details>
+- outer self-improving Agent
+  - codex (already logged in)
+  - claude code (already logged in)
 
-- This can be helpful when you don't want the agent to get involved, and you just want to test one change in an ad-hoc fashion
+
+
+## Run Experiments
+
+Prerequisites: Docker is running, provider credentials are configured, [config/harness_config.json](./config/harness_config.json) has the intended panels/budgets, and the worktree is clean.
+
+Warnings: `uv run exp` uses paid/quota-limited LLM calls; it writes to `experiments/`; repeated manual runs need a new `experiment_id`. For throwaway local runs only, `EXP_ALLOW_DIRTY_WORKTREE=1 uv run exp` bypasses the clean-worktree gate.
 
 ```bash
 uv run exp
 ```
 
-7. Run the self-improvement loop:
+It should print out a progress bar indicating the progress of this one-off experiment. Something like this:
 
-- This keeps looping until you stop it with Ctrl+C or a runtime error occurs.
-
-```bash
-uv run auto # default is codex
-uv run auto --agent claude # claude -p might start charging credits, so be careful
-uv run auto --agent codex
+```
+[------------------------] 0/49 tasks (0%) | trials 1/105 | solved 1/1 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 2/105 | solved 2/2 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/2 | errors 0
 ```
 
+## Run Self-Improvement
 
-## Where to See Experiment Output Artifacts
+Prerequisites: all experiment prerequisites, a clean committed `HEAD`, and an authenticated automation CLI (`codex` by default, or `claude` with `--agent claude`).
 
-Experiment-level artifacts:
+For `uv run auto`, Codex is the default agent. The run provisions a separate Codex home under `../harness-experiment_supervisor/codex-home` with symlinks to your `~/.codex/auth.json` and `~/.codex/config.toml`.
 
-- `experiments/state.json`
+Warnings: `uv run auto` has no built-in budget cap, keeps running until Ctrl+C or an error, uses paid/quota-limited calls for both the self-improvement agent and task-solving LLM, runs agent CLIs without permission prompts, and hard-resets the primary worktree between baseline/candidate commits. Use a dedicated checkout.
+
+```bash
+uv run auto
+uv run auto --agent codex
+uv run auto --agent claude
+```
+
+Once it starts, it should print out the self-improvement agent's thinking and tool call traces in real-time:
+
+```bash
+> uv run auto --agent claude
+[supervisor] loop_iteration_started
+[claude] thread 98f1d6ff-1e3e-4988-9b11-e34d5e47a250
+[claude] I'll read the authoritative files to understand the current state and what's needed for this prelaunch phase.
+  [toolcall] read /Users/henry/Git/harness-experiment_supervisor/harness-experiment-e930d607ca91/workspace/program.md
+  [toolcall] read /Users/henry/Git/harness-experiment_supervisor/harness-experiment-e930d607ca91/workspace/config/harness_config.json
+  [toolcall] read /Users/henry/Git/harness-experiment_supervisor/harness-experiment-e930d607ca91/workspace/experiments/learning.md
+  [toolcall] read experiments/exp-20260601-160651/experiment.json
+
+...
+
+[------------------------] 0/49 tasks (0%) | trials 1/105 | solved 1/1 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 2/105 | solved 2/2 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/2 | errors 0
+```
+
+## Results
+
+After you've ran `uv run auto` for a while to complete a couple of iterations, you can start to examine:
+- `experiments/learning.md`: the cumulative agent-generated human-readable diagnosis memo. Then read 
+- `experiments/state.json` for the current baseline/current experiment and `experiments/<experiment_id>/experiment.json` for the verdict.
+
+- In `experiment.json`, `status` is the run decision (`keep`, `discard`, or `crash`) and `evidence.panel_outcomes` links the verdict to representative task artifacts.
+- Per-trial artifacts live under `experiments/<experiment_id>/tasks/<task>/<run_id>/`.
+- Automation state/events live under `../harness-experiment_supervisor/<repo-fingerprint>/`.
+
+<details>
+<summary>Result examples</summary>
+
 ```json
-// Example
 {
   "active_baseline_experiment_id": "baseline-20260525-190114",
   "current_experiment_id": "exp-20260525-191311",
@@ -99,89 +117,47 @@ Experiment-level artifacts:
 }
 ```
 
-- `experiments/learning.md`
-  - cumulative post-run diagnosis notes written by the agent
-- `experiments/<experiment_id>/experiment.json`
-```json
-// Example
-{
-  "experiment_id": "exp-20260525-191311",
-  "parent_baseline_experiment_id": "baseline-20260525-190114",
-  "git_commit_hash": "...",
-  "focus_name": "usually the hypothesis the agent is testing",
-  "train_task_ids": [
-    "configure-git-webserver",
-    // ...
-  ],
-  // keep: candidate is promoted as the active baseline
-  // discard: candidate is not promoted; its commit is preserved under `refs/experiments/failed/<experiment_id>`
-  // crash: run failed; record and available artifacts are still written
-  "status": "usually 'discard' or 'keep' or 'crash'",
-  "train_solved_count": ...,
-  "decision_reason": "train task configure-git-webserver regressed",
-  "error": "",
-  "started_at": "...",
-  "finished_at": "...",
-  "train_task_results": {
-    "configure-git-webserver": {
-      "task_name": "configure-git-webserver",
-      "expected_trial_count": 1,
-      "trials": [
-        {
-          "task_name": "configure-git-webserver",
-          "reward": 0.0,
-          "solved": false,
-          "error": "...",
-          "steps_used": 79,
-          "trial_dir": "...",
-          "trace_path": "...",
-          "metrics_path": "...",
-          "metrics": {
-            ...
-          },
-          "started_at": "...",
-          "finished_at": "..."
-        }
-      ]
-    },
-  },
-  "evidence": {}
-}
-```
-
-**Task-level artifacts:**
 ```text
 experiments/
-└── exp-.../                                # one experiment run
-    ├── experiment.json                     # experiment-level config/metadata
-    └── tasks/                              # per-task results
-        └── regex-log/                      # task name
-            └── 20260525-215314-213b2141/   # one trial: YYYYMMDD-HHMMSS-<8hex>
-                ├── agent/                  # agent execution traces
-                │   ├── exec.log            # raw command/session log
-                │   ├── metrics.json        # run metrics/timing/token stats
-                │   └── steps.jsonl         # step-by-step agent events
-                ├── artifacts/              # files produced/collected from run
-                ├── bootstrap/              # setup phase records
-                │   ├── bootstrap.sh        # setup script used for task env
-                │   └── return-code.txt     # setup script exit code
-                └── verifier/               # grading/test outputs
-                    ├── ctrf.json           # structured test report
-                    ├── reward.txt          # scalar verifier score/reward
-                    └── test-stdout.txt     # verifier stdout
+└── exp-.../
+    ├── experiment.json
+    └── tasks/
+        └── regex-log/
+            └── 20260525-215314-213b2141/
+                ├── agent/
+                │   ├── exec.log
+                │   ├── metrics.json
+                │   └── steps.jsonl
+                ├── artifacts/
+                ├── bootstrap/
+                └── verifier/
+                    ├── ctrf.json
+                    ├── reward.txt
+                    └── test-stdout.txt
 ```
-
-**Supervisor artifacts:**
-
-Supervisor state lives outside the clone in a sibling directory named after the repo directory with `_supervisor` appended. For this checkout, that directory is `../harness-experiment_supervisor`; the default Codex home is `../harness-experiment_supervisor/codex-home`.
 
 ```text
 ../harness-experiment_supervisor/
-└── repo-.../         # one repo fingerprint supervisor record
-    ├── events.jsonl  # append-only event log; JSONL supervisor events/timestamps
-    └── state.json    # latest supervisor state snapshot: phase, thread id, update time, postrun payload/log
+└── harness-experiment-<hash>/
+    ├── events.jsonl
+    ├── state.json
+    └── workspace/
 ```
 
-## Technical Design
+</details>
 
-See [TECH_DESIGN.md](./TECH_DESIGN.md)
+## Optional
+
+<details>
+<summary>Local package caches</summary>
+
+For multi-trial runs, [scripts/setup-apt-cache.sh](./scripts/setup-apt-cache.sh) reduces repeated `apt` bootstrap stalls. For ML-heavy tasks, [scripts/setup-pypi-cache.sh](./scripts/setup-pypi-cache.sh) reduces repeated verifier dependency downloads.
+
+</details>
+
+<details>
+<summary>Task overrides</summary>
+
+Drop a valid Harbor task layout under `task_overrides/<task_id>/` to shadow a Terminal-Bench task or run a local task. Configure or disable overrides in [config/harbor_config.toml](./config/harbor_config.toml).
+
+</details>
