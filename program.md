@@ -43,6 +43,18 @@ Do not edit runner state by hand:
 - `experiments/state.json`
 - `experiments/<experiment_id>/experiment.json`
 
+## Benchmark protocol boundary
+
+Verifier/tests are final grading. Do not:
+
+- run final verifier/tests mid-solve or more than once
+- show verifier output/reward/diagnostics to the agent before score
+- make failed final verification retryable
+- expose/reverse-engineer hidden tests, verifier scripts, or reward logic
+
+Single-step TB/Harbor: agent phase, then one final score. Multi-step: only
+task-declared step checks.
+
 ## Promotion
 
 A candidate is evaluated against the active baseline with per-task two-sided Fisher exact tests at alpha = 0.05, comparing the candidate's solved/total counts against the baseline's solved/total counts.
