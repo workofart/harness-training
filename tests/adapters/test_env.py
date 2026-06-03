@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +21,8 @@ def _write_minimal_task(
     *,
     cpus: int | None = 1,
     verifier_env: dict[str, str] | None = None,
+    verifier_environment_mode: str | None = None,
+    verifier_docker_image: str | None = None,
 ) -> None:
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "solution").mkdir()
@@ -33,9 +36,21 @@ def _write_minimal_task(
     ]
     if cpus is not None:
         task_toml.append(f"cpus = {cpus}")
+    if verifier_environment_mode is not None or verifier_docker_image is not None:
+        task_toml.extend(["", "[verifier]"])
+    if verifier_environment_mode is not None:
+        task_toml.append(f'environment_mode = "{verifier_environment_mode}"')
     if verifier_env:
         task_toml.extend(["", "[verifier.env]"])
         task_toml.extend(f'{key} = "{value}"' for key, value in verifier_env.items())
+    if verifier_docker_image is not None:
+        task_toml.extend(
+            [
+                "",
+                "[verifier.environment]",
+                f'docker_image = "{verifier_docker_image}"',
+            ]
+        )
     (task_dir / "task.toml").write_text("\n".join(task_toml) + "\n")
     (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.13-slim\n")
     (task_dir / "solution" / "solve.sh").write_text("#!/bin/bash\n")
@@ -557,6 +572,137 @@ def test_harbor_reset_passes_trial_log_mounts_to_environment(
     assert mounts_by_target["/logs/agent"]["source"].endswith("/agent")
     assert mounts_by_target["/logs/verifier"]["source"].endswith("/verifier")
     assert mounts_by_target["/logs/artifacts"]["source"].endswith("/artifacts")
+
+
+def test_harbor_verify_runs_separate_verifier_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor.environments.factory import EnvironmentFactory
+
+    class LifecycleRecordingEnvironment:
+        os = TaskOS.LINUX
+        capabilities = SimpleNamespace(mounted=True)
+
+        def __init__(self, *, trial_paths: TrialPaths, label: str) -> None:
+            self.trial_paths = trial_paths
+            self.label = label
+            self.default_user = None
+            self.start_calls: list[bool] = []
+            self.stop_calls: list[bool] = []
+            self.exec_calls: list[dict[str, object]] = []
+            self.empty_dir_calls: list[dict[str, object]] = []
+            self.upload_dir_calls: list[tuple[Path | str, str]] = []
+
+        @contextlib.contextmanager
+        def with_default_user(self, user):
+            previous = self.default_user
+            self.default_user = user
+            try:
+                yield
+            finally:
+                self.default_user = previous
+
+        async def start(self, *, force_build: bool) -> None:
+            self.start_calls.append(force_build)
+
+        async def stop(self, *, delete: bool):
+            self.stop_calls.append(delete)
+
+        async def upload_file(self, source_path: Path | str, target_path: str):
+            del source_path, target_path
+
+        async def upload_dir(self, source_dir: Path | str, target_dir: str):
+            self.upload_dir_calls.append((source_dir, target_dir))
+
+        async def empty_dirs(self, dirs, *, chmod: bool = True):
+            self.empty_dir_calls.append({"dirs": dirs, "chmod": chmod})
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+        async def exec(
+            self,
+            command: str,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> ExecResult:
+            effective_user = user if user is not None else self.default_user
+            self.exec_calls.append(
+                {
+                    "command": command,
+                    "cwd": cwd,
+                    "env": env,
+                    "timeout_sec": timeout_sec,
+                    "user": effective_user,
+                }
+            )
+            if command == "pwd":
+                return ExecResult(return_code=0, stdout="/app\n", stderr="")
+            if "/tests/test.sh" in command:
+                self.trial_paths.reward_text_path.write_text("1.0")
+                self.trial_paths.test_stdout_path.write_text(
+                    f"{self.label} verifier stdout\n"
+                )
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    created_envs: list[LifecycleRecordingEnvironment] = []
+    create_calls: list[dict[str, object]] = []
+
+    def fake_create_environment_from_config(**kwargs):
+        label = "agent" if not created_envs else "verifier"
+        env = LifecycleRecordingEnvironment(
+            trial_paths=kwargs["trial_paths"],
+            label=label,
+        )
+        created_envs.append(env)
+        create_calls.append(kwargs)
+        return env
+
+    monkeypatch.setattr(
+        EnvironmentFactory,
+        "create_environment_from_config",
+        staticmethod(fake_create_environment_from_config),
+    )
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(
+        task_dir,
+        verifier_docker_image="example/verifier:latest",
+    )
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    asyncio.run(harbor.reset())
+    result = asyncio.run(harbor.verify())
+
+    assert result.passed is True
+    assert result.reward == 1.0
+    assert result.stdout == "verifier verifier stdout\n"
+    assert len(created_envs) == 2
+    agent_env, verifier_env = created_envs
+    agent_call, verifier_call = create_calls
+    assert agent_call["environment_dir"] == task_dir / "environment"
+    assert verifier_call["environment_dir"] == task_dir / "tests"
+    assert agent_call["task_env_config"].docker_image == "example/task:latest"
+    assert verifier_call["task_env_config"].docker_image == "example/verifier:latest"
+    assert verifier_call["session_id"] != agent_call["session_id"]
+    assert "__verifier" in verifier_call["session_id"]
+    assert verifier_call["config"].extra_docker_compose == []
+    verifier_mounts_by_target = {
+        mount["target"]: mount for mount in verifier_call["mounts"]
+    }
+    assert set(verifier_mounts_by_target) == {"/logs/verifier", "/logs/artifacts"}
+    assert verifier_mounts_by_target["/logs/verifier"]["source"].endswith("/verifier")
+    assert verifier_mounts_by_target["/logs/artifacts"]["source"].endswith("/artifacts")
+    assert verifier_env.upload_dir_calls == []
+    assert verifier_env.start_calls == [False]
+    assert verifier_env.stop_calls == [True]
+    assert agent_env.stop_calls == []
+
+    asyncio.run(harbor.close())
+    assert agent_env.stop_calls == [True]
 
 
 def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:

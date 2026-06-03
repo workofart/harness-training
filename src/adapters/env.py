@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import tomllib
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
 from harbor.models.task.task import Task
+from harbor.models.task.verifier_mode import resolve_effective_verifier_env_config
 from harbor.models.trial.config import EnvironmentConfig, ServiceVolumeConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+from harbor.models.verifier.result import VerifierResult
 from harbor.verifier.verifier import Verifier
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -31,6 +36,7 @@ DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"
 )
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
+_MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +147,25 @@ def _trial_log_mounts(
     ]
 
 
+def _verifier_log_mounts(
+    trial_paths: TrialPaths,
+    verifier_env_config: TaskEnvironmentConfig,
+) -> list[ServiceVolumeConfig]:
+    env_paths = EnvironmentPaths.for_os(verifier_env_config.os)
+    return [
+        {
+            "type": "bind",
+            "source": str(trial_paths.verifier_dir.resolve()),
+            "target": str(env_paths.verifier_dir),
+        },
+        {
+            "type": "bind",
+            "source": str(trial_paths.artifacts_dir.resolve()),
+            "target": str(env_paths.artifacts_dir),
+        },
+    ]
+
+
 @dataclass
 class _ResourceCappedEnvironment:
     environment: BaseEnvironment
@@ -175,7 +200,8 @@ class HarborSession:
     trial_paths: TrialPaths
     environment: _ResourceCappedEnvironment
     raw_environment: BaseEnvironment
-    verifier: Verifier
+    verifier: Verifier | None
+    verifier_env_config: TaskEnvironmentConfig | None
 
 
 class HarborConfig(BaseModel):
@@ -295,16 +321,25 @@ class Harbor:
             harbor_environment,
             _cpu_resource_env(task.config.environment.cpus),
         )
+        verifier_env_config = resolve_effective_verifier_env_config(
+            task.config,
+            step_cfg=None,
+        )
         self._session = HarborSession(
             task=task,
             trial_paths=trial_paths,
             environment=capped_environment,
             raw_environment=harbor_environment,
-            verifier=Verifier(
-                task=task,
-                trial_paths=trial_paths,
-                environment=capped_environment,
+            verifier=(
+                None
+                if verifier_env_config is not None
+                else Verifier(
+                    task=task,
+                    trial_paths=trial_paths,
+                    environment=capped_environment,
+                )
             ),
+            verifier_env_config=verifier_env_config,
         )
 
     async def _bootstrap_environment(self) -> None:
@@ -469,9 +504,80 @@ class Harbor:
                 passed=result.return_code == 0,
             )
 
+    def _separate_verifier_session_id(self) -> str:
+        raw = f"{self.task_name}__{self.session.trial_paths.trial_dir.name}__verifier"
+        safe = "".join(char if char.isalnum() or char in "-._" else "_" for char in raw)
+        if len(safe) <= _MAX_VERIFIER_ENV_SESSION_ID_LEN:
+            return safe
+
+        digest = hashlib.sha1(safe.encode()).hexdigest()[:8]
+        suffix = f"__{digest}"
+        prefix = safe[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - len(suffix)].rstrip("-._")
+        return f"{prefix}{suffix}"
+
+    @contextlib.asynccontextmanager
+    async def _separate_verifier_environment(
+        self,
+        verifier_env_config: TaskEnvironmentConfig,
+    ) -> AsyncGenerator[_ResourceCappedEnvironment, None]:
+        from harbor.environments.factory import EnvironmentFactory
+
+        raw_environment = EnvironmentFactory.create_environment_from_config(
+            config=self.config.environment.model_copy(
+                update={"extra_docker_compose": []}
+            ),
+            environment_dir=self.session.task.paths.tests_dir,
+            environment_name=self.session.task.name,
+            session_id=self._separate_verifier_session_id(),
+            trial_paths=self.session.trial_paths,
+            task_env_config=verifier_env_config,
+            mounts=_verifier_log_mounts(
+                self.session.trial_paths,
+                verifier_env_config,
+            ),
+        )
+        try:
+            await raw_environment.start(force_build=False)
+            yield _ResourceCappedEnvironment(
+                raw_environment,
+                _cpu_resource_env(verifier_env_config.cpus),
+            )
+        finally:
+            try:
+                await asyncio.shield(self._stop_environment(raw_environment))
+            except Exception as exc:
+                logger.debug("Failed to stop separate verifier environment: %s", exc)
+
+    async def _verify_in_separate_environment(self) -> VerifierResult:
+        verifier_env_config = self.session.verifier_env_config
+        if verifier_env_config is None:
+            raise RuntimeError("Separate verifier mode did not resolve an environment")
+
+        async with self._separate_verifier_environment(
+            verifier_env_config
+        ) as verifier_environment:
+            with verifier_environment.with_default_user(
+                self.session.task.config.verifier.user
+            ):
+                env_paths = EnvironmentPaths.for_os(verifier_environment.os)
+                await verifier_environment.empty_dirs(
+                    [env_paths.verifier_dir],
+                    chmod=True,
+                )
+                verifier = Verifier(
+                    task=self.session.task,
+                    trial_paths=self.session.trial_paths,
+                    environment=verifier_environment,
+                    skip_tests_upload=True,
+                )
+                return await verifier.verify()
+
     async def verify(self) -> RawState:
         async with self._env_gate():
-            verifier_result = await self.session.verifier.verify()
+            if self.session.verifier is None:
+                verifier_result = await self._verify_in_separate_environment()
+            else:
+                verifier_result = await self.session.verifier.verify()
             rewards = verifier_result.rewards
             raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
             reward = 0.0 if raw_reward is None else float(raw_reward)
