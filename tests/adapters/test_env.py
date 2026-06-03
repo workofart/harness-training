@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from harbor.environments.base import ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
-from harbor.models.task.config import TaskOS
+from harbor.models.task.config import TaskOS, VerifierEnvironmentMode
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
@@ -294,7 +294,12 @@ def _attach_recording_harbor(
     verifier_env: dict[str, str] | None = None,
 ) -> tuple[Harbor, RecordingEnvironment]:
     task_dir = tmp_path / "task"
-    _write_minimal_task(task_dir, cpus=cpus, verifier_env=verifier_env)
+    _write_minimal_task(
+        task_dir,
+        cpus=cpus,
+        verifier_env=verifier_env,
+        verifier_environment_mode="shared",
+    )
     trial_paths = TrialPaths(trial_dir=tmp_path / "trial")
     trial_paths.mkdir()
     task = Task(task_dir=task_dir)
@@ -589,6 +594,9 @@ class LifecycleRecordingEnvironment:
         self.exec_calls: list[dict[str, object]] = []
         self.empty_dir_calls: list[dict[str, object]] = []
         self.upload_dir_calls: list[tuple[Path | str, str]] = []
+        self.download_dir_calls: list[tuple[str, Path | str]] = []
+        self.download_file_calls: list[tuple[str, Path | str]] = []
+        self.is_dir_values: dict[str, bool] = {}
 
     @contextlib.contextmanager
     def with_default_user(self, user):
@@ -610,6 +618,20 @@ class LifecycleRecordingEnvironment:
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str):
         self.upload_dir_calls.append((source_dir, target_dir))
+
+    async def download_dir(self, source_dir: str, target_dir: Path | str):
+        self.download_dir_calls.append((source_dir, target_dir))
+        Path(target_dir).mkdir(parents=True, exist_ok=True)
+        (Path(target_dir) / "workspace-marker.txt").write_text("downloaded\n")
+
+    async def download_file(self, source_path: str, target_path: Path | str):
+        self.download_file_calls.append((source_path, target_path))
+        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(target_path).write_text("downloaded\n")
+
+    async def is_dir(self, path: str, user: str | int | None = None) -> bool:
+        del user
+        return self.is_dir_values.get(path, True)
 
     async def empty_dirs(self, dirs, *, chmod: bool = True):
         self.empty_dir_calls.append({"dirs": dirs, "chmod": chmod})
@@ -708,10 +730,11 @@ def test_harbor_verify_runs_separate_verifier_environment(
     verifier_mounts_by_target = {
         mount["target"]: mount for mount in verifier_call["mounts"]
     }
-    assert set(verifier_mounts_by_target) == {"/logs/verifier", "/logs/artifacts"}
+    assert set(verifier_mounts_by_target) == {"/logs/verifier"}
     assert verifier_mounts_by_target["/logs/verifier"]["source"].endswith("/verifier")
-    assert verifier_mounts_by_target["/logs/artifacts"]["source"].endswith("/artifacts")
-    assert verifier_env.upload_dir_calls == []
+    assert not any(
+        source == task_dir / "tests" for source, _ in verifier_env.upload_dir_calls
+    )
     assert verifier_env.start_calls == [False]
     assert verifier_env.stop_calls == [True]
     assert agent_env.stop_calls == []
@@ -779,6 +802,61 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
 
     asyncio.run(harbor.close())
     assert created_envs[0].stop_calls == [True]
+
+
+def test_harbor_auto_converts_shared_tasks_to_official_separate_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+    existing_images: set[str] = set()
+    docker_calls: list[list[str]] = []
+
+    async def fake_docker_cli(args: list[str]) -> ExecResult:
+        docker_calls.append(args)
+        if args[:3] == ["image", "inspect", "--format"]:
+            image_name = args[-1]
+            if image_name not in existing_images:
+                raise RuntimeError(f"No such image: {image_name}")
+            return ExecResult(return_code=0, stdout="sha256:cached\n", stderr=None)
+        if args[:2] == ["build", "--tag"]:
+            existing_images.add(args[2])
+            return ExecResult(return_code=0, stdout="", stderr=None)
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+
+    asyncio.run(harbor.reset())
+    result = asyncio.run(harbor.verify())
+
+    assert result.passed is True
+    agent_env, verifier_env = created_envs
+    verifier_call = create_calls[1]
+    verifier_config = verifier_call["task_env_config"]
+    verifier_context = verifier_call["environment_dir"]
+    assert harbor.session.task.config.verifier.environment_mode == (
+        VerifierEnvironmentMode.SEPARATE
+    )
+    assert verifier_config.docker_image.startswith("hb-verifier-cache")
+    assert verifier_context != task_dir / "tests"
+    dockerfile = (verifier_context / "Dockerfile").read_text()
+    assert "FROM example/task:latest" in dockerfile
+    assert "WORKDIR /app" in dockerfile
+    assert "COPY . /tests/" in dockerfile
+    assert (verifier_context / "test.sh").exists()
+    assert agent_env.download_dir_calls == [
+        ("/app", harbor.session.trial_paths.artifacts_dir / "app")
+    ]
+    assert any(target == "/app" for _, target in verifier_env.upload_dir_calls)
+    assert any(args[:2] == ["build", "--tag"] for args in docker_calls)
+
+    asyncio.run(harbor.close())
 
 
 def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import shutil
 import tomllib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -15,7 +16,11 @@ from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.environment_type import EnvironmentType
-from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
+from harbor.models.task.config import (
+    EnvironmentConfig as TaskEnvironmentConfig,
+    TaskOS,
+    VerifierEnvironmentMode,
+)
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import resolve_effective_verifier_env_config
 from harbor.models.trial.config import EnvironmentConfig, ServiceVolumeConfig
@@ -39,6 +44,7 @@ DEFAULT_HARBOR_CONFIG_PATH = (
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
 _VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
+_VERIFIER_CONTEXT_LOCKS: dict[str, asyncio.Lock] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +150,14 @@ def _directory_content_hash(directory: Path) -> str:
     return digest.hexdigest()
 
 
+def _string_hash(*values: str) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _trial_log_mounts(
     trial_paths: TrialPaths,
     task: Task,
@@ -178,11 +192,6 @@ def _verifier_log_mounts(
             "type": "bind",
             "source": str(trial_paths.verifier_dir.resolve()),
             "target": str(env_paths.verifier_dir),
-        },
-        {
-            "type": "bind",
-            "source": str(trial_paths.artifacts_dir.resolve()),
-            "target": str(env_paths.artifacts_dir),
         },
     ]
 
@@ -223,6 +232,9 @@ class HarborSession:
     raw_environment: BaseEnvironment
     verifier: Verifier | None
     verifier_env_config: TaskEnvironmentConfig | None
+    verifier_build_context: Path | None
+    verifier_extra_artifacts: tuple[str, ...]
+    working_dir: str | None = None
 
 
 class HarborConfig(BaseModel):
@@ -342,10 +354,21 @@ class Harbor:
             harbor_environment,
             _cpu_resource_env(task.config.environment.cpus),
         )
-        verifier_env_config = resolve_effective_verifier_env_config(
-            task.config,
-            step_cfg=None,
-        )
+        verifier_build_context: Path | None = task.paths.tests_dir
+        verifier_extra_artifacts: tuple[str, ...] = ()
+        if self._should_auto_separate_verifier(task):
+            verifier_env_config = task.config.environment.model_copy(
+                deep=True,
+                update={"docker_image": None},
+            )
+            task.config.verifier.environment_mode = VerifierEnvironmentMode.SEPARATE
+            task.config.verifier.environment = verifier_env_config
+            verifier_build_context = None
+        else:
+            verifier_env_config = resolve_effective_verifier_env_config(
+                task.config,
+                step_cfg=None,
+            )
         self._session = HarborSession(
             task=task,
             trial_paths=trial_paths,
@@ -361,6 +384,21 @@ class Harbor:
                 )
             ),
             verifier_env_config=verifier_env_config,
+            verifier_build_context=verifier_build_context,
+            verifier_extra_artifacts=verifier_extra_artifacts,
+        )
+
+    def _should_auto_separate_verifier(self, task: Task) -> bool:
+        return (
+            not task.has_steps
+            and self.config.environment.type == EnvironmentType.DOCKER
+            and self.config.environment.import_path is None
+            and task.config.environment.os == TaskOS.LINUX
+            and task.config.environment.docker_image is not None
+            and task.config.verifier.environment_mode is None
+            and task.config.verifier.environment is None
+            and task.paths.discovered_test_path_for(task.config.environment.os)
+            is not None
         )
 
     async def _bootstrap_environment(self) -> None:
@@ -459,6 +497,9 @@ class Harbor:
                 )
                 await self._bootstrap_environment()
                 working_dir = await self._detect_working_dir()
+                self.session.working_dir = working_dir
+                if self.session.verifier_build_context is None:
+                    self.session.verifier_extra_artifacts = (working_dir,)
             return RawState(
                 instruction=task.instruction,
                 working_dir=working_dir,
@@ -536,27 +577,80 @@ class Harbor:
         prefix = safe[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - len(suffix)].rstrip("-._")
         return f"{prefix}{suffix}"
 
-    def _verifier_cache_image_name(self) -> str:
+    def _verifier_cache_image_name(self, build_context: Path) -> str:
         from harbor.environments.docker.docker import _sanitize_docker_image_name
 
         repository = _sanitize_docker_image_name(
             f"hb-verifier-cache__{self.session.task.name}"
         )
-        digest = _directory_content_hash(self.session.task.paths.tests_dir)[:16]
+        digest = _directory_content_hash(build_context)[:16]
         return f"{repository}:{digest}"
 
     def _should_cache_verifier_image(
         self,
         verifier_env_config: TaskEnvironmentConfig,
+        build_context: Path,
     ) -> bool:
-        tests_dir = self.session.task.paths.tests_dir
         return (
             self.config.environment.type == EnvironmentType.DOCKER
             and self.config.environment.import_path is None
             and verifier_env_config.docker_image is None
-            and (tests_dir / "Dockerfile").is_file()
-            and not (tests_dir / "docker-compose.yaml").exists()
+            and (build_context / "Dockerfile").is_file()
+            and not (build_context / "docker-compose.yaml").exists()
         )
+
+    def _generated_verifier_context_dir(self) -> Path:
+        base_image = self.session.task.config.environment.docker_image
+        working_dir = self.session.working_dir
+        if base_image is None or working_dir is None:
+            raise RuntimeError("Generated separate verifier context is not available")
+
+        digest = _string_hash(
+            "official-separate-verifier-v1",
+            base_image,
+            working_dir,
+            _directory_content_hash(self.session.task.paths.tests_dir),
+        )[:16]
+        return (
+            self.config.experiments_dir
+            / "_verifier_contexts"
+            / self.session.task.name
+            / digest
+        )
+
+    async def _ensure_generated_verifier_context(self) -> Path:
+        base_image = self.session.task.config.environment.docker_image
+        working_dir = self.session.working_dir
+        if base_image is None or working_dir is None:
+            raise RuntimeError("Generated separate verifier context is not available")
+
+        context_dir = self._generated_verifier_context_dir()
+        lock = _VERIFIER_CONTEXT_LOCKS.setdefault(str(context_dir), asyncio.Lock())
+        async with lock:
+            if (context_dir / "Dockerfile").exists():
+                return context_dir
+
+            context_dir.parent.mkdir(parents=True, exist_ok=True)
+            if context_dir.exists():
+                shutil.rmtree(context_dir)
+            shutil.copytree(self.session.task.paths.tests_dir, context_dir)
+            (context_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        f"FROM {base_image}",
+                        f"WORKDIR {working_dir}",
+                        "COPY . /tests/",
+                        "RUN chmod +x /tests/test.sh && mkdir -p /logs/verifier /logs/artifacts",
+                        "",
+                    ]
+                )
+            )
+        return context_dir
+
+    async def _verifier_build_context(self) -> Path:
+        if self.session.verifier_build_context is not None:
+            return self.session.verifier_build_context
+        return await self._ensure_generated_verifier_context()
 
     async def _docker_image_exists(self, image_name: str) -> bool:
         try:
@@ -584,16 +678,52 @@ class Harbor:
     async def _verifier_env_config_with_cached_image(
         self,
         verifier_env_config: TaskEnvironmentConfig,
+        build_context: Path,
     ) -> TaskEnvironmentConfig:
-        if not self._should_cache_verifier_image(verifier_env_config):
+        if not self._should_cache_verifier_image(verifier_env_config, build_context):
             return verifier_env_config
 
-        image_name = self._verifier_cache_image_name()
+        image_name = self._verifier_cache_image_name(build_context)
         await self._ensure_cached_verifier_image(
             image_name=image_name,
-            build_context=self.session.task.paths.tests_dir,
+            build_context=build_context,
         )
         return verifier_env_config.model_copy(update={"docker_image": image_name})
+
+    def _artifact_handler(self):
+        from harbor.trial.artifact_handler import ArtifactHandler
+
+        return ArtifactHandler(
+            artifacts=self.session.task.config.artifacts,
+            logger=logger,
+        )
+
+    async def _collect_separate_verifier_artifacts(self) -> None:
+        agent_env_paths = EnvironmentPaths.for_os(
+            self.session.task.config.environment.os
+        )
+        await self._artifact_handler().download_artifacts(
+            self.session.environment,
+            self.session.trial_paths.artifacts_dir,
+            source_artifacts_dir=agent_env_paths.artifacts_dir,
+            artifacts=self.session.verifier_extra_artifacts,
+        )
+
+    async def _upload_separate_verifier_artifacts(
+        self,
+        verifier_environment: _ResourceCappedEnvironment,
+    ) -> None:
+        agent_env_paths = EnvironmentPaths.for_os(
+            self.session.task.config.environment.os
+        )
+        verifier_env_paths = EnvironmentPaths.for_os(verifier_environment.os)
+        await self._artifact_handler().upload_artifacts(
+            verifier_environment,
+            artifacts_dir=self.session.trial_paths.artifacts_dir,
+            source_artifacts_dir=agent_env_paths.artifacts_dir,
+            target_artifacts_dir=verifier_env_paths.artifacts_dir,
+            artifacts=self.session.verifier_extra_artifacts,
+        )
 
     @contextlib.asynccontextmanager
     async def _separate_verifier_environment(
@@ -602,14 +732,16 @@ class Harbor:
     ) -> AsyncGenerator[_ResourceCappedEnvironment, None]:
         from harbor.environments.factory import EnvironmentFactory
 
+        build_context = await self._verifier_build_context()
         verifier_env_config = await self._verifier_env_config_with_cached_image(
-            verifier_env_config
+            verifier_env_config,
+            build_context,
         )
         raw_environment = EnvironmentFactory.create_environment_from_config(
             config=self.config.environment.model_copy(
                 update={"extra_docker_compose": []}
             ),
-            environment_dir=self.session.task.paths.tests_dir,
+            environment_dir=build_context,
             environment_name=self.session.task.name,
             session_id=self._separate_verifier_session_id(),
             trial_paths=self.session.trial_paths,
@@ -636,6 +768,7 @@ class Harbor:
         if verifier_env_config is None:
             raise RuntimeError("Separate verifier mode did not resolve an environment")
 
+        await self._collect_separate_verifier_artifacts()
         async with self._separate_verifier_environment(
             verifier_env_config
         ) as verifier_environment:
@@ -647,6 +780,7 @@ class Harbor:
                     [env_paths.verifier_dir],
                     chmod=True,
                 )
+                await self._upload_separate_verifier_artifacts(verifier_environment)
                 verifier = Verifier(
                     task=self.session.task,
                     trial_paths=self.session.trial_paths,
