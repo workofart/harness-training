@@ -92,14 +92,16 @@ def _compile_panel_specs(harness_config: HarnessConfig) -> tuple[PanelSpec, ...]
     return tuple(specs)
 
 
-def _prepare_task_dirs(
+async def _prepare_task_dirs(
     *,
     trial_harbor_config: HarborConfig,
     task_names: Sequence[str],
 ) -> dict[str, Path]:
     from src.adapters.env import TaskDirectoryResolver
 
-    return dict(TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names)))
+    return dict(
+        await TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names))
+    )
 
 
 def _load_task_duration_priors(
@@ -702,11 +704,15 @@ class ExperimentRunner:
             trial_harbor_config = harbor_config.model_copy(
                 update={"experiments_dir": experiment_dir / "tasks"}
             )
-            task_dirs = _prepare_task_dirs(
-                trial_harbor_config=trial_harbor_config,
-                task_names=[
-                    task_name for spec in panel_specs for task_name in spec.task_names
-                ],
+            task_dirs = asyncio.run(
+                _prepare_task_dirs(
+                    trial_harbor_config=trial_harbor_config,
+                    task_names=[
+                        task_name
+                        for spec in panel_specs
+                        for task_name in spec.task_names
+                    ],
+                )
             )
             for spec in panel_specs:
                 panel = record.panels[spec.panel_id]
@@ -863,14 +869,16 @@ class ExperimentRunner:
                 candidate=self.record,
                 baseline=baseline,
             )
-            self._task_dirs = _prepare_task_dirs(
-                trial_harbor_config=self._trial_harbor_config(),
-                task_names=[
-                    task_name
-                    for spec in self.panel_specs
-                    if spec.initial_lifecycle == "active"
-                    for task_name in spec.task_names
-                ],
+            self._task_dirs = asyncio.run(
+                _prepare_task_dirs(
+                    trial_harbor_config=self._trial_harbor_config(),
+                    task_names=[
+                        task_name
+                        for spec in self.panel_specs
+                        if spec.initial_lifecycle == "active"
+                        for task_name in spec.task_names
+                    ],
+                )
             )
             self.record.started_at = datetime.now(timezone.utc).isoformat()
             self.record.write(root=self.experiments_root)
@@ -941,7 +949,7 @@ class ExperimentRunner:
                 ]
                 if missing_task_dirs:
                     self._task_dirs.update(
-                        _prepare_task_dirs(
+                        await _prepare_task_dirs(
                             trial_harbor_config=self._trial_harbor_config(),
                             task_names=missing_task_dirs,
                         )

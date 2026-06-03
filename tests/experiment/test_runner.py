@@ -288,7 +288,7 @@ def _stub_baseline_task_environment(monkeypatch, tmp_path: Path) -> None:
         def __init__(self, config):
             self.config = config
 
-        def resolve(self, task_names):
+        async def resolve(self, task_names):
             return {
                 task_name: tmp_path / "tasks" / task_name for task_name in task_names
             }
@@ -2007,13 +2007,12 @@ def test_run_experiment_runs_test_panel_after_train_pass_and_blocks_regression(
     )
     stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(
-        runner,
-        "_prepare_task_dirs",
-        lambda *, trial_harbor_config, task_names: {
-            task_name: tmp_path / "tasks" / task_name for task_name in task_names
-        },
-    )
+
+    async def fake_prepare_task_dirs(*, trial_harbor_config, task_names):
+        del trial_harbor_config
+        return {task_name: tmp_path / "tasks" / task_name for task_name in task_names}
+
+    monkeypatch.setattr(runner, "_prepare_task_dirs", fake_prepare_task_dirs)
 
     async def fake_run_task(*, task_name, task_timeout_sec, **_kwargs):
         if task_name == "train-a":
@@ -2046,6 +2045,91 @@ def test_run_experiment_runs_test_panel_after_train_pass_and_blocks_regression(
         experiment_runner.record.evidence.panel_outcomes["test"][0].outcome
         == "regression"
     )
+
+
+def test_run_experiment_resolves_pending_panel_tasks_inside_event_loop(
+    monkeypatch, tmp_path
+):
+    from harbor.registry.client import factory as registry_factory
+    from harbor.tasks import client as tasks_client
+
+    monkeypatch.setattr(
+        runner.control_repo,
+        "update_ref",
+        lambda ref_name, commit_hash, *, cwd=None: None,
+    )
+    downloaded_test_dir = tmp_path / "downloaded" / "test-a"
+    registry_downloads: list[list[str]] = []
+
+    class FakeTaskId:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def get_name(self) -> str:
+            return self.name
+
+    class FakeRegistryClient:
+        async def get_dataset_metadata(self, dataset_name):
+            assert dataset_name == "terminal-bench"
+            return SimpleNamespace(task_ids=[FakeTaskId("test-a")])
+
+    class FakeTaskClient:
+        async def download_tasks(self, task_ids):
+            names = [task_id.get_name() for task_id in task_ids]
+            registry_downloads.append(names)
+            assert names == ["test-a"]
+            return SimpleNamespace(paths=[downloaded_test_dir])
+
+    monkeypatch.setattr(
+        registry_factory.RegistryClientFactory,
+        "create",
+        staticmethod(lambda: FakeRegistryClient()),
+    )
+    monkeypatch.setattr(tasks_client, "TaskClient", FakeTaskClient)
+    baseline = _baseline_with_train_and_test(
+        train_solves=[False, False, False],
+        test_solves=[False, False, False],
+    )
+    experiment_runner = make_runner(
+        monkeypatch,
+        tmp_path,
+        experiment_id="exp-pending-panel-resolves",
+        focus_name="focus",
+        train_task_names=["train-a"],
+        test_task_names=["test-a"],
+        task_trials=3,
+        max_trial_concurrency=1,
+        task_dirs=["train-a"],
+        harbor_config=_FakeHarborConfig(
+            experiments_dir=tmp_path / "experiments",
+            task_overrides_dir=tmp_path / "overrides",
+            dataset_name="terminal-bench",
+            dataset_version=None,
+        ),
+    )
+    stub_trial_factories(monkeypatch, experiment_runner)
+    experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(experiment_runner, "_make_llm", lambda: object(), raising=False)
+
+    def fake_make_env(task_name, *, task_dir, exec_semaphore=None):
+        del exec_semaphore
+        if task_name == "test-a":
+            assert task_dir == downloaded_test_dir
+        return object()
+
+    monkeypatch.setattr(experiment_runner, "_make_env", fake_make_env, raising=False)
+
+    async def fake_run_task(*, task_name, **_kwargs):
+        return _panel_trial_result(task_name, solved=True, index=0)
+
+    monkeypatch.setattr(runner, "run_task", fake_run_task)
+
+    asyncio.run(experiment_runner._run_experiment(baseline=baseline))
+
+    assert registry_downloads == [["test-a"]]
+    assert experiment_runner.record.status == "keep"
+    assert not experiment_runner.record.error
+    assert experiment_runner.record.panels["test"].lifecycle == "finished"
 
 
 def test_run_experiment_test_panel_improvement_does_not_replace_promotion_decision(

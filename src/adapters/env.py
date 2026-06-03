@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
+import shutil
 import tomllib
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
-from harbor.models.task.paths import TaskPaths
+from harbor.models.environment_type import EnvironmentType
+from harbor.models.task.config import (
+    EnvironmentConfig as TaskEnvironmentConfig,
+    TaskOS,
+    VerifierEnvironmentMode,
+)
 from harbor.models.task.task import Task
-from harbor.models.trial.config import EnvironmentConfig
-from harbor.models.trial.paths import TrialPaths
+from harbor.models.task.verifier_mode import resolve_effective_verifier_env_config
+from harbor.models.trial.config import EnvironmentConfig, ServiceVolumeConfig
+from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+from harbor.models.verifier.result import VerifierResult
 from harbor.verifier.verifier import Verifier
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -32,6 +42,9 @@ DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"
 )
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
+_MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
+_VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
+_VERIFIER_CONTEXT_LOCKS: dict[str, asyncio.Lock] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -107,13 +120,80 @@ _CPU_THREAD_ENV_KEYS = (
 )
 
 
-def _cpu_resource_env(cpus: int) -> dict[str, str]:
+def _cpu_resource_env(cpus: int | None) -> dict[str, str]:
+    if cpus is None:
+        return {"TOKENIZERS_PARALLELISM": "false"}
     cap = str(cpus)
     return {
         **{key: cap for key in _CPU_THREAD_ENV_KEYS},
         "MAKEFLAGS": f"-j{cap}",
         "TOKENIZERS_PARALLELISM": "false",
     }
+
+
+def _directory_content_hash(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        relative_path = path.relative_to(directory).as_posix().encode()
+        digest.update(relative_path)
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"L")
+            digest.update(str(path.readlink()).encode())
+        elif path.is_file():
+            digest.update(b"F")
+            with path.open("rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif path.is_dir():
+            digest.update(b"D")
+    return digest.hexdigest()
+
+
+def _string_hash(*values: str) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _trial_log_mounts(
+    trial_paths: TrialPaths,
+    task: Task,
+) -> list[ServiceVolumeConfig]:
+    env_paths = EnvironmentPaths.for_os(task.config.environment.os)
+    return [
+        {
+            "type": "bind",
+            "source": str(trial_paths.agent_dir.resolve()),
+            "target": str(env_paths.agent_dir),
+        },
+        {
+            "type": "bind",
+            "source": str(trial_paths.verifier_dir.resolve()),
+            "target": str(env_paths.verifier_dir),
+        },
+        {
+            "type": "bind",
+            "source": str(trial_paths.artifacts_dir.resolve()),
+            "target": str(env_paths.artifacts_dir),
+        },
+    ]
+
+
+def _verifier_log_mounts(
+    trial_paths: TrialPaths,
+    verifier_env_config: TaskEnvironmentConfig,
+) -> list[ServiceVolumeConfig]:
+    env_paths = EnvironmentPaths.for_os(verifier_env_config.os)
+    return [
+        {
+            "type": "bind",
+            "source": str(trial_paths.verifier_dir.resolve()),
+            "target": str(env_paths.verifier_dir),
+        },
+    ]
 
 
 @dataclass
@@ -130,6 +210,7 @@ class _ResourceCappedEnvironment:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
+        user: str | int | None = None,
     ) -> ExecResult:
         merged_env = dict(self.resource_env)
         if env is not None:
@@ -139,6 +220,7 @@ class _ResourceCappedEnvironment:
             cwd=cwd,
             env=merged_env,
             timeout_sec=timeout_sec,
+            user=user,
         )
 
 
@@ -148,7 +230,11 @@ class HarborSession:
     trial_paths: TrialPaths
     environment: _ResourceCappedEnvironment
     raw_environment: BaseEnvironment
-    verifier: Verifier
+    verifier: Verifier | None
+    verifier_env_config: TaskEnvironmentConfig | None
+    verifier_build_context: Path | None
+    verifier_extra_artifacts: tuple[str, ...]
+    working_dir: str | None = None
 
 
 class HarborConfig(BaseModel):
@@ -268,16 +354,51 @@ class Harbor:
             harbor_environment,
             _cpu_resource_env(task.config.environment.cpus),
         )
+        verifier_build_context: Path | None = task.paths.tests_dir
+        verifier_extra_artifacts: tuple[str, ...] = ()
+        if self._should_auto_separate_verifier(task):
+            verifier_env_config = task.config.environment.model_copy(
+                deep=True,
+                update={"docker_image": None},
+            )
+            task.config.verifier.environment_mode = VerifierEnvironmentMode.SEPARATE
+            task.config.verifier.environment = verifier_env_config
+            verifier_build_context = None
+        else:
+            verifier_env_config = resolve_effective_verifier_env_config(
+                task.config,
+                step_cfg=None,
+            )
         self._session = HarborSession(
             task=task,
             trial_paths=trial_paths,
             environment=capped_environment,
             raw_environment=harbor_environment,
-            verifier=Verifier(
-                task=task,
-                trial_paths=trial_paths,
-                environment=capped_environment,
+            verifier=(
+                None
+                if verifier_env_config is not None
+                else Verifier(
+                    task=task,
+                    trial_paths=trial_paths,
+                    environment=capped_environment,
+                )
             ),
+            verifier_env_config=verifier_env_config,
+            verifier_build_context=verifier_build_context,
+            verifier_extra_artifacts=verifier_extra_artifacts,
+        )
+
+    def _should_auto_separate_verifier(self, task: Task) -> bool:
+        return (
+            not task.has_steps
+            and self.config.environment.type == EnvironmentType.DOCKER
+            and self.config.environment.import_path is None
+            and task.config.environment.os == TaskOS.LINUX
+            and task.config.environment.docker_image is not None
+            and task.config.verifier.environment_mode is None
+            and task.config.verifier.environment is None
+            and task.paths.discovered_test_path_for(task.config.environment.os)
+            is not None
         )
 
     async def _bootstrap_environment(self) -> None:
@@ -362,6 +483,7 @@ class Harbor:
             session_id=session_id,
             trial_paths=trial_paths,
             task_env_config=task.config.environment,
+            mounts=_trial_log_mounts(trial_paths, task),
         )
         try:
             async with self._env_gate():
@@ -375,6 +497,9 @@ class Harbor:
                 )
                 await self._bootstrap_environment()
                 working_dir = await self._detect_working_dir()
+                self.session.working_dir = working_dir
+                if self.session.verifier_build_context is None:
+                    self.session.verifier_extra_artifacts = (working_dir,)
             return RawState(
                 instruction=task.instruction,
                 working_dir=working_dir,
@@ -441,9 +566,237 @@ class Harbor:
                 passed=result.return_code == 0,
             )
 
+    def _separate_verifier_session_id(self) -> str:
+        raw = f"{self.task_name}__{self.session.trial_paths.trial_dir.name}__verifier"
+        safe = "".join(char if char.isalnum() or char in "-._" else "_" for char in raw)
+        if len(safe) <= _MAX_VERIFIER_ENV_SESSION_ID_LEN:
+            return safe
+
+        digest = hashlib.sha1(safe.encode()).hexdigest()[:8]
+        suffix = f"__{digest}"
+        prefix = safe[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - len(suffix)].rstrip("-._")
+        return f"{prefix}{suffix}"
+
+    def _verifier_cache_image_name(self, build_context: Path) -> str:
+        from harbor.environments.docker.docker import _sanitize_docker_image_name
+
+        repository = _sanitize_docker_image_name(
+            f"hb-verifier-cache__{self.session.task.name}"
+        )
+        digest = _directory_content_hash(build_context)[:16]
+        return f"{repository}:{digest}"
+
+    def _should_cache_verifier_image(
+        self,
+        verifier_env_config: TaskEnvironmentConfig,
+        build_context: Path,
+    ) -> bool:
+        return (
+            self.config.environment.type == EnvironmentType.DOCKER
+            and self.config.environment.import_path is None
+            and verifier_env_config.docker_image is None
+            and (build_context / "Dockerfile").is_file()
+            and not (build_context / "docker-compose.yaml").exists()
+        )
+
+    def _generated_verifier_context_dir(self) -> Path:
+        base_image = self.session.task.config.environment.docker_image
+        working_dir = self.session.working_dir
+        if base_image is None or working_dir is None:
+            raise RuntimeError("Generated separate verifier context is not available")
+
+        digest = _string_hash(
+            "official-separate-verifier-v1",
+            base_image,
+            working_dir,
+            _directory_content_hash(self.session.task.paths.tests_dir),
+        )[:16]
+        return (
+            self.config.experiments_dir
+            / "_verifier_contexts"
+            / self.session.task.name
+            / digest
+        )
+
+    async def _ensure_generated_verifier_context(self) -> Path:
+        base_image = self.session.task.config.environment.docker_image
+        working_dir = self.session.working_dir
+        if base_image is None or working_dir is None:
+            raise RuntimeError("Generated separate verifier context is not available")
+
+        context_dir = self._generated_verifier_context_dir()
+        lock = _VERIFIER_CONTEXT_LOCKS.setdefault(str(context_dir), asyncio.Lock())
+        async with lock:
+            if (context_dir / "Dockerfile").exists():
+                return context_dir
+
+            context_dir.parent.mkdir(parents=True, exist_ok=True)
+            if context_dir.exists():
+                shutil.rmtree(context_dir)
+            shutil.copytree(self.session.task.paths.tests_dir, context_dir)
+            (context_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        f"FROM {base_image}",
+                        f"WORKDIR {working_dir}",
+                        "COPY . /tests/",
+                        "RUN chmod +x /tests/test.sh && mkdir -p /logs/verifier /logs/artifacts",
+                        "",
+                    ]
+                )
+            )
+        return context_dir
+
+    async def _verifier_build_context(self) -> Path:
+        if self.session.verifier_build_context is not None:
+            return self.session.verifier_build_context
+        return await self._ensure_generated_verifier_context()
+
+    async def _docker_image_exists(self, image_name: str) -> bool:
+        try:
+            await self._run_docker_cli(
+                ["image", "inspect", "--format", "{{.Id}}", image_name],
+                failure_context="Docker image inspect failed",
+            )
+        except RuntimeError:
+            return False
+        return True
+
+    async def _ensure_cached_verifier_image(
+        self,
+        *,
+        image_name: str,
+        build_context: Path,
+    ) -> None:
+        lock = _VERIFIER_IMAGE_BUILD_LOCKS.setdefault(image_name, asyncio.Lock())
+        async with lock:
+            if await self._docker_image_exists(image_name):
+                return
+            await self._run_docker_cli(
+                ["build", "--tag", image_name, str(build_context.resolve())],
+                failure_context="Docker image build failed",
+            )
+
+    async def _verifier_env_config_with_cached_image(
+        self,
+        verifier_env_config: TaskEnvironmentConfig,
+        build_context: Path,
+    ) -> TaskEnvironmentConfig:
+        if not self._should_cache_verifier_image(verifier_env_config, build_context):
+            return verifier_env_config
+
+        image_name = self._verifier_cache_image_name(build_context)
+        await self._ensure_cached_verifier_image(
+            image_name=image_name,
+            build_context=build_context,
+        )
+        return verifier_env_config.model_copy(update={"docker_image": image_name})
+
+    def _artifact_handler(self):
+        from harbor.trial.artifact_handler import ArtifactHandler
+
+        return ArtifactHandler(
+            artifacts=self.session.task.config.artifacts,
+            logger=logger,
+        )
+
+    async def _collect_separate_verifier_artifacts(self) -> None:
+        agent_env_paths = EnvironmentPaths.for_os(
+            self.session.task.config.environment.os
+        )
+        await self._artifact_handler().download_artifacts(
+            self.session.environment,
+            self.session.trial_paths.artifacts_dir,
+            source_artifacts_dir=agent_env_paths.artifacts_dir,
+            artifacts=self.session.verifier_extra_artifacts,
+        )
+
+    async def _upload_separate_verifier_artifacts(
+        self,
+        verifier_environment: _ResourceCappedEnvironment,
+    ) -> None:
+        agent_env_paths = EnvironmentPaths.for_os(
+            self.session.task.config.environment.os
+        )
+        verifier_env_paths = EnvironmentPaths.for_os(verifier_environment.os)
+        await self._artifact_handler().upload_artifacts(
+            verifier_environment,
+            artifacts_dir=self.session.trial_paths.artifacts_dir,
+            source_artifacts_dir=agent_env_paths.artifacts_dir,
+            target_artifacts_dir=verifier_env_paths.artifacts_dir,
+            artifacts=self.session.verifier_extra_artifacts,
+        )
+
+    @contextlib.asynccontextmanager
+    async def _separate_verifier_environment(
+        self,
+        verifier_env_config: TaskEnvironmentConfig,
+    ) -> AsyncGenerator[_ResourceCappedEnvironment, None]:
+        from harbor.environments.factory import EnvironmentFactory
+
+        build_context = await self._verifier_build_context()
+        verifier_env_config = await self._verifier_env_config_with_cached_image(
+            verifier_env_config,
+            build_context,
+        )
+        raw_environment = EnvironmentFactory.create_environment_from_config(
+            config=self.config.environment.model_copy(
+                update={"extra_docker_compose": []}
+            ),
+            environment_dir=build_context,
+            environment_name=self.session.task.name,
+            session_id=self._separate_verifier_session_id(),
+            trial_paths=self.session.trial_paths,
+            task_env_config=verifier_env_config,
+            mounts=_verifier_log_mounts(
+                self.session.trial_paths,
+                verifier_env_config,
+            ),
+        )
+        try:
+            await raw_environment.start(force_build=False)
+            yield _ResourceCappedEnvironment(
+                raw_environment,
+                _cpu_resource_env(verifier_env_config.cpus),
+            )
+        finally:
+            try:
+                await asyncio.shield(self._stop_environment(raw_environment))
+            except Exception as exc:
+                logger.debug("Failed to stop separate verifier environment: %s", exc)
+
+    async def _verify_in_separate_environment(self) -> VerifierResult:
+        verifier_env_config = self.session.verifier_env_config
+        if verifier_env_config is None:
+            raise RuntimeError("Separate verifier mode did not resolve an environment")
+
+        await self._collect_separate_verifier_artifacts()
+        async with self._separate_verifier_environment(
+            verifier_env_config
+        ) as verifier_environment:
+            with verifier_environment.with_default_user(
+                self.session.task.config.verifier.user
+            ):
+                env_paths = EnvironmentPaths.for_os(verifier_environment.os)
+                await verifier_environment.empty_dirs(
+                    [env_paths.verifier_dir],
+                    chmod=True,
+                )
+                await self._upload_separate_verifier_artifacts(verifier_environment)
+                verifier = Verifier(
+                    task=self.session.task,
+                    trial_paths=self.session.trial_paths,
+                    environment=verifier_environment,
+                    skip_tests_upload=True,
+                )
+                return await verifier.verify()
+
     async def verify(self) -> RawState:
         async with self._env_gate():
-            verifier_result = await self.session.verifier.verify()
+            if self.session.verifier is None:
+                verifier_result = await self._verify_in_separate_environment()
+            else:
+                verifier_result = await self.session.verifier.verify()
             rewards = verifier_result.rewards
             raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
             reward = 0.0 if raw_reward is None else float(raw_reward)
@@ -463,7 +816,12 @@ class Harbor:
             raise RuntimeError("failed to detect environment working directory")
         return result.stdout.strip()
 
-    async def _run_docker_cli(self, args: list[str]) -> ExecResult:
+    async def _run_docker_cli(
+        self,
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
         process = await asyncio.create_subprocess_exec(
             "docker",
             *args,
@@ -480,7 +838,7 @@ class Harbor:
         )
         if result.return_code != 0:
             raise RuntimeError(
-                "Docker cleanup command failed. "
+                f"{failure_context}. "
                 f"Command: docker {' '.join(args)}. "
                 f"Return code: {result.return_code}. "
                 f"Output: {result.stdout}."
@@ -489,9 +847,13 @@ class Harbor:
 
     @staticmethod
     def _docker_compose_project_name(env: BaseEnvironment) -> str:
+        from harbor.environments.docker.docker import (
+            _sanitize_docker_compose_project_name,
+        )
+
         # Must stay in sync with Harbor's private DockerEnvironment
         # `docker compose -p` derivation; drift makes label cleanup a no-op.
-        return env.session_id.lower().replace(".", "-")
+        return _sanitize_docker_compose_project_name(env.session_id)
 
     async def _docker_ids_by_project_label(
         self,
@@ -503,7 +865,10 @@ class Harbor:
         args = [resource, "ls", "--quiet", "--filter", label]
         if resource == "container":
             args.insert(2, "--all")
-        result = await self._run_docker_cli(args)
+        result = await self._run_docker_cli(
+            args,
+            failure_context="Docker cleanup command failed",
+        )
         return [line for line in (result.stdout or "").splitlines() if line]
 
     async def _cleanup_docker_project_by_label(self, project_name: str) -> None:
@@ -513,7 +878,8 @@ class Harbor:
         )
         if container_ids:
             await self._run_docker_cli(
-                ["container", "rm", "--force", "--volumes", *container_ids]
+                ["container", "rm", "--force", "--volumes", *container_ids],
+                failure_context="Docker cleanup command failed",
             )
 
         volume_ids = await self._docker_ids_by_project_label(
@@ -521,14 +887,20 @@ class Harbor:
             project_name=project_name,
         )
         if volume_ids:
-            await self._run_docker_cli(["volume", "rm", "--force", *volume_ids])
+            await self._run_docker_cli(
+                ["volume", "rm", "--force", *volume_ids],
+                failure_context="Docker cleanup command failed",
+            )
 
         network_ids = await self._docker_ids_by_project_label(
             resource="network",
             project_name=project_name,
         )
         if network_ids:
-            await self._run_docker_cli(["network", "rm", *network_ids])
+            await self._run_docker_cli(
+                ["network", "rm", *network_ids],
+                failure_context="Docker cleanup command failed",
+            )
 
     async def _stop_environment(self, env: BaseEnvironment) -> None:
         from harbor.environments.docker.docker import DockerEnvironment
@@ -578,7 +950,7 @@ class TaskDirectoryResolver:
     def __init__(self, config: HarborConfig) -> None:
         self.config = config
 
-    def resolve(self, task_names: list[str]) -> dict[str, Path]:
+    async def resolve(self, task_names: list[str]) -> dict[str, Path]:
         resolved: dict[str, Path] = {}
         needs_registry: list[str] = []
         for task_name in dict.fromkeys(task_names):
@@ -595,14 +967,16 @@ class TaskDirectoryResolver:
         from harbor.tasks.client import TaskClient
 
         registry_client = RegistryClientFactory.create()
-        dataset = registry_client.get_dataset_spec(
-            self.config.dataset_name,
-            self.config.dataset_version,
-        )
-        task_client = TaskClient()
+        dataset_ref = self.config.dataset_name
+        if self.config.dataset_version is not None:
+            dataset_ref = f"{dataset_ref}@{self.config.dataset_version}"
+        metadata = await registry_client.get_dataset_metadata(dataset_ref)
+        task_ids = list(metadata.task_ids)
         pending_ids = []
         for task_name in needs_registry:
-            matches = [task for task in dataset.tasks if task.name == task_name]
+            matches = [
+                task_id for task_id in task_ids if task_id.get_name() == task_name
+            ]
             if not matches:
                 raise ValueError(
                     f"Task `{task_name}` was not found in dataset "
@@ -613,12 +987,13 @@ class TaskDirectoryResolver:
                     f"Task `{task_name}` matched multiple registry entries in "
                     f"`{self.config.dataset_name}`."
                 )
-            pending_ids.append((task_name, matches[0].to_source_task_id()))
+            pending_ids.append((task_name, matches[0]))
 
-        downloaded = task_client.download_tasks(
-            [source_id for _, source_id in pending_ids]
+        task_client = TaskClient()
+        downloaded = await task_client.download_tasks(
+            [task_id for _, task_id in pending_ids]
         )
-        for (task_name, _), path in zip(pending_ids, downloaded, strict=True):
+        for (task_name, _), path in zip(pending_ids, downloaded.paths, strict=True):
             resolved[task_name] = path
         return resolved
 
@@ -630,6 +1005,6 @@ class TaskDirectoryResolver:
         if not override_dir.exists():
             return None
 
-        if not TaskPaths(override_dir).is_valid():
+        if not Task.is_valid_dir(override_dir):
             raise RuntimeError(f"local task override is invalid: {override_dir}")
         return override_dir
