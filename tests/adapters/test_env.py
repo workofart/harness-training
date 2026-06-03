@@ -20,6 +20,7 @@ def _write_minimal_task(
     task_dir: Path,
     *,
     cpus: int | None = 1,
+    docker_image: str | None = "example/task:latest",
     verifier_env: dict[str, str] | None = None,
     verifier_environment_mode: str | None = None,
     verifier_docker_image: str | None = None,
@@ -32,8 +33,9 @@ def _write_minimal_task(
         'version = "1.0"',
         "",
         "[environment]",
-        'docker_image = "example/task:latest"',
     ]
+    if docker_image is not None:
+        task_toml.append(f'docker_image = "{docker_image}"')
     if cpus is not None:
         task_toml.append(f"cpus = {cpus}")
     if verifier_environment_mode is not None or verifier_docker_image is not None:
@@ -574,76 +576,77 @@ def test_harbor_reset_passes_trial_log_mounts_to_environment(
     assert mounts_by_target["/logs/artifacts"]["source"].endswith("/artifacts")
 
 
-def test_harbor_verify_runs_separate_verifier_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from harbor.environments.factory import EnvironmentFactory
+class LifecycleRecordingEnvironment:
+    os = TaskOS.LINUX
+    capabilities = SimpleNamespace(mounted=True)
 
-    class LifecycleRecordingEnvironment:
-        os = TaskOS.LINUX
-        capabilities = SimpleNamespace(mounted=True)
+    def __init__(self, *, trial_paths: TrialPaths, label: str) -> None:
+        self.trial_paths = trial_paths
+        self.label = label
+        self.default_user = None
+        self.start_calls: list[bool] = []
+        self.stop_calls: list[bool] = []
+        self.exec_calls: list[dict[str, object]] = []
+        self.empty_dir_calls: list[dict[str, object]] = []
+        self.upload_dir_calls: list[tuple[Path | str, str]] = []
 
-        def __init__(self, *, trial_paths: TrialPaths, label: str) -> None:
-            self.trial_paths = trial_paths
-            self.label = label
-            self.default_user = None
-            self.start_calls: list[bool] = []
-            self.stop_calls: list[bool] = []
-            self.exec_calls: list[dict[str, object]] = []
-            self.empty_dir_calls: list[dict[str, object]] = []
-            self.upload_dir_calls: list[tuple[Path | str, str]] = []
+    @contextlib.contextmanager
+    def with_default_user(self, user):
+        previous = self.default_user
+        self.default_user = user
+        try:
+            yield
+        finally:
+            self.default_user = previous
 
-        @contextlib.contextmanager
-        def with_default_user(self, user):
-            previous = self.default_user
-            self.default_user = user
-            try:
-                yield
-            finally:
-                self.default_user = previous
+    async def start(self, *, force_build: bool) -> None:
+        self.start_calls.append(force_build)
 
-        async def start(self, *, force_build: bool) -> None:
-            self.start_calls.append(force_build)
+    async def stop(self, *, delete: bool):
+        self.stop_calls.append(delete)
 
-        async def stop(self, *, delete: bool):
-            self.stop_calls.append(delete)
+    async def upload_file(self, source_path: Path | str, target_path: str):
+        del source_path, target_path
 
-        async def upload_file(self, source_path: Path | str, target_path: str):
-            del source_path, target_path
+    async def upload_dir(self, source_dir: Path | str, target_dir: str):
+        self.upload_dir_calls.append((source_dir, target_dir))
 
-        async def upload_dir(self, source_dir: Path | str, target_dir: str):
-            self.upload_dir_calls.append((source_dir, target_dir))
+    async def empty_dirs(self, dirs, *, chmod: bool = True):
+        self.empty_dir_calls.append({"dirs": dirs, "chmod": chmod})
+        return ExecResult(return_code=0, stdout="", stderr="")
 
-        async def empty_dirs(self, dirs, *, chmod: bool = True):
-            self.empty_dir_calls.append({"dirs": dirs, "chmod": chmod})
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-        async def exec(
-            self,
-            command: str,
-            cwd: str | None = None,
-            env: dict[str, str] | None = None,
-            timeout_sec: int | None = None,
-            user: str | int | None = None,
-        ) -> ExecResult:
-            effective_user = user if user is not None else self.default_user
-            self.exec_calls.append(
-                {
-                    "command": command,
-                    "cwd": cwd,
-                    "env": env,
-                    "timeout_sec": timeout_sec,
-                    "user": effective_user,
-                }
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        effective_user = user if user is not None else self.default_user
+        self.exec_calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout_sec": timeout_sec,
+                "user": effective_user,
+            }
+        )
+        if command == "pwd":
+            return ExecResult(return_code=0, stdout="/app\n", stderr="")
+        if "/tests/test.sh" in command:
+            self.trial_paths.reward_text_path.write_text("1.0")
+            self.trial_paths.test_stdout_path.write_text(
+                f"{self.label} verifier stdout\n"
             )
-            if command == "pwd":
-                return ExecResult(return_code=0, stdout="/app\n", stderr="")
-            if "/tests/test.sh" in command:
-                self.trial_paths.reward_text_path.write_text("1.0")
-                self.trial_paths.test_stdout_path.write_text(
-                    f"{self.label} verifier stdout\n"
-                )
-            return ExecResult(return_code=0, stdout="", stderr="")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+
+def _patch_lifecycle_environment_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[LifecycleRecordingEnvironment], list[dict[str, object]]]:
+    from harbor.environments.factory import EnvironmentFactory
 
     created_envs: list[LifecycleRecordingEnvironment] = []
     create_calls: list[dict[str, object]] = []
@@ -663,6 +666,13 @@ def test_harbor_verify_runs_separate_verifier_environment(
         "create_environment_from_config",
         staticmethod(fake_create_environment_from_config),
     )
+    return created_envs, create_calls
+
+
+def test_harbor_verify_runs_separate_verifier_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
     task_dir = tmp_path / "task-a"
     _write_minimal_task(
         task_dir,
@@ -673,6 +683,11 @@ def test_harbor_verify_runs_separate_verifier_environment(
         task_name="task-a",
         task_dir=task_dir,
     )
+
+    async def fail_docker_cli(args):
+        raise AssertionError(f"prebuilt verifier image should not build: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
 
     asyncio.run(harbor.reset())
     result = asyncio.run(harbor.verify())
@@ -703,6 +718,67 @@ def test_harbor_verify_runs_separate_verifier_environment(
 
     asyncio.run(harbor.close())
     assert agent_env.stop_calls == [True]
+
+
+def test_harbor_verify_caches_dockerfile_verifier_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(
+        task_dir,
+        docker_image=None,
+        verifier_environment_mode="separate",
+    )
+    (task_dir / "tests" / "Dockerfile").write_text(
+        "FROM python:3.13-slim\nCOPY test.sh /tests/test.sh\n"
+    )
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+    existing_images: set[str] = set()
+    docker_calls: list[list[str]] = []
+
+    async def fake_docker_cli(args: list[str]) -> ExecResult:
+        docker_calls.append(args)
+        if args[:3] == ["image", "inspect", "--format"]:
+            image_name = args[-1]
+            if image_name not in existing_images:
+                raise RuntimeError(f"No such image: {image_name}")
+            return ExecResult(return_code=0, stdout="sha256:cached\n", stderr=None)
+        if args[:2] == ["build", "--tag"]:
+            existing_images.add(args[2])
+            return ExecResult(return_code=0, stdout="", stderr=None)
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+
+    asyncio.run(harbor.reset())
+    first = asyncio.run(harbor.verify())
+    second = asyncio.run(harbor.verify())
+
+    assert first.passed is True
+    assert second.passed is True
+    verifier_calls = create_calls[1:]
+    verifier_images = [call["task_env_config"].docker_image for call in verifier_calls]
+    assert len(verifier_images) == 2
+    assert verifier_images[0] == verifier_images[1]
+    assert verifier_images[0].startswith("hb-verifier-cache")
+    assert verifier_calls[0]["environment_dir"] == task_dir / "tests"
+    assert verifier_calls[1]["environment_dir"] == task_dir / "tests"
+    build_calls = [args for args in docker_calls if args[:2] == ["build", "--tag"]]
+    inspect_calls = [
+        args for args in docker_calls if args[:3] == ["image", "inspect", "--format"]
+    ]
+    assert len(build_calls) == 1
+    assert len(inspect_calls) == 2
+    assert build_calls[0][2] == verifier_images[0]
+    assert build_calls[0][-1] == str((task_dir / "tests").resolve())
+
+    asyncio.run(harbor.close())
+    assert created_envs[0].stop_calls == [True]
 
 
 def _stub_harbor_for_bootstrap(tmp_path: Path, *, exec_side_effect) -> Harbor:

@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import resolve_effective_verifier_env_config
@@ -37,6 +38,7 @@ DEFAULT_HARBOR_CONFIG_PATH = (
 )
 DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrides"
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
+_VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +123,25 @@ def _cpu_resource_env(cpus: int | None) -> dict[str, str]:
         "MAKEFLAGS": f"-j{cap}",
         "TOKENIZERS_PARALLELISM": "false",
     }
+
+
+def _directory_content_hash(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        relative_path = path.relative_to(directory).as_posix().encode()
+        digest.update(relative_path)
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"L")
+            digest.update(str(path.readlink()).encode())
+        elif path.is_file():
+            digest.update(b"F")
+            with path.open("rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif path.is_dir():
+            digest.update(b"D")
+    return digest.hexdigest()
 
 
 def _trial_log_mounts(
@@ -515,6 +536,65 @@ class Harbor:
         prefix = safe[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - len(suffix)].rstrip("-._")
         return f"{prefix}{suffix}"
 
+    def _verifier_cache_image_name(self) -> str:
+        from harbor.environments.docker.docker import _sanitize_docker_image_name
+
+        repository = _sanitize_docker_image_name(
+            f"hb-verifier-cache__{self.session.task.name}"
+        )
+        digest = _directory_content_hash(self.session.task.paths.tests_dir)[:16]
+        return f"{repository}:{digest}"
+
+    def _should_cache_verifier_image(
+        self,
+        verifier_env_config: TaskEnvironmentConfig,
+    ) -> bool:
+        tests_dir = self.session.task.paths.tests_dir
+        return (
+            self.config.environment.type == EnvironmentType.DOCKER
+            and self.config.environment.import_path is None
+            and verifier_env_config.docker_image is None
+            and (tests_dir / "Dockerfile").is_file()
+            and not (tests_dir / "docker-compose.yaml").exists()
+        )
+
+    async def _docker_image_exists(self, image_name: str) -> bool:
+        try:
+            await self._run_docker_cli(
+                ["image", "inspect", "--format", "{{.Id}}", image_name]
+            )
+        except RuntimeError:
+            return False
+        return True
+
+    async def _ensure_cached_verifier_image(
+        self,
+        *,
+        image_name: str,
+        build_context: Path,
+    ) -> None:
+        lock = _VERIFIER_IMAGE_BUILD_LOCKS.setdefault(image_name, asyncio.Lock())
+        async with lock:
+            if await self._docker_image_exists(image_name):
+                return
+            await self._run_docker_cli(
+                ["build", "--tag", image_name, str(build_context.resolve())]
+            )
+
+    async def _verifier_env_config_with_cached_image(
+        self,
+        verifier_env_config: TaskEnvironmentConfig,
+    ) -> TaskEnvironmentConfig:
+        if not self._should_cache_verifier_image(verifier_env_config):
+            return verifier_env_config
+
+        image_name = self._verifier_cache_image_name()
+        await self._ensure_cached_verifier_image(
+            image_name=image_name,
+            build_context=self.session.task.paths.tests_dir,
+        )
+        return verifier_env_config.model_copy(update={"docker_image": image_name})
+
     @contextlib.asynccontextmanager
     async def _separate_verifier_environment(
         self,
@@ -522,6 +602,9 @@ class Harbor:
     ) -> AsyncGenerator[_ResourceCappedEnvironment, None]:
         from harbor.environments.factory import EnvironmentFactory
 
+        verifier_env_config = await self._verifier_env_config_with_cached_image(
+            verifier_env_config
+        )
         raw_environment = EnvironmentFactory.create_environment_from_config(
             config=self.config.environment.model_copy(
                 update={"extra_docker_compose": []}
