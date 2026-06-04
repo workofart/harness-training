@@ -264,6 +264,7 @@ class HarborConfig(BaseModel):
     task_overrides_dir: Path | None = DEFAULT_TASK_OVERRIDES_DIR
     bootstrap_commands: tuple[str, ...] = ()
     bootstrap_timeout_sec: int = 600
+    shared_verifier_task_names: tuple[str, ...] = ()
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
 
     @model_validator(mode="after")
@@ -369,6 +370,15 @@ class Harbor:
             task.config,
             step_cfg=None,
         )
+        # Default to fresh verifier environments; keep stateful service tasks
+        # shared so their agent-started localhost services remain testable.
+        if (
+            self.task_name not in self.config.shared_verifier_task_names
+            and task.config.verifier.environment_mode is None
+        ):
+            verifier_env_config = (
+                verifier_env_config or task.config.environment.model_copy(deep=True)
+            )
         self._session = HarborSession(
             task=task,
             trial_paths=trial_paths,

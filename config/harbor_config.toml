@@ -9,6 +9,17 @@ bootstrap_commands = [
 # and infra_retry (with the lock-safe preamble) gets clean retries well inside
 # env_setup_timeout_sec instead of hanging until the trial budget is gone.
 bootstrap_timeout_sec = 120
+shared_verifier_task_names = [
+  "build-cython-ext",
+  "build-pmars",
+  "build-pov-ray",
+  "configure-git-webserver",
+  "hf-model-inference",
+  "kv-store-grpc",
+  "nginx-request-logging",
+  "pypi-server",
+  "sqlite-with-gcov",
+]
 
 [environment]
 type = "docker"
