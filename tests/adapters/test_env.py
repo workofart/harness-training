@@ -870,7 +870,7 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
     assert created_envs[0].stop_calls == [True]
 
 
-def test_harbor_uses_shared_verifier_when_task_does_not_request_separate_mode(
+def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
@@ -879,6 +879,52 @@ def test_harbor_uses_shared_verifier_when_task_does_not_request_separate_mode(
     harbor = Harbor(
         HarborConfig(experiments_dir=tmp_path / "experiments"),
         task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    async def fail_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
+        raise AssertionError(f"default separate verifier should not build: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
+    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+
+    asyncio.run(harbor.reset())
+    result = asyncio.run(harbor.verify())
+
+    assert result.passed is True
+    assert result.stdout == "verifier verifier stdout\n"
+    assert len(created_envs) == 2
+    assert len(create_calls) == 2
+    agent_env = created_envs[0]
+    agent_call = create_calls[0]
+    verifier_call = create_calls[1]
+    assert agent_call["environment_dir"] == task_dir / "environment"
+    assert verifier_call["environment_dir"] == task_dir / "tests"
+    assert verifier_call["task_env_config"].docker_image == "example/task:latest"
+    assert not any(
+        source == task_dir / "tests" for source, _ in agent_env.upload_dir_calls
+    )
+
+    asyncio.run(harbor.close())
+
+
+def test_harbor_keeps_configured_service_task_verifier_shared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "pypi-server"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(
+            experiments_dir=tmp_path / "experiments",
+            shared_verifier_task_names=("pypi-server",),
+        ),
+        task_name="pypi-server",
         task_dir=task_dir,
     )
 
@@ -903,7 +949,6 @@ def test_harbor_uses_shared_verifier_when_task_does_not_request_separate_mode(
     agent_env = created_envs[0]
     agent_call = create_calls[0]
     assert agent_call["environment_dir"] == task_dir / "environment"
-    assert harbor.session.task.config.verifier.environment_mode is None
     assert any(source == task_dir / "tests" for source, _ in agent_env.upload_dir_calls)
     assert agent_env.download_dir_calls == []
 
