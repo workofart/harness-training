@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from harbor.environments.base import ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
-from harbor.models.task.config import TaskOS, VerifierEnvironmentMode
+from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
@@ -822,7 +822,7 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
     assert created_envs[0].stop_calls == [True]
 
 
-def test_harbor_auto_converts_shared_tasks_to_official_separate_verifier(
+def test_harbor_uses_shared_verifier_when_task_does_not_request_separate_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
@@ -833,51 +833,30 @@ def test_harbor_auto_converts_shared_tasks_to_official_separate_verifier(
         task_name="task-a",
         task_dir=task_dir,
     )
-    existing_images: set[str] = set()
-    docker_calls: list[list[str]] = []
 
-    async def fake_docker_cli(
+    async def fail_docker_cli(
         args: list[str],
         *,
         failure_context: str = "Docker command failed",
     ) -> ExecResult:
         del failure_context
-        docker_calls.append(args)
-        if args[:3] == ["image", "inspect", "--format"]:
-            image_name = args[-1]
-            if image_name not in existing_images:
-                raise RuntimeError(f"No such image: {image_name}")
-            return ExecResult(return_code=0, stdout="sha256:cached\n", stderr=None)
-        if args[:2] == ["build", "--tag"]:
-            existing_images.add(args[2])
-            return ExecResult(return_code=0, stdout="", stderr=None)
-        raise AssertionError(f"unexpected docker call: {args}")
+        raise AssertionError(f"shared verifier should not build verifier image: {args}")
 
-    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+    monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
 
     asyncio.run(harbor.reset())
     result = asyncio.run(harbor.verify())
 
     assert result.passed is True
-    agent_env, verifier_env = created_envs
-    verifier_call = create_calls[1]
-    verifier_config = verifier_call["task_env_config"]
-    verifier_context = verifier_call["environment_dir"]
-    assert harbor.session.task.config.verifier.environment_mode == (
-        VerifierEnvironmentMode.SEPARATE
-    )
-    assert verifier_config.docker_image.startswith("hb-verifier-cache")
-    assert verifier_context != task_dir / "tests"
-    dockerfile = (verifier_context / "Dockerfile").read_text()
-    assert "FROM example/task:latest" in dockerfile
-    assert "WORKDIR /app" in dockerfile
-    assert "COPY . /tests/" in dockerfile
-    assert (verifier_context / "test.sh").exists()
-    assert agent_env.download_dir_calls == [
-        ("/app", harbor.session.trial_paths.artifacts_dir / "app")
-    ]
-    assert any(target == "/app" for _, target in verifier_env.upload_dir_calls)
-    assert any(args[:2] == ["build", "--tag"] for args in docker_calls)
+    assert result.stdout == "agent verifier stdout\n"
+    assert len(created_envs) == 1
+    assert len(create_calls) == 1
+    agent_env = created_envs[0]
+    agent_call = create_calls[0]
+    assert agent_call["environment_dir"] == task_dir / "environment"
+    assert harbor.session.task.config.verifier.environment_mode is None
+    assert any(source == task_dir / "tests" for source, _ in agent_env.upload_dir_calls)
+    assert agent_env.download_dir_calls == []
 
     asyncio.run(harbor.close())
 
