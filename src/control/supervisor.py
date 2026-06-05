@@ -430,6 +430,46 @@ def _load_parent_baseline(
     return ExperimentRecord.load(parent_id, root=experiments_root)
 
 
+def _discard_interrupted_baseline(
+    *,
+    snapshot: RuntimeSnapshot,
+    repo_root: Path,
+    supervisor_root: Path = DEFAULT_SUPERVISOR_ROOT,
+) -> ExperimentRecord | None:
+    """Drop an active baseline that never finalized as a keep.
+
+    A baseline run killed mid-flight leaves ``state.json`` pointing the active
+    baseline at a partial, never-graded record. Trusting it would let the loop
+    short-circuit the fresh measurement -- and later compare every candidate
+    against ungraded evidence -- or make ``run_baseline_at_head`` abort on its
+    "active baseline must be a concluded keep" guard. We finalize the stale
+    record and fall back to its parent keep (or nothing, seeding fresh), then
+    return the baseline the caller should reason about next.
+    """
+    baseline = snapshot.active_baseline_record
+    if baseline is None or (baseline.status == "keep" and baseline.is_concluded()):
+        return baseline
+    parent = _load_parent_baseline(
+        record=baseline,
+        experiments_root=snapshot.experiments_root,
+    )
+    if not baseline.is_concluded():
+        baseline.finalize_crash(
+            exc=ExperimentAbandoned(ABANDONED_EXPERIMENT_REASON),
+            baseline=parent,
+            root=snapshot.experiments_root,
+        )
+    state = snapshot.experiment_state
+    parent_id = baseline.parent_baseline_experiment_id
+    state.active_baseline_experiment_id = parent_id
+    if state.current_experiment_id == baseline.experiment_id:
+        state.current_experiment_id = parent_id
+    state.updated_at = datetime.now(timezone.utc).isoformat()
+    state.save(root=snapshot.experiments_root)
+    SupervisorState.clear(repo_root=repo_root, root=supervisor_root)
+    return parent
+
+
 def abandon_unfinished_candidate(
     *,
     snapshot: RuntimeSnapshot,
@@ -1353,7 +1393,6 @@ def _ensure_baseline_at_head(
     # Any uncommitted change is treated as user-in-progress work and aborts.
     # Committed advances past the active baseline trigger a full baseline
     # measurement at HEAD instead of synthesizing evidence from history.
-    baseline = snapshot.active_baseline_record
     dirty_paths: tuple[str, ...] = ()
     if (repo_root / ".git").exists():
         dirty_paths = control_repo.changed_paths(cwd=repo_root)
@@ -1364,6 +1403,15 @@ def _ensure_baseline_at_head(
         )
     head_commit = control_repo.get_head_commit(cwd=repo_root)
     harness_config = snapshot.harness_config
+    # An interrupted baseline run can leave the active baseline pointing at a
+    # record that never finalized as a keep. Discard it before deciding whether
+    # to short-circuit so we re-measure from the last valid keep instead of
+    # trusting partial evidence.
+    baseline = _discard_interrupted_baseline(
+        snapshot=snapshot,
+        repo_root=repo_root,
+        supervisor_root=supervisor_root,
+    )
     if baseline is not None and head_commit == baseline.git_commit_hash:
         if _baseline_matches_harness_config(
             baseline=baseline,

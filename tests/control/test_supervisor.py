@@ -2809,6 +2809,78 @@ def test_ensure_baseline_at_head_no_op_when_head_matches_and_clean(
     assert refreshed is False
 
 
+def test_ensure_baseline_at_head_reruns_when_active_baseline_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A baseline run killed mid-flight leaves state.json pointing the active
+    # baseline at a record that never finalized as a keep. Even when that record
+    # sits at HEAD with matching panels, the loop must discard it and measure a
+    # fresh baseline -- short-circuiting here would compare every later
+    # candidate against partial, never-graded evidence.
+    interrupted = make_unfinished_record(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+    )
+    snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=interrupted)
+    (snapshot.repo_root / ".git").write_text("gitdir: /tmp/fake\n")
+
+    new_baseline = make_record(
+        experiment_id="baseline-20260411-000000",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        status="keep",
+        reward=1.0,
+    )
+    baseline_calls: dict[str, object] = {}
+
+    monkeypatch.setattr(supervisor.control_repo, "changed_paths", lambda **_: ())
+    monkeypatch.setattr(
+        supervisor.control_repo, "get_head_commit", lambda **_: "base123"
+    )
+    freeze_supervisor_time(monkeypatch, "2026-04-11T00:00:00+00:00")
+    monkeypatch.setattr(
+        supervisor,
+        "_load_runtime",
+        lambda *, repo_root: (
+            SimpleNamespace(experiments_dir=snapshot.experiments_root),
+            "api-key",
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "sync_sparse_workspace_to_commit",
+        lambda *, workspace_root, commit_hash: None,
+    )
+
+    def fake_run_baseline(*, harness_config, harbor_config, api_key, **_kwargs):
+        baseline_calls["experiment_id"] = _kwargs["experiment_id"]
+        return new_baseline
+
+    monkeypatch.setattr(
+        supervisor.ExperimentRunner,
+        "run_baseline_at_head",
+        fake_run_baseline,
+    )
+
+    refreshed = supervisor._ensure_baseline_at_head(
+        snapshot=snapshot,
+        repo_root=snapshot.repo_root,
+        workspace_root=tmp_path / "workspace",
+        supervisor_root=tmp_path / "supervisor",
+    )
+
+    assert refreshed is True
+    assert baseline_calls["experiment_id"] == "baseline-20260411-000000"
+    # The interrupted record must be finalized (not left dangling) and dropped
+    # as the active baseline so run_baseline_at_head seeds from a clean slate.
+    discarded = ExperimentRecord.load("baseline", root=snapshot.experiments_root)
+    assert discarded.is_concluded()
+    reloaded_state = ExperimentState.load(root=snapshot.experiments_root)
+    assert reloaded_state.active_baseline_experiment_id is None
+
+
 def test_ensure_baseline_at_head_aborts_on_dirty_worktree(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
