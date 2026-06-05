@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 # ── shared constants ──────────────────────────────────────────────
 
-DEFAULT_TURN_TIMEOUT_SEC = 600
+DEFAULT_TURN_TIMEOUT_SEC = 3600
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
