@@ -170,6 +170,22 @@ def test_task_directory_resolver_uses_dataset_version_for_registry_metadata(
     assert task_dirs == {"task-a": downloaded_task_dir}
 
 
+def test_verifier_context_cache_dir_is_stable_when_trial_config_scopes_experiments(
+    tmp_path: Path,
+) -> None:
+    config = HarborConfig(experiments_dir=tmp_path / "experiments")
+    trial_config = config.model_copy(
+        update={"experiments_dir": config.experiments_dir / "exp-id" / "tasks"}
+    )
+
+    assert (
+        config.verifier_context_cache_dir
+        == tmp_path / "experiments" / "_verifier_contexts"
+    )
+    assert trial_config.experiments_dir == config.experiments_dir / "exp-id" / "tasks"
+    assert trial_config.verifier_context_cache_dir == config.verifier_context_cache_dir
+
+
 def test_task_directory_resolver_rejects_invalid_local_task_override(
     tmp_path: Path,
 ) -> None:
@@ -700,6 +716,34 @@ def _patch_lifecycle_environment_factory(
     return created_envs, create_calls
 
 
+def _patch_docker_image_cache(
+    harbor: Harbor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[list[str]]:
+    existing_images: set[str] = set()
+    docker_calls: list[list[str]] = []
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
+        docker_calls.append(args)
+        if args[:3] == ["image", "inspect", "--format"]:
+            image_name = args[-1]
+            if image_name not in existing_images:
+                raise RuntimeError(f"No such image: {image_name}")
+            return ExecResult(return_code=0, stdout="sha256:cached\n", stderr=None)
+        if args[:2] == ["build", "--tag"]:
+            existing_images.add(args[2])
+            return ExecResult(return_code=0, stdout="", stderr=None)
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+    return docker_calls
+
+
 def test_harbor_verify_runs_separate_verifier_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -870,6 +914,45 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
     assert created_envs[0].stop_calls == [True]
 
 
+def test_harbor_separate_verifier_applies_network_preamble_as_root_before_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_envs, _create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    _patch_docker_image_cache(harbor, monkeypatch)
+    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+
+    asyncio.run(harbor.reset())
+    result = asyncio.run(harbor.verify())
+
+    assert result.passed is True
+    # The separate verifier container must receive the same apt/pip cache and
+    # retry/timeout config the agent gets, applied as root before the immutable
+    # test.sh runs its own toolchain install -- otherwise a flaky mirror stalls
+    # the whole grade.
+    verifier_env = created_envs[1]
+    commands = [str(call["command"]) for call in verifier_env.exec_calls]
+    preamble_idx = next(
+        i
+        for i, command in enumerate(commands)
+        if "host.docker.internal:3142" in command and "Acquire::http::Proxy" in command
+    )
+    test_idx = next(
+        i for i, command in enumerate(commands) if "/tests/test.sh" in command
+    )
+    assert preamble_idx < test_idx
+    assert verifier_env.exec_calls[preamble_idx]["user"] == "root"
+
+    asyncio.run(harbor.close())
+
+
 def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -882,15 +965,7 @@ def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
         task_dir=task_dir,
     )
 
-    async def fail_docker_cli(
-        args: list[str],
-        *,
-        failure_context: str = "Docker command failed",
-    ) -> ExecResult:
-        del failure_context
-        raise AssertionError(f"default separate verifier should not build: {args}")
-
-    monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
+    docker_calls = _patch_docker_image_cache(harbor, monkeypatch)
     monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
 
     asyncio.run(harbor.reset())
@@ -904,11 +979,50 @@ def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
     agent_call = create_calls[0]
     verifier_call = create_calls[1]
     assert agent_call["environment_dir"] == task_dir / "environment"
-    assert verifier_call["environment_dir"] == task_dir / "tests"
-    assert verifier_call["task_env_config"].docker_image == "example/task:latest"
+    assert verifier_call["environment_dir"] != task_dir / "tests"
+    assert verifier_call["task_env_config"].docker_image.startswith("hb-verifier-cache")
+    assert [args[:2] for args in docker_calls].count(["build", "--tag"]) == 1
     assert not any(
         source == task_dir / "tests" for source, _ in agent_env.upload_dir_calls
     )
+
+    asyncio.run(harbor.close())
+
+
+def test_harbor_auto_separate_verifier_generates_context_for_plain_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    task_dir = tmp_path / "task-a"
+    _write_minimal_task(task_dir)
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=task_dir,
+    )
+
+    docker_calls = _patch_docker_image_cache(harbor, monkeypatch)
+    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+
+    asyncio.run(harbor.reset())
+    asyncio.run(harbor.verify())
+    asyncio.run(harbor.verify())
+
+    verifier_context = create_calls[1]["environment_dir"]
+    reused_verifier_context = create_calls[2]["environment_dir"]
+    assert verifier_context != task_dir / "tests"
+    assert reused_verifier_context == verifier_context
+    assert verifier_context.parent.parent == harbor.config.verifier_context_cache_dir
+    assert (verifier_context / "test.sh").read_text() == "#!/bin/bash\n"
+    assert (verifier_context / "Dockerfile").read_text() == (
+        "FROM example/task:latest\n"
+        "WORKDIR /app\n"
+        "COPY . /tests/\n"
+        "RUN chmod +x /tests/test.sh && mkdir -p /logs/verifier /logs/artifacts\n"
+    )
+    build_calls = [args for args in docker_calls if args[:2] == ["build", "--tag"]]
+    assert len(build_calls) == 1
+    assert build_calls[0][-1] == str(verifier_context.resolve())
 
     asyncio.run(harbor.close())
 
