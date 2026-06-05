@@ -40,7 +40,6 @@
         "largest-eigenval",
         "chess-best-move",
         "kv-store-grpc",
-        "reshard-c4-data",
         "distribution-search",
         "adaptive-rejection-sampler",
         "portfolio-optimization",
@@ -91,6 +90,12 @@
     }
   ],
   "excluded_task_groups": {
+    "contamination_risk": {
+      "task_names": [
+        "reshard-c4-data"
+      ],
+      "reason": "running it offline (to avoid re-downloading the held-out HF c4 shard every trial) needs a local override that commits the solution/oracle into the repo, which the self-improvement loop could read"
+    },
     "ignored": {
       "task_names": [
         "break-filter-js-from-html",
