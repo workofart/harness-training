@@ -9,16 +9,39 @@ bootstrap_commands = [
 # and infra_retry (with the lock-safe preamble) gets clean retries well inside
 # env_setup_timeout_sec instead of hanging until the trial budget is gone.
 bootstrap_timeout_sec = 120
+# Tasks whose verifier must run INSIDE the agent's live container instead of the
+# default "separate verifier" (a fresh container built FROM the task image with
+# only the deliverable files copied in). That fresh verifier is hermetic: it has
+# the deliverable files but NOT the agent's running processes, in-container build
+# artifacts / installed deps, or original git working tree. Each task below fails
+# in the fresh verifier for the reason noted, and passes when it reuses the
+# agent's container. Order is irrelevant -- the setup contract compares the
+# sorted set, so these are grouped by reason for readability.
 shared_verifier_task_names = [
-  "build-cython-ext",
-  "build-pmars",
-  "build-pov-ray",
-  "configure-git-webserver",
-  "hf-model-inference",
-  "kv-store-grpc",
-  "nginx-request-logging",
-  "pypi-server",
-  "sqlite-with-gcov",
+  # Reason: the verifier connects to a network service the agent left running.
+  #         A fresh verifier never started that daemon, so it gets connection
+  #         refused.
+  "configure-git-webserver",     # git web server
+  "git-multibranch",             # sshd + nginx: verify clones git@localhost, checks HTTPS deploy of main/dev
+  "hf-model-inference",          # Flask inference API on :5000
+  "kv-store-grpc",               # gRPC server on 127.0.0.1 (also needs agent-installed grpcio)
+  "mailman",                     # SMTP server on localhost:25
+  "nginx-request-logging",       # nginx on :8080
+  "pypi-server",                 # PyPI server on localhost:8080
+  # Reason: the verifier needs build artifacts or packages the agent produced in
+  #         its container. A fresh verifier rebuilt from the base image does not
+  #         have them.
+  "build-cython-ext",            # compiled Cython .so + system-installed pyknotid at pinned numpy
+  "build-pmars",                 # /usr/local/bin/pmars binary (+ its shared libs)
+  "build-pov-ray",               # /usr/local/bin/povray binary
+  "sqlite-with-gcov",            # gcov-instrumented build + .gcda/.gcno coverage files
+  "adaptive-rejection-sampler",  # verify executes the agent's solution in its python env
+  # Reason: the verifier runs git over the agent's working tree/history. A fresh
+  #         verifier re-owns the copied tree under a different uid, which trips
+  #         git "dubious ownership" and loses the reflog / unreachable objects.
+  "git-leak-recovery",           # git fsck/log over unreachable objects
+  "merge-diff-arc-agi-task",     # git branches merged from bundles in /app/repo
+  "sanitize-git-repo",           # git history checks (secrets gone, no other files changed)
 ]
 
 [environment]
