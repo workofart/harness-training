@@ -6,7 +6,7 @@ Operating policy for the autonomous harness-search loop.
 
 Improve the harness within the current experiment.
 Treat Harbor tasks as black-box evaluations.
-Increase per-task solve rates on the train panel without significantly regressing any baseline-solved train task.
+Increase aggregate solved-task count on the train panel while preserving task-level evidence about improvements and regressions.
 
 This is a narrow mechanism-search loop, not a broad repo-wide self-improvement loop.
 If this file and code disagree, code is source of truth.
@@ -57,13 +57,15 @@ task-declared step checks.
 
 ## Promotion
 
-A candidate is evaluated against the active baseline with per-task two-sided Fisher exact tests at alpha = 0.05, comparing the candidate's solved/total counts against the baseline's solved/total counts.
+A candidate is evaluated against the frozen active baseline at two levels. The promotion decision is panel-level: each task contributes its majority-solved result, and the panel compares candidate solved-task count against baseline solved-task count with a two-sided Fisher exact test at alpha = 0.20. Per-task two-sided Fisher exact verdicts at alpha = 0.05 are still computed as task-level evidence for diagnosis and self-improvement; they do not directly keep or discard a promotion panel.
 
 1. A per-trial infrastructure failure is retried within the trial on a bounded internal budget. If it still fails, the trial concludes as a terminal `crash`, excluded from all evidence, with no effect on the experiment status or other trials (and it is not re-run). Experiment-level failures still make the experiment `crash`: setup, task resolution, evaluation, or a run that produced zero valid trials across the whole panel. A baseline run that crashes is not promoted; no baseline is installed and the next `uv run auto` reruns it.
 2. If there is no baseline yet, `uv run auto` first runs the current panel as a kept baseline, then starts candidate search.
-3. Otherwise `keep` iff some train task significantly improved (p < 0.05, candidate rate above baseline) AND no train task significantly regressed (p < 0.05, candidate rate below baseline). A task with no baseline samples counts as "improved" if the candidate majority-solves it. Else `discard`.
+3. Otherwise the promotion panel returns `keep` only if the candidate solves more train tasks than the baseline and, when the baseline has samples for the panel, the aggregate Fisher exact test is significant at alpha = 0.20. If the frozen baseline has no panel samples, a higher candidate solved-task count is enough. Else `discard`.
+4. Per-task verdicts label task-level evidence (`new_solve`, `regression`, and related outcomes) for the self-improving agent. They are diagnostic signal, not the promotion trigger.
+5. A regression-veto panel runs only after a promotion `keep`; it can only block. It discards iff the aggregate solved-task count drops below the baseline.
 
-There is no mean-reward promotion rule. Family-wise error is intentionally uncontrolled.
+There is no mean-reward promotion rule. No family-wise correction is applied to diagnostic per-task verdicts.
 
 ## Panel changes
 

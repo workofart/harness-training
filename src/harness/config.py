@@ -10,9 +10,10 @@ DEFAULT_HARNESS_CONFIG_PATH = (
 )
 ReasoningEffort = Literal["none", "low", "medium", "high"]
 OpenRouterServiceTier = Literal["auto", "default", "flex"]
-ChatGptCodexServiceTier = Literal["auto", "default", "flex", "priority"]
+ChatGptCodexServiceTier = Literal["auto", "default", "flex", "priority", "standard"]
 PanelPurpose = Literal["promotion", "regression_veto"]
 PanelRunStatus = Literal["keep", "discard", "crash"]
+PanelLifecycle = Literal["pending", "active", "finished", "skipped"]
 
 
 class OpenRouterProviderRouting(BaseModel):
@@ -155,6 +156,25 @@ class PanelConfig(BaseModel):
     task_timeout_sec: float = Field(default=600.0, gt=0)
     run: PanelRunConfig = Field(default_factory=lambda: PanelRunConfig(when="always"))
     baseline: PanelBaselineConfig = Field(default_factory=PanelBaselineConfig)
+
+    # Runtime policy derived from run/baseline so the runner consumes PanelConfig
+    # directly with no separate compiled mirror. Declared as @property (not Fields)
+    # so the persisted config schema is unaffected.
+    @property
+    def initial_lifecycle(self) -> PanelLifecycle:
+        return "active" if self.run.when == "always" else "pending"
+
+    @property
+    def after_panel(self) -> str | None:
+        return None if self.run.when == "always" else self.run.after_panel
+
+    @property
+    def when_status(self) -> PanelRunStatus | None:
+        return None if self.run.when == "always" else self.run.when_status
+
+    @property
+    def requires_baseline(self) -> bool:
+        return self.baseline.required
 
 
 class ExcludedTaskGroup(BaseModel):

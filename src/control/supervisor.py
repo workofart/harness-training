@@ -46,10 +46,11 @@ from src.experiment.record import (
     ExperimentAbandoned,
     ExperimentRecord,
     ExperimentState,
+    existing_artifact_path,
     failed_experiment_git_ref,
     write_json_atomic,
 )
-from src.experiment.runner import ExperimentRunner
+from src.experiment.runner import ExperimentRunner, baseline_matches_panel_specs
 from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
 
 DEFAULT_SUPERVISOR_WORKTREE_PARENT = DEFAULT_SUPERVISOR_ROOT
@@ -90,6 +91,14 @@ class PreparedCandidate:
     experiment_id: str
     changed_paths: tuple[str, ...]
     harness_config: HarnessConfig
+
+
+SupervisorPhaseIntent = Literal[
+    "recover_launch",
+    "abandon_unfinished_candidate",
+    "postrun_diagnosis",
+    "prelaunch",
+]
 
 
 def load_runtime_snapshot(*, repo_root: Path | None = None) -> RuntimeSnapshot:
@@ -152,6 +161,37 @@ def current_experiment_record(snapshot: RuntimeSnapshot) -> ExperimentRecord | N
     )
 
 
+def derive_next_phase(
+    *,
+    snapshot: RuntimeSnapshot,
+    saved_state: SupervisorState | None,
+    current_record: ExperimentRecord | None,
+) -> SupervisorPhaseIntent:
+    if saved_state is not None and saved_state.phase == "launch":
+        return "recover_launch"
+    if (
+        snapshot.current_candidate_record is not None
+        and not snapshot.current_candidate_record.is_concluded()
+    ):
+        return "abandon_unfinished_candidate"
+    if (
+        current_record is not None
+        and current_record.is_concluded()
+        and (
+            (saved_state is not None and saved_state.phase == "postrun")
+            or snapshot.current_candidate_record is not None
+        )
+        and not (
+            saved_state is not None
+            and saved_state.phase == "prelaunch"
+            and saved_state.postrun_completed_experiment_id
+            == current_record.experiment_id
+        )
+    ):
+        return "postrun_diagnosis"
+    return "prelaunch"
+
+
 def load_harness_config_for_repo(repo_root: Path) -> HarnessConfig:
     harness_config_path = repo_root.resolve() / "config" / "harness_config.json"
     return HarnessConfig.model_validate_json(harness_config_path.read_text())
@@ -175,7 +215,9 @@ def write_learning_memo(*, experiments_root: Path, content: str) -> None:
 
 
 def _existing_artifact_paths(paths: tuple[str | None, ...]) -> tuple[str, ...]:
-    return tuple(path for path in paths if path is not None and Path(path).exists())
+    return tuple(
+        resolved for p in paths if (resolved := existing_artifact_path(p)) is not None
+    )
 
 
 def latest_evidence_task_artifact_paths(record: ExperimentRecord) -> tuple[str, ...]:
@@ -428,46 +470,6 @@ def _load_parent_baseline(
     if not parent_path.exists():
         return None
     return ExperimentRecord.load(parent_id, root=experiments_root)
-
-
-def _discard_interrupted_baseline(
-    *,
-    snapshot: RuntimeSnapshot,
-    repo_root: Path,
-    supervisor_root: Path = DEFAULT_SUPERVISOR_ROOT,
-) -> ExperimentRecord | None:
-    """Drop an active baseline that never finalized as a keep.
-
-    A baseline run killed mid-flight leaves ``state.json`` pointing the active
-    baseline at a partial, never-graded record. Trusting it would let the loop
-    short-circuit the fresh measurement -- and later compare every candidate
-    against ungraded evidence -- or make ``run_baseline_at_head`` abort on its
-    "active baseline must be a concluded keep" guard. We finalize the stale
-    record and fall back to its parent keep (or nothing, seeding fresh), then
-    return the baseline the caller should reason about next.
-    """
-    baseline = snapshot.active_baseline_record
-    if baseline is None or (baseline.status == "keep" and baseline.is_concluded()):
-        return baseline
-    parent = _load_parent_baseline(
-        record=baseline,
-        experiments_root=snapshot.experiments_root,
-    )
-    if not baseline.is_concluded():
-        baseline.finalize_crash(
-            exc=ExperimentAbandoned(ABANDONED_EXPERIMENT_REASON),
-            baseline=parent,
-            root=snapshot.experiments_root,
-        )
-    state = snapshot.experiment_state
-    parent_id = baseline.parent_baseline_experiment_id
-    state.set_active_baseline(experiment_id=parent_id, record=parent)
-    if state.current_experiment_id == baseline.experiment_id:
-        state.current_experiment_id = parent_id
-    state.updated_at = datetime.now(timezone.utc).isoformat()
-    state.save(root=snapshot.experiments_root)
-    SupervisorState.clear(repo_root=repo_root, root=supervisor_root)
-    return parent
 
 
 def abandon_unfinished_candidate(
@@ -1158,14 +1160,20 @@ def run_supervisor_loop(
                 repo_root=resolved_repo_root,
                 root=supervisor_root,
             )
-            if recover_interrupted_launch(
-                saved_state=saved_state,
+            phase_intent = derive_next_phase(
                 snapshot=snapshot,
-                repo_root=resolved_repo_root,
-                workspace_root=workspace_root,
-                supervisor_root=supervisor_root,
-            ):
-                continue
+                saved_state=saved_state,
+                current_record=None,
+            )
+            if phase_intent == "recover_launch":
+                if recover_interrupted_launch(
+                    saved_state=saved_state,
+                    snapshot=snapshot,
+                    repo_root=resolved_repo_root,
+                    workspace_root=workspace_root,
+                    supervisor_root=supervisor_root,
+                ):
+                    continue
             if _cleanup_orphaned_experiment_artifacts(
                 experiments_root=snapshot.experiments_root,
                 current_experiment_id=snapshot.experiment_state.current_experiment_id,
@@ -1179,10 +1187,12 @@ def run_supervisor_loop(
             # Reconcile state.json before touching HEAD: an unfinished candidate
             # record must be marked concluded so baseline refresh can proceed if
             # the user advanced HEAD past the active baseline.
-            if (
-                snapshot.current_candidate_record is not None
-                and not snapshot.current_candidate_record.is_concluded()
-            ):
+            phase_intent = derive_next_phase(
+                snapshot=snapshot,
+                saved_state=saved_state,
+                current_record=None,
+            )
+            if phase_intent == "abandon_unfinished_candidate":
                 abandon_unfinished_candidate(
                     snapshot=snapshot,
                     repo_root=resolved_repo_root,
@@ -1205,18 +1215,12 @@ def run_supervisor_loop(
                 supervisor_root=supervisor_root,
             )
             if (
-                current_record is not None
-                and current_record.is_concluded()
-                and (
-                    (saved_state is not None and saved_state.phase == "postrun")
-                    or snapshot.current_candidate_record is not None
+                derive_next_phase(
+                    snapshot=snapshot,
+                    saved_state=saved_state,
+                    current_record=current_record,
                 )
-                and not (
-                    saved_state is not None
-                    and saved_state.phase == "prelaunch"
-                    and saved_state.postrun_completed_experiment_id
-                    == current_record.experiment_id
-                )
+                == "postrun_diagnosis"
             ):
                 complete_postrun_diagnosis(
                     workspace_root=workspace_root,
@@ -1406,17 +1410,33 @@ def _ensure_baseline_at_head(
     # An interrupted baseline run can leave the active baseline pointing at a
     # record that never finalized as a keep. Discard it before deciding whether
     # to short-circuit so we re-measure from the last valid keep instead of
-    # trusting partial evidence.
-    baseline = _discard_interrupted_baseline(
-        snapshot=snapshot,
-        repo_root=repo_root,
-        supervisor_root=supervisor_root,
-    )
+    # trusting partial evidence: finalize the stale record, fall back to its
+    # parent keep (or nothing, seeding fresh), and reason about that next.
+    baseline = snapshot.active_baseline_record
+    if baseline is not None and not (
+        baseline.status == "keep" and baseline.is_concluded()
+    ):
+        parent = _load_parent_baseline(
+            record=baseline,
+            experiments_root=snapshot.experiments_root,
+        )
+        if not baseline.is_concluded():
+            baseline.finalize_crash(
+                exc=ExperimentAbandoned(ABANDONED_EXPERIMENT_REASON),
+                baseline=parent,
+                root=snapshot.experiments_root,
+            )
+        state = snapshot.experiment_state
+        parent_id = baseline.parent_baseline_experiment_id
+        state.set_active_baseline(experiment_id=parent_id, record=parent)
+        if state.current_experiment_id == baseline.experiment_id:
+            state.current_experiment_id = parent_id
+        state.updated_at = datetime.now(timezone.utc).isoformat()
+        state.save(root=snapshot.experiments_root)
+        SupervisorState.clear(repo_root=repo_root, root=supervisor_root)
+        baseline = parent
     if baseline is not None and head_commit == baseline.git_commit_hash:
-        if _baseline_matches_harness_config(
-            baseline=baseline,
-            harness_config=harness_config,
-        ):
+        if baseline_matches_panel_specs(baseline, harness_config.panels):
             return False
     harbor_config, api_key = _load_runtime(repo_root=repo_root)
     decision_reason: Literal["baseline seed", "baseline rerun"] = (
@@ -1471,17 +1491,3 @@ def _ensure_baseline_at_head(
         commit=new_baseline.git_commit_hash,
     )
     return True
-
-
-def _baseline_matches_harness_config(
-    *,
-    baseline: ExperimentRecord,
-    harness_config: HarnessConfig,
-) -> bool:
-    if baseline.panel_order != [panel.id for panel in harness_config.panels]:
-        return False
-    return all(
-        panel.id in baseline.panels
-        and set(baseline.panels[panel.id].task_ids) == set(panel.task_names)
-        for panel in harness_config.panels
-    )

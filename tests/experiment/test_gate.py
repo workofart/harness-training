@@ -7,7 +7,12 @@ from src.experiment.gate import (
     build_gate_verdicts,
     decide_panel_from_verdicts,
 )
-from src.experiment.record import ExperimentRecord, PanelRecord, terminal_task_result
+from src.experiment.record import (
+    ExperimentRecord,
+    PanelEvaluation,
+    PanelRecord,
+    terminal_task_result,
+)
 from src.harness.contracts import TaskResult
 
 
@@ -66,7 +71,12 @@ def test_evidence_outcome_follows_gate_verdict_not_majority_flip(tmp_path):
         for tid, trials in _train_results(baseline).items()
     }
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
-    candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
+    candidate.panels["train"].evaluation = PanelEvaluation(
+        status="discard",
+        decision_reason="no train improvement",
+        verdicts=verdicts,
+    )
+    candidate.refresh_evidence(baseline=baseline)
 
     outcome = _train_outcomes(candidate)[0]
     assert outcome.outcome == "unchanged_unsolved"
@@ -134,7 +144,12 @@ def test_single_source_of_truth_gate_and_evidence_agree():
     # Evidence layer reads the same verdicts. Labels are the 5-state
     # vocabulary derived from verdict.kind + majority bools.
     candidate.finalize(status=status, decision_reason=reason)
-    candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
+    candidate.panels["train"].evaluation = PanelEvaluation(
+        status=status,
+        decision_reason=reason,
+        verdicts=verdicts,
+    )
+    candidate.refresh_evidence(baseline=baseline)
     outcomes = {
         outcome.task_id: outcome.outcome for outcome in _train_outcomes(candidate)
     }

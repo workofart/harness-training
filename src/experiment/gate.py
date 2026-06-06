@@ -1,10 +1,15 @@
 """Promotion-gate statistics.
 
 Turns a candidate's per-task trial outcomes into ``BaselineComparison`` verdicts
-and a keep/discard decision, and builds the pooled-control sample the gate
-compares against (active baseline + recent non-conflicting candidates). Pure
-functions over the persisted records in ``record.py``; imports nothing from the
-runner.
+and a keep/discard decision, and builds the control the gate compares against:
+the frozen active baseline's own trials only (:func:`build_baseline_pool`). The
+gate deliberately does not pool other candidates' trials, which keeps each
+evaluation independent and the control stationary until a keep re-freezes the
+baseline. Recent concluded candidate records
+(:func:`load_recent_candidate_records`) are retained only for the supervisor's
+mechanism-novelty check (``control.gates.build_mechanism_novelty_rejection``),
+not for the gate control. Pure functions over the persisted records in
+``record.py``; imports nothing from the runner.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from src.metrics import (
     is_majority_solved,
 )
 
-from src.experiment.record import ExperimentRecord, ExperimentStatus, PanelPurpose
+from src.experiment.record import ExperimentRecord, PanelDecision, PanelPurpose
 
 
 class _PanelAggregate(NamedTuple):
@@ -106,7 +111,7 @@ def decide_panel_from_verdicts(
     verdicts: Mapping[str, BaselineComparison],
     panel: str,
     purpose: PanelPurpose,
-) -> tuple[ExperimentStatus, str]:
+) -> tuple[PanelDecision, str]:
     """Resolve panel verdicts into a keep/discard decision.
 
     Promotion is aggregate: the panel solved-count must improve over the frozen

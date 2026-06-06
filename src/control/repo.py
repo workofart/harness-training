@@ -8,9 +8,10 @@ def _git_run(
     *args: str,
     cwd: Path | None = None,
     input: str | None = None,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     kwargs = {
-        "check": True,
+        "check": check,
         "capture_output": True,
         "text": True,
     }
@@ -47,12 +48,8 @@ def require_clean_worktree(*, cwd: Path | None = None) -> None:
 
 
 def git_ref_exists(*, cwd: Path | None = None, ref: str) -> bool:
-    completed = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
+    completed = _git_run(
+        "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", cwd=cwd, check=False
     )
     return completed.returncode == 0
 
@@ -78,12 +75,8 @@ def git_diff_added_lines_between(
         return []
     if not git_ref_exists(cwd=cwd, ref=head_ref):
         return []
-    completed = subprocess.run(
-        ["git", "diff", "--unified=0", base_ref, head_ref, "--", *paths],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
+    completed = _git_run(
+        "diff", "--unified=0", base_ref, head_ref, "--", *paths, cwd=cwd, check=False
     )
     if completed.returncode != 0:
         return []
@@ -100,13 +93,7 @@ def git_diff_added_lines_worktree(
     The working-tree sibling of `git_diff_added_lines_between` (which diffs two
     commits): used to scan a candidate's not-yet-committed edits.
     """
-    completed = subprocess.run(
-        ["git", "diff", "--unified=0", "--", *paths],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
+    completed = _git_run("diff", "--unified=0", "--", *paths, cwd=cwd, check=False)
     if completed.returncode != 0:
         return []
     return _added_lines(completed.stdout)
@@ -118,13 +105,7 @@ def git_show_at_head(path: str, *, cwd: Path | None = None) -> str:
     Uses `check=False` so a missing/unreadable blob raises a RuntimeError that
     carries the captured stdout+stderr, rather than an opaque CalledProcessError.
     """
-    completed = subprocess.run(
-        ["git", "show", f"HEAD:{path}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
+    completed = _git_run("show", f"HEAD:{path}", cwd=cwd, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
             f"failed to read HEAD {path}:\n"

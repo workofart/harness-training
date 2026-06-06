@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
-from pathlib import Path
 
 import src.trace as trace_module
 from src.adapters.llm_base import BaseLlm
+from src.experiment.record import existing_artifact_path
 from src.harness.contracts import HarnessEnv, TaskResult
 from src.harness.core import (
     NoValidActionError,
@@ -63,14 +63,6 @@ def _recorder_for_paths(
         trace_path=trace_path,
         metrics_path=metrics_path,
     )
-
-
-def _existing_artifact_path(path: str | None) -> str | None:
-    if path is None:
-        return None
-    if not Path(path).exists():
-        return None
-    return path
 
 
 def _recorded_steps_used(
@@ -201,7 +193,7 @@ async def run_task(
             trial_dir=trial_dir,
             trace_path=trace_path_for_trial,
             metrics_path=metrics_path,
-            verifier_stdout_path=_existing_artifact_path(verifier_stdout_path),
+            verifier_stdout_path=existing_artifact_path(verifier_stdout_path),
             metrics=final_metrics,
             started_at=started_at,
             finished_at=finished_at,
@@ -299,7 +291,7 @@ async def run_task(
         trial_dir=trial_dir,
         trace_path=trace_path,
         metrics_path=metrics_path,
-        verifier_stdout_path=_existing_artifact_path(verifier_stdout_path),
+        verifier_stdout_path=existing_artifact_path(verifier_stdout_path),
         metrics=final_metrics,
         started_at=started_at,
         finished_at=finished_at,

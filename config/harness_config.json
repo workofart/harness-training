@@ -154,6 +154,6 @@
     "max_context_length": 200000,
     "reasoning_effort": "high",
     "timeout_seconds": 300.0,
-    "service_tier": "priority"
+    "service_tier": "standard"
   }
 }

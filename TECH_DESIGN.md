@@ -127,7 +127,7 @@ The model-facing action vocabulary is eight typed dataclasses:
 - `run`
 - `verify`
 
-`ACTION_CLASSES` is the source of truth. `build_tool_specs()` derives tool schemas from the dataclass fields, while descriptions and integer-typed fields are declared separately.
+`ACTION_CLASSES` is the source of truth. Each action class declares its model-facing description; `build_tool_specs()` derives required/optional keys and JSON scalar types from dataclass fields/type hints.
 
 Per-task execution:
 
@@ -252,11 +252,11 @@ Gate rules:
 
 - candidate task results compare against the frozen active baseline for the same panel
 - prior candidate trials are not pooled into the control
-- per-task comparison uses `compare_candidate_against_baseline()` from `src/metrics.py`
-- alpha is `PROMOTION_P_VALUE_ALPHA`
-- a regression verdict discards the panel
-- a promotion panel keeps only if at least one task significantly improves and no task regresses
-- a regression-veto panel can only block; it cannot promote by itself
+- per-task comparison uses `compare_candidate_against_baseline()` from `src/metrics.py` at `PER_TASK_VERDICT_P_VALUE_ALPHA` for task-level evidence only
+- promotion uses aggregate solved-task counts and `AGGREGATE_PROMOTION_P_VALUE_ALPHA`
+- a promotion panel keeps only if aggregate solved-task count improves and, when the baseline has panel samples, the aggregate Fisher exact test passes
+- no per-task verdict directly promotes or discards a panel
+- a regression-veto panel can only block; it discards on an aggregate solved-task count drop
 - if a candidate still majority-solves a task, a statistical regression verdict is floored to unchanged
 - tasks with no baseline samples are treated as no-baseline frontier tasks
 

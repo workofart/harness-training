@@ -26,6 +26,7 @@ from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majorit
 
 EXPERIMENT_FILENAME = "experiment.json"
 ExperimentStatus = Literal["keep", "discard", "crash"]
+PanelDecision = Literal["keep", "discard"]
 PanelLifecycle = Literal["pending", "active", "finished", "skipped"]
 PanelPurpose = Literal["promotion", "regression_veto"]
 
@@ -39,6 +40,15 @@ class ExperimentAbandoned(RuntimeError):
 
 def failed_experiment_git_ref(experiment_id: str) -> str:
     return f"refs/experiments/failed/{experiment_id}"
+
+
+def existing_artifact_path(path: str | None) -> str | None:
+    """Return `path` when it names an existing file, else None."""
+    if path is None:
+        return None
+    if not Path(path).exists():
+        return None
+    return path
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -124,6 +134,10 @@ class TaskTrials(BaseModel):
         return len(self.finished_trials) >= self.expected_trial_count
 
     def append(self, trial: TaskResult) -> None:
+        if trial.task_name != self.task_name:
+            raise ValueError(
+                f"cannot append trial for task {trial.task_name!r} to {self.task_name!r}"
+            )
         self.trials.append(trial)
 
     @classmethod
@@ -172,13 +186,6 @@ class TaskOutcomeEvidence(BaseModel):
         baseline_trials: TaskTrials | None,
         verdict: BaselineComparison | None,
     ) -> "TaskOutcomeEvidence":
-        def existing_artifact_path(path: str | None) -> str | None:
-            if path is None:
-                return None
-            if not Path(path).exists():
-                return None
-            return path
-
         def agent_exec_log_path(task_result: TaskResult) -> str | None:
             if task_result.trial_dir is None:
                 return None
@@ -250,7 +257,7 @@ class ExperimentEvidence(BaseModel):
 class PanelEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: ExperimentStatus
+    status: PanelDecision
     decision_reason: str
     verdicts: dict[str, BaselineComparison]
 
@@ -374,7 +381,8 @@ class ExperimentRecord(BaseModel):
         focus_name: str = "",
         started_at: str,
     ) -> "ExperimentRecord":
-        return cls(
+        panel_order = [panel.panel_id for panel in panels]
+        record = cls(
             schema_version=2,
             experiment_id=experiment_id,
             parent_baseline_experiment_id=parent_baseline_experiment_id,
@@ -385,14 +393,14 @@ class ExperimentRecord(BaseModel):
             error="",
             started_at=started_at,
             finished_at=None,
-            panel_order=[panel.panel_id for panel in panels],
+            panel_order=panel_order,
             panels={panel.panel_id: panel for panel in panels},
             evidence=None,
         )
+        record.evidence = ExperimentEvidence.empty(record=record)
+        return record
 
     def write(self, *, root: Path) -> None:
-        if self.evidence is None:
-            self.evidence = ExperimentEvidence.empty(record=self)
         payload = self.model_dump(mode="json")
         write_json_atomic(self.path(self.experiment_id, root=root), payload)
 
@@ -416,16 +424,23 @@ class ExperimentRecord(BaseModel):
         self.error = "" if error is None else error
         self.finished_at = datetime.now(timezone.utc).isoformat()
 
+    def _evaluation_verdicts(self) -> dict[str, BaselineComparison]:
+        verdicts: dict[str, BaselineComparison] = {}
+        for panel_id in self.panel_order:
+            evaluation = self.panels[panel_id].evaluation
+            if evaluation is not None:
+                verdicts.update(evaluation.verdicts)
+        return verdicts
+
     def refresh_evidence(
         self,
         *,
         baseline: ExperimentRecord | None,
-        verdicts: Mapping[str, BaselineComparison] | None = None,
     ) -> None:
         self.evidence = build_experiment_evidence(
             candidate=self,
             baseline=baseline,
-            verdicts=verdicts,
+            verdicts=self._evaluation_verdicts(),
         )
 
     def finalize_crash(

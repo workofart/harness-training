@@ -294,7 +294,7 @@ def test_harness_config_accepts_chatgpt_codex_provider():
             "model_name": "gpt-5.5",
             "max_context_length": 200000,
             "reasoning_effort": "low",
-            "service_tier": "priority",
+            "service_tier": "standard",
         }
     )
 
@@ -303,7 +303,7 @@ def test_harness_config_accepts_chatgpt_codex_provider():
     assert config.llm_provider_config.provider == "chatgpt_codex"
     assert config.llm_provider_config.model_name == "gpt-5.5"
     assert config.llm_provider_config.max_context_length == 200000
-    assert config.llm_provider_config.service_tier == "priority"
+    assert config.llm_provider_config.service_tier == "standard"
 
 
 def test_harness_config_rejects_openrouter_priority_service_tier():

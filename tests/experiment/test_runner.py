@@ -30,14 +30,32 @@ class FakePanelConfig:
     purpose: str
     task_names: list[str]
     task_timeout_sec: float
-    run: object = field(
+    run: SimpleNamespace = field(
         default_factory=lambda: SimpleNamespace(
             when="always",
             after_panel=None,
             when_status=None,
         )
     )
-    baseline: object = field(default_factory=lambda: SimpleNamespace(required=False))
+    baseline: SimpleNamespace = field(
+        default_factory=lambda: SimpleNamespace(required=False)
+    )
+
+    @property
+    def initial_lifecycle(self) -> str:
+        return "active" if self.run.when == "always" else "pending"
+
+    @property
+    def after_panel(self) -> str | None:
+        return None if self.run.when == "always" else self.run.after_panel
+
+    @property
+    def when_status(self) -> str | None:
+        return None if self.run.when == "always" else self.run.when_status
+
+    @property
+    def requires_baseline(self) -> bool:
+        return self.baseline.required
 
 
 @dataclass
@@ -356,7 +374,7 @@ def test_schedule_order_keeps_config_order_for_equal_durations():
     ]
 
 
-def test_compile_panel_specs_exposes_panel_lifecycle_data():
+def test_panels_expose_lifecycle_data():
     config = FakeHarnessConfig(
         experiment_id="exp",
         focus_name="focus",
@@ -366,12 +384,12 @@ def test_compile_panel_specs_exposes_panel_lifecycle_data():
         test_task_timeout_sec=1200.0,
     )
 
-    specs = runner._compile_panel_specs(config)
+    specs = config.panels
 
-    assert [spec.panel_id for spec in specs] == ["train", "test"]
+    assert [spec.id for spec in specs] == ["train", "test"]
     promotion, regression_veto = specs
     assert promotion.purpose == "promotion"
-    assert promotion.task_names == ("train-a",)
+    assert promotion.task_names == ["train-a"]
     assert promotion.task_timeout_sec == 600.0
     assert promotion.initial_lifecycle == "active"
     assert promotion.requires_baseline is False
@@ -379,7 +397,7 @@ def test_compile_panel_specs_exposes_panel_lifecycle_data():
     assert promotion.when_status is None
 
     assert regression_veto.purpose == "regression_veto"
-    assert regression_veto.task_names == ("test-a",)
+    assert regression_veto.task_names == ["test-a"]
     assert regression_veto.task_timeout_sec == 1200.0
     assert regression_veto.initial_lifecycle == "pending"
     assert regression_veto.requires_baseline is True
@@ -387,16 +405,16 @@ def test_compile_panel_specs_exposes_panel_lifecycle_data():
     assert regression_veto.when_status == "keep"
 
 
-def test_compile_panel_specs_omits_absent_regression_veto_panel():
+def test_panels_omit_absent_regression_veto_panel():
     config = FakeHarnessConfig(
         experiment_id="exp",
         focus_name="focus",
         train_task_names=["train-a"],
     )
 
-    specs = runner._compile_panel_specs(config)
+    specs = config.panels
 
-    assert [spec.panel_id for spec in specs] == ["train"]
+    assert [spec.id for spec in specs] == ["train"]
 
 
 def test_run_experiment_uses_configured_panel_ids(monkeypatch, tmp_path):
@@ -515,6 +533,21 @@ def _budget_trials(*, expected, solved=0, failed=0, crashed=0):
     for _ in range(crashed):
         trials.append(_task_result(task_name="t", reward=0.0, error="boom"))
     return trials
+
+
+def test_set_trial_budget_centralizes_expected_count_mutation():
+    trials = _budget_trials(expected=3)
+
+    assert runner._set_trial_budget(trials, expected_trial_count=1) is True
+    assert trials.expected_trial_count == 1
+    assert runner._set_trial_budget(trials, expected_trial_count=1) is False
+
+
+def test_set_trial_budget_rejects_budget_below_finished_trials():
+    trials = _budget_trials(expected=3, solved=2)
+
+    with pytest.raises(ValueError, match="finished trials"):
+        runner._set_trial_budget(trials, expected_trial_count=1)
 
 
 def test_wants_confirmation_expand_only_for_failed_single_deterministic_trial():
@@ -1274,16 +1307,14 @@ def test_run_experiment_runs_train_when_baseline_absent(monkeypatch, tmp_path):
 
 def test_validate_setup_contract_rejects_configured_panel_drift():
     experiment_runner = runner.ExperimentRunner.__new__(runner.ExperimentRunner)
-    experiment_runner.panel_specs = runner._compile_panel_specs(
-        FakeHarnessConfig(
-            experiment_id="exp",
-            focus_name="focus",
-            promotion_panel_id="promotion",
-            regression_veto_panel_id="holdout",
-            train_task_names=["promotion-a"],
-            test_task_names=["holdout-a"],
-        )
-    )
+    experiment_runner.panel_specs = FakeHarnessConfig(
+        experiment_id="exp",
+        focus_name="focus",
+        promotion_panel_id="promotion",
+        regression_veto_panel_id="holdout",
+        train_task_names=["promotion-a"],
+        test_task_names=["holdout-a"],
+    ).panels
     state = ExperimentState(active_baseline_experiment_id="baseline")
     baseline = init_generic_record(
         experiment_id="baseline",
@@ -1489,6 +1520,58 @@ def test_run_baseline_at_head_returns_existing_baseline_when_unchanged(
     assert baseline.experiment_id == "baseline"
     assert state.current_experiment_id == "baseline"
     assert state.active_baseline_experiment_id == "baseline"
+
+
+def test_baseline_panel_spec_match_requires_exact_panel_order():
+    baseline = init_generic_record(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        panel_specs=[
+            ("test", "regression_veto", ["test-a"], 1),
+            ("train", "promotion", ["train-a"], 1),
+        ],
+    )
+    config = FakeHarnessConfig(
+        experiment_id="unused",
+        focus_name="",
+        train_task_names=["train-a"],
+        test_task_names=["test-a"],
+    )
+
+    assert runner.baseline_matches_panel_specs(baseline, config.panels) is False
+
+
+def test_baseline_panel_spec_match_ignores_task_order():
+    baseline = init_generic_record(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        panel_specs=[("train", "promotion", ["train-a", "train-b"], 1)],
+    )
+    config = FakeHarnessConfig(
+        experiment_id="unused",
+        focus_name="",
+        train_task_names=["train-b", "train-a"],
+    )
+
+    assert runner.baseline_matches_panel_specs(baseline, config.panels) is True
+
+
+def test_baseline_panel_spec_match_requires_panel_purpose():
+    baseline = init_generic_record(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        panel_specs=[("train", "regression_veto", ["train-a"], 1)],
+    )
+    config = FakeHarnessConfig(
+        experiment_id="unused",
+        focus_name="",
+        train_task_names=["train-a"],
+    )
+
+    assert runner.baseline_matches_panel_specs(baseline, config.panels) is False
 
 
 def test_run_baseline_at_head_runs_full_current_panel(monkeypatch, tmp_path):

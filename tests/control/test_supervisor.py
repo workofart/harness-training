@@ -21,6 +21,7 @@ from src.experiment.record import (
     ExperimentEvidence,
     ExperimentRecord,
     ExperimentState,
+    PanelEvaluation,
     PanelRecord,
     TaskOutcomeEvidence,
 )
@@ -223,6 +224,118 @@ def make_keep_baseline() -> ExperimentRecord:
         parent_baseline_experiment_id=None,
         status="keep",
         reward=1.0,
+    )
+
+
+def test_derive_next_phase_recovers_launch_checkpoint(tmp_path: Path) -> None:
+    snapshot = make_runtime_snapshot(
+        tmp_path,
+        active_baseline_record=make_keep_baseline(),
+    )
+    saved_state = supervisor_state.SupervisorState.launch(
+        thread_id="thread-1",
+        updated_at="2026-04-11T00:00:00+00:00",
+        launch_experiment_id="exp-next",
+        launch_baseline_commit="base123",
+    )
+
+    assert (
+        supervisor.derive_next_phase(
+            snapshot=snapshot,
+            saved_state=saved_state,
+            current_record=None,
+        )
+        == "recover_launch"
+    )
+
+
+def test_derive_next_phase_abandons_unfinished_candidate(tmp_path: Path) -> None:
+    snapshot = make_runtime_snapshot(
+        tmp_path,
+        active_baseline_record=make_keep_baseline(),
+    )
+    snapshot.current_candidate_record = make_unfinished_record(
+        experiment_id="exp-next",
+        git_commit_hash="candidate123",
+        parent_baseline_experiment_id="baseline",
+    )
+
+    assert (
+        supervisor.derive_next_phase(
+            snapshot=snapshot,
+            saved_state=None,
+            current_record=None,
+        )
+        == "abandon_unfinished_candidate"
+    )
+
+
+def test_derive_next_phase_runs_postrun_for_concluded_candidate(
+    tmp_path: Path,
+) -> None:
+    candidate = make_record(
+        experiment_id="exp-next",
+        git_commit_hash="candidate123",
+        parent_baseline_experiment_id="baseline",
+        status="discard",
+        reward=0.0,
+    )
+    snapshot = make_runtime_snapshot(
+        tmp_path,
+        active_baseline_record=make_keep_baseline(),
+    )
+    snapshot.current_candidate_record = candidate
+
+    assert (
+        supervisor.derive_next_phase(
+            snapshot=snapshot,
+            saved_state=None,
+            current_record=candidate,
+        )
+        == "postrun_diagnosis"
+    )
+
+
+def test_derive_next_phase_skips_completed_postrun_marker(tmp_path: Path) -> None:
+    candidate = make_record(
+        experiment_id="exp-next",
+        git_commit_hash="candidate123",
+        parent_baseline_experiment_id="baseline",
+        status="discard",
+        reward=0.0,
+    )
+    snapshot = make_runtime_snapshot(
+        tmp_path,
+        active_baseline_record=make_keep_baseline(),
+    )
+    snapshot.current_candidate_record = candidate
+    saved_state = supervisor_state.SupervisorState.prelaunch(
+        thread_id="thread-1",
+        updated_at="2026-04-11T00:00:00+00:00",
+        postrun_completed_experiment_id="exp-next",
+    )
+
+    assert (
+        supervisor.derive_next_phase(
+            snapshot=snapshot,
+            saved_state=saved_state,
+            current_record=candidate,
+        )
+        == "prelaunch"
+    )
+
+
+def test_derive_next_phase_defaults_to_prelaunch(tmp_path: Path) -> None:
+    baseline = make_keep_baseline()
+    snapshot = make_runtime_snapshot(tmp_path, active_baseline_record=baseline)
+
+    assert (
+        supervisor.derive_next_phase(
+            snapshot=snapshot,
+            saved_state=None,
+            current_record=baseline,
+        )
+        == "prelaunch"
     )
 
 
@@ -665,7 +778,12 @@ def test_latest_evidence_task_artifact_paths_uses_all_relevant_panel_outcomes(
         for tid, trials in baseline.panels["train"].task_results.items()
     }
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
-    candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
+    candidate.panels["train"].evaluation = PanelEvaluation(
+        status="discard",
+        decision_reason="baseline solved task regressed",
+        verdicts=verdicts,
+    )
+    candidate.refresh_evidence(baseline=baseline)
 
     assert supervisor.latest_evidence_task_artifact_paths(candidate) == (
         candidate_artifacts["task-a"]["trial_dir"],

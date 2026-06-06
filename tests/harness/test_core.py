@@ -164,6 +164,15 @@ def test_build_tool_specs_covers_all_action_names():
     assert {s["function"]["name"] for s in specs} == set(ACTION_SPECS)
 
 
+def test_action_specs_derive_metadata_from_action_classes():
+    assert ACTION_SPECS["run"].description == RunAction.DESCRIPTION
+    assert ACTION_SPECS["read_file"].json_type_by_key == {
+        "path": "string",
+        "start_line": "integer",
+        "end_line": "integer",
+    }
+
+
 def test_build_tool_specs_marks_integer_fields_with_integer_type():
     properties_by_tool = {
         spec["function"]["name"]: spec["function"]["parameters"]["properties"]

@@ -12,6 +12,7 @@ from src.experiment.record import (
     ExperimentAbandoned,
     ExperimentRecord,
     ExperimentState,
+    PanelEvaluation,
     PanelRecord,
     TaskTrials,
     task_success_summary,
@@ -188,6 +189,39 @@ def test_panel_record_rejects_duplicate_task_ids():
 
     with pytest.raises(ValidationError):
         PanelRecord.model_validate(payload)
+
+
+def test_panel_evaluation_rejects_crash_status():
+    with pytest.raises(ValidationError):
+        PanelEvaluation(status="crash", decision_reason="boom", verdicts={})
+
+
+def test_experiment_record_initialize_creates_empty_evidence():
+    record = init_record(
+        experiment_id="exp",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a"],
+    )
+
+    assert record.evidence is not None
+    assert record.evidence.candidate_change.commit == "abc123"
+    assert record.evidence.candidate_change.parent_baseline_experiment_id is None
+    assert record.evidence.panel_outcomes == {"train": []}
+
+
+def test_experiment_record_write_does_not_mutate_evidence(tmp_path):
+    record = init_record(
+        experiment_id="exp",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=["train-a"],
+    )
+    record.evidence = None
+
+    record.write(root=tmp_path)
+
+    assert record.evidence is None
 
 
 def test_load_fails_fast_on_missing_decision_bearing_fields():
@@ -389,7 +423,12 @@ def test_experiment_record_evidence_marks_outcomes_without_rule_internals(
         for tid, trials in train_results(baseline).items()
     }
     verdicts = build_gate_verdicts(candidate=candidate, pool=pool)
-    candidate.refresh_evidence(baseline=baseline, verdicts=verdicts)
+    candidate.panels["train"].evaluation = PanelEvaluation(
+        status="discard",
+        decision_reason="baseline solved task regressed",
+        verdicts=verdicts,
+    )
+    candidate.refresh_evidence(baseline=baseline)
 
     assert candidate.evidence.candidate_change.commit == "candidate123"
     assert candidate.evidence.candidate_change.parent_baseline_commit == "base123"
@@ -495,10 +534,17 @@ def test_experiment_record_evidence_writes_train_and_test_panel_outcomes():
         pool={"test-a": (4, 4)},
         panel="test",
     )
-    candidate.refresh_evidence(
-        baseline=baseline,
-        verdicts={**train_verdicts, **test_verdicts},
+    candidate.panels["train"].evaluation = PanelEvaluation(
+        status="keep",
+        decision_reason="train improved",
+        verdicts=train_verdicts,
     )
+    candidate.panels["test"].evaluation = PanelEvaluation(
+        status="discard",
+        decision_reason="test regressed",
+        verdicts=test_verdicts,
+    )
+    candidate.refresh_evidence(baseline=baseline)
 
     assert candidate.evidence is not None
     assert set(candidate.evidence.panel_outcomes) == {"train", "test"}
@@ -724,6 +770,13 @@ def test_task_trials_majority_solved_with_k_trials():
     assert trials.solved_count == 2
     assert trials.majority_solved is True
     assert trials.is_finished is True
+
+
+def test_task_trials_append_rejects_mismatched_task_name():
+    trials = TaskTrials(task_name="expected", expected_trial_count=1, trials=[])
+
+    with pytest.raises(ValueError, match="expected"):
+        trials.append(_task_result(task_name="actual", reward=1.0))
 
 
 def test_task_trials_unfinished_trials_do_not_block_completion_after_padding():
