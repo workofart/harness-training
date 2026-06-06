@@ -12,15 +12,32 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import NamedTuple
 
 from src.metrics import (
-    PROMOTION_P_VALUE_ALPHA,
+    AGGREGATE_PROMOTION_P_VALUE_ALPHA,
+    PER_TASK_VERDICT_P_VALUE_ALPHA,
     BaselineComparison,
     compare_candidate_against_baseline,
+    compute_fisher_exact_p_value,
     is_majority_solved,
 )
 
 from src.experiment.record import ExperimentRecord, ExperimentStatus, PanelPurpose
+
+
+class _PanelAggregate(NamedTuple):
+    """Panel-level solved-task counts for the promotion decision.
+
+    Each unit is a whole task (majority-solved), not a trial. ``p_value`` is the
+    aggregate Fisher exact test, or ``None`` when no baseline tasks were observed.
+    """
+
+    candidate_solved: int
+    candidate_total: int
+    baseline_solved: int
+    baseline_total: int
+    p_value: float | None
 
 
 def build_gate_verdicts(
@@ -48,7 +65,7 @@ def build_gate_verdicts(
             candidate_total=len(candidate_trials.valid_trials),
             baseline_solved=baseline_solved,
             baseline_total=baseline_total,
-            alpha=PROMOTION_P_VALUE_ALPHA,
+            alpha=PER_TASK_VERDICT_P_VALUE_ALPHA,
         )
         verdicts[task_id] = _floor_regression_when_candidate_solves(verdict)
     return verdicts
@@ -90,23 +107,82 @@ def decide_panel_from_verdicts(
     panel: str,
     purpose: PanelPurpose,
 ) -> tuple[ExperimentStatus, str]:
-    """Resolve panel verdicts into a policy decision.
+    """Resolve panel verdicts into a keep/discard decision.
 
-    Regressions always discard. Promotion panels can keep on improvement;
-    regression-veto panels can only block.
+    Promotion is aggregate: the panel solved-count must improve over the frozen
+    parent and pass a relaxed Fisher check. Per-task verdicts stay diagnostic,
+    not the trigger.
     """
-    panel_order = tuple(candidate.panels[panel].task_ids)
-    for task_id in panel_order:
-        verdict = verdicts.get(task_id)
-        if verdict is not None and verdict.kind == "regression":
-            return "discard", f"{panel} task {task_id} regressed"
+    aggregate = _aggregate_panel_comparison(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel=panel,
+    )
+    counts = (
+        f"{aggregate.candidate_solved}/{aggregate.candidate_total} "
+        f"vs {aggregate.baseline_solved}/{aggregate.baseline_total}"
+    )
     if purpose == "regression_veto":
-        return "keep", f"{panel} tasks did not regress"
-    for task_id in panel_order:
-        verdict = verdicts.get(task_id)
-        if verdict is not None and verdict.kind == "improvement":
-            return "keep", f"{panel} task {task_id} improved"
-    return "discard", f"no {panel} task improvement reached significance"
+        if aggregate.candidate_solved < aggregate.baseline_solved:
+            return "discard", f"{panel} aggregate regressed: {counts}"
+        return "keep", f"{panel} aggregate did not regress: {counts}"
+    if aggregate.candidate_solved <= aggregate.baseline_solved:
+        return "discard", f"{panel} aggregate did not improve: {counts}"
+    if aggregate.baseline_total == 0:
+        return "keep", f"{panel} aggregate improved: {counts}"
+    # Both guards above leave a positive denominator, so p_value is set here.
+    assert aggregate.p_value is not None
+    passed = aggregate.p_value <= AGGREGATE_PROMOTION_P_VALUE_ALPHA
+    verb = "improved" if passed else "improvement not significant"
+    op = "<=" if passed else ">"
+    return (
+        "keep" if passed else "discard",
+        f"{panel} aggregate {verb}: {counts} "
+        f"(p={aggregate.p_value:.3g} {op} {AGGREGATE_PROMOTION_P_VALUE_ALPHA})",
+    )
+
+
+def _aggregate_panel_comparison(
+    *,
+    candidate: ExperimentRecord,
+    verdicts: Mapping[str, BaselineComparison],
+    panel: str,
+) -> _PanelAggregate:
+    # `build_gate_verdicts` covers every panel task, so each in-scope id is in `verdicts`.
+    panel_record = candidate.panels[panel]
+    in_scope = panel_record.in_scope_task_results
+    candidate_total = len(in_scope)
+    candidate_solved = panel_record.solved_count
+    baseline_total = (
+        candidate_total
+        if any(verdicts[task_id].baseline_total > 0 for task_id in in_scope)
+        else 0
+    )
+    baseline_solved = sum(
+        1
+        for task_id in in_scope
+        if is_majority_solved(
+            solved=verdicts[task_id].baseline_solved,
+            total=verdicts[task_id].baseline_total,
+        )
+    )
+    p_value = (
+        None
+        if baseline_total == 0 or candidate_total == 0
+        else compute_fisher_exact_p_value(
+            candidate_solved=candidate_solved,
+            candidate_total=candidate_total,
+            baseline_solved=baseline_solved,
+            baseline_total=baseline_total,
+        )
+    )
+    return _PanelAggregate(
+        candidate_solved=candidate_solved,
+        candidate_total=candidate_total,
+        baseline_solved=baseline_solved,
+        baseline_total=baseline_total,
+        p_value=p_value,
+    )
 
 
 # ----------------------------------------------------------------------------

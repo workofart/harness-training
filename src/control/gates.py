@@ -28,6 +28,10 @@ CANDIDATE_DIFF_SCAN_PATHS: tuple[str, ...] = (
     "src/harness/core.py",
     "tests/harness/test_core.py",
 )
+# Line ceiling on experiments/learning.md so the diagnosis memo stays condensed:
+# an over-budget update is rejected and fed back to force a rewrite, not an append.
+# ~1/3 of the pre-cap memo. Lines (not chars) for reviewability; tunable.
+LEARNING_MEMO_MAX_LINES = 150
 
 
 def validate_candidate_editable_paths(
@@ -109,6 +113,15 @@ def validate_learning_memo_update(
         raise RuntimeError("learning memo must be non-empty")
     if after_learning == before_learning:
         raise RuntimeError("learning memo was not updated")
+    line_count = len(after_learning.splitlines())
+    if line_count > LEARNING_MEMO_MAX_LINES:
+        raise RuntimeError(
+            f"learning memo is {line_count} lines, over the "
+            f"{LEARNING_MEMO_MAX_LINES}-line budget; rewrite it shorter (do not "
+            "append). Keep durable, generic mechanism knowledge and the current "
+            "frontier; drop per-cycle solve-count deltas and cross-run variance "
+            "narration."
+        )
 
 
 def _load_head_harness_config_for_repo(repo_root: Path) -> HarnessConfig:

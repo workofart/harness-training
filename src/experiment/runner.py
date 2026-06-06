@@ -660,6 +660,9 @@ class ExperimentRunner:
                 baseline.git_commit_hash == git_commit_hash
                 and _record_matches_panel_specs(baseline, panel_specs)
             ):
+                state.set_active_baseline(
+                    experiment_id=baseline.experiment_id, record=baseline
+                )
                 state.current_experiment_id = baseline.experiment_id
                 state.updated_at = datetime.now(timezone.utc).isoformat()
                 state.save(root=experiments_root)
@@ -758,7 +761,7 @@ class ExperimentRunner:
         record.finalize(status="keep", decision_reason=decision_reason)
         record.refresh_evidence(baseline=baseline)
         record.write(root=experiments_root)
-        state.active_baseline_experiment_id = record.experiment_id
+        state.set_active_baseline(experiment_id=record.experiment_id, record=record)
         state.current_experiment_id = record.experiment_id
         state.updated_at = record.finished_at
         state.save(root=experiments_root)
@@ -1040,7 +1043,9 @@ class ExperimentRunner:
         self.state.updated_at = self.record.finished_at
         match status:
             case "keep":
-                self.state.active_baseline_experiment_id = self.record.experiment_id
+                self.state.set_active_baseline(
+                    experiment_id=self.record.experiment_id, record=self.record
+                )
                 self.state.save(root=self.experiments_root)
                 return
             case _:

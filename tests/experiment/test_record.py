@@ -11,8 +11,10 @@ from src.experiment.gate import build_gate_verdicts
 from src.experiment.record import (
     ExperimentAbandoned,
     ExperimentRecord,
+    ExperimentState,
     PanelRecord,
     TaskTrials,
+    task_success_summary,
     terminal_task_result,
 )
 from src.harness.contracts import TaskResult
@@ -545,6 +547,155 @@ def test_experiment_record_evidence_omits_missing_artifact_paths(tmp_path):
     assert outcome.agent_exec_log_path == str(exec_log_path)
     assert outcome.metrics_path == str(metrics_path)
     assert outcome.verifier_stdout_path is None
+
+
+def test_experiment_state_load_accepts_missing_success_rate_index(tmp_path):
+    root = tmp_path / "experiments"
+    root.mkdir()
+    (root / "state.json").write_text(
+        json.dumps(
+            {
+                "active_baseline_experiment_id": "baseline",
+                "current_experiment_id": "candidate",
+                "updated_at": "2026-04-10T00:00:00+00:00",
+            }
+        )
+    )
+
+    state = ExperimentState.load(root=root)
+
+    assert state.active_baseline_experiment_id == "baseline"
+    assert state.current_experiment_id == "candidate"
+    assert state.experiment_task_success_rates == {}
+
+
+def test_set_active_baseline_snapshots_success_rate_from_in_memory_record(tmp_path):
+    # Summary comes from the in-memory record, not disk: the baseline below is
+    # never written, yet its rate still lands in state.json.
+    root = tmp_path / "experiments"
+    root.mkdir()
+    baseline = ExperimentRecord.initialize(
+        experiment_id="baseline-summary",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=["baseline-solved", "baseline-unsolved", "baseline-crash"],
+                expected_trial_count=1,
+                lifecycle="finished",
+            ),
+            PanelRecord.initialize(
+                panel_id="test",
+                purpose="regression_veto",
+                task_ids=["skipped-task"],
+                expected_trial_count=0,
+                lifecycle="skipped",
+            ),
+        ],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    baseline.record_task_result(_task_result(task_name="baseline-solved", reward=1.0))
+    baseline.record_task_result(_task_result(task_name="baseline-unsolved", reward=0.0))
+    baseline.record_task_result(
+        _task_result(task_name="baseline-crash", reward=0.0, error="crashed")
+    )
+    baseline.finalize(status="keep", decision_reason="promoted")
+
+    state = ExperimentState(
+        active_baseline_experiment_id=None,
+        current_experiment_id="candidate",
+        updated_at=baseline.finished_at,
+    )
+    state.set_active_baseline(experiment_id=baseline.experiment_id, record=baseline)
+
+    # Snapshotted eagerly in memory, before any save touches disk.
+    assert state.active_baseline_experiment_id == "baseline-summary"
+    assert list(state.experiment_task_success_rates) == ["baseline-summary"]
+
+    state.save(root=root)
+
+    reloaded = ExperimentState.load(root=root)
+    summary = reloaded.experiment_task_success_rates["baseline-summary"]
+    assert summary.overall.solved == 1  # crash trial excluded from solved
+    assert summary.overall.total == 3  # all three in-scope train tasks count
+    assert summary.overall.rate == pytest.approx(1 / 3)
+    assert summary.panels["train"].solved == 1
+    assert summary.panels["train"].total == 3
+    assert summary.panels["test"].total == 0  # skipped panel is out of scope
+    assert summary.panels["test"].rate is None
+
+    payload = json.loads((root / "state.json").read_text())
+    persisted = payload["experiment_task_success_rates"]["baseline-summary"]
+    assert persisted["overall"] == {
+        "solved": 1,
+        "total": 3,
+        "rate": pytest.approx(1 / 3),
+    }
+
+
+def test_set_active_baseline_without_loadable_record_drops_summary():
+    # Rollback to a parent that could not be loaded keeps the (possibly
+    # dangling) pointer but records no summary, clearing any prior one.
+    keep = ExperimentRecord.initialize(
+        experiment_id="parent",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=["task-a"],
+                expected_trial_count=1,
+                lifecycle="finished",
+            ),
+        ],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    keep.record_task_result(_task_result(task_name="task-a", reward=1.0))
+    keep.finalize(status="keep", decision_reason="promoted")
+
+    state = ExperimentState(active_baseline_experiment_id=None, updated_at=None)
+    state.set_active_baseline(experiment_id=keep.experiment_id, record=keep)
+    assert state.experiment_task_success_rates  # populated
+
+    state.set_active_baseline(experiment_id="missing-parent", record=None)
+    assert state.active_baseline_experiment_id == "missing-parent"
+    assert state.experiment_task_success_rates == {}
+
+
+def test_task_success_summary_counts_only_tasks_in_run_scope():
+    record = ExperimentRecord.initialize(
+        experiment_id="exp-summary",
+        git_commit_hash="abc123",
+        parent_baseline_experiment_id=None,
+        panels=[
+            PanelRecord.initialize(
+                panel_id="train",
+                purpose="promotion",
+                task_ids=["train-a"],
+                expected_trial_count=1,
+                lifecycle="finished",
+            ),
+            PanelRecord.initialize(
+                panel_id="test",
+                purpose="regression_veto",
+                task_ids=["test-a"],
+                expected_trial_count=0,
+                lifecycle="skipped",
+            ),
+        ],
+        started_at="2026-04-10T00:00:00+00:00",
+    )
+    record.record_task_result(_task_result(task_name="train-a", reward=1.0))
+
+    summary = task_success_summary(record)
+
+    assert summary.overall.solved == 1
+    assert summary.overall.total == 1
+    assert summary.overall.rate == 1.0
+    assert summary.panels["test"].total == 0
 
 
 def test_task_trials_majority_solved_with_k_trials():

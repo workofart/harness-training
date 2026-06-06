@@ -118,15 +118,18 @@ def test_single_source_of_truth_gate_and_evidence_agree():
     assert verdicts["solid"].kind == "regression"
     assert verdicts["wobbly"].kind == "unchanged"
 
-    # Decision layer reads the same verdicts. Regression wins over
-    # improvement within a candidate.
+    # Decision layer uses aggregate panel counts. The per-task verdicts remain
+    # evidence, but they no longer promote/veto by themselves.
     status, reason = decide_panel_from_verdicts(
         candidate=candidate,
         verdicts=verdicts,
         panel="train",
         purpose="promotion",
     )
-    assert (status, reason) == ("discard", "train task solid regressed")
+    assert (status, reason) == (
+        "discard",
+        "train aggregate did not improve: 1/3 vs 2/3",
+    )
 
     # Evidence layer reads the same verdicts. Labels are the 5-state
     # vocabulary derived from verdict.kind + majority bools.
@@ -305,59 +308,136 @@ def test_well_separated_regression_is_flagged():
         panel="train",
         purpose="promotion",
     )
-    assert status == "discard" and "regressed" in reason
+    assert (status, reason) == (
+        "discard",
+        "train aggregate did not improve: 0/1 vs 1/1",
+    )
 
 
-def test_evaluate_keeps_candidate_with_significant_train_gain_at_k10():
+def test_evaluate_keeps_candidate_with_significant_aggregate_train_gain():
+    task_ids = [f"task-{index}" for index in range(10)]
     baseline = _make_record(
         experiment_id="baseline",
         parent=None,
-        train_ids=["frontier"],
-        k=10,
+        train_ids=task_ids,
+        k=1,
     )
-    # 1/10 baseline (not 0/10) so the Fisher two-sample path applies (the
-    # baseline_solved==0 majority-solve shortcut does not). The candidate needs
-    # a large enough separation to reach significance at these counts: 8/10 vs
-    # 1/10 is a clear Fisher improvement (p ~= 0.006).
-    _record_solves(baseline, "frontier", [True] + [False] * 9)
+    _record_solves(baseline, "task-0", [True])
+    for task_id in task_ids[1:]:
+        _record_solves(baseline, task_id, [False])
     candidate = _make_record(
         experiment_id="cand",
         parent="baseline",
-        train_ids=["frontier"],
-        k=10,
+        train_ids=task_ids,
+        k=1,
     )
-    _record_solves(candidate, "frontier", [True] * 8 + [False] * 2)
+    for task_id in task_ids[:8]:
+        _record_solves(candidate, task_id, [True])
+    for task_id in task_ids[8:]:
+        _record_solves(candidate, task_id, [False])
 
     status, reason = _gate(candidate=candidate, pool=_pool_from_baseline(baseline))
     assert status == "keep"
-    assert reason.startswith("train task frontier improved")
+    assert reason == "train aggregate improved: 8/10 vs 1/10 (p=0.00548 <= 0.2)"
+
+
+def test_promotion_requires_aggregate_train_signal_not_one_task_lottery():
+    baseline = _make_record(
+        experiment_id="baseline",
+        parent=None,
+        train_ids=["stable-a", "stable-b", "frontier"],
+        k=3,
+    )
+    _record_solves(baseline, "stable-a", [True] * 3)
+    _record_solves(baseline, "stable-b", [True] * 3)
+    _record_solves(baseline, "frontier", [False] * 3)
+    candidate = _make_record(
+        experiment_id="candidate",
+        parent="baseline",
+        train_ids=["stable-a", "stable-b", "frontier"],
+        k=3,
+    )
+    _record_solves(candidate, "stable-a", [True] * 3)
+    _record_solves(candidate, "stable-b", [True] * 3)
+    _record_solves(candidate, "frontier", [True] * 3)
+
+    verdicts = build_gate_verdicts(
+        candidate=candidate,
+        pool=_pool_from_baseline(baseline),
+    )
+    assert verdicts["frontier"].kind == "improvement"
+    assert decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="promotion",
+    ) == (
+        "discard",
+        "train aggregate improvement not significant: 3/3 vs 2/3 (p=1 > 0.2)",
+    )
+
+
+def test_regression_veto_blocks_aggregate_solved_count_drop():
+    baseline = _make_record(
+        experiment_id="baseline",
+        parent=None,
+        train_ids=["stable-a", "stable-b", "wobbly"],
+        k=1,
+    )
+    _record_solves(baseline, "stable-a", [True])
+    _record_solves(baseline, "stable-b", [True])
+    _record_solves(baseline, "wobbly", [True])
+    candidate = _make_record(
+        experiment_id="candidate",
+        parent="baseline",
+        train_ids=["stable-a", "stable-b", "wobbly"],
+        k=1,
+    )
+    _record_solves(candidate, "stable-a", [True])
+    _record_solves(candidate, "stable-b", [True])
+    _record_solves(candidate, "wobbly", [False])
+
+    verdicts = build_gate_verdicts(
+        candidate=candidate,
+        pool=_pool_from_baseline(baseline),
+    )
+    assert verdicts["wobbly"].kind == "unchanged"
+    assert decide_panel_from_verdicts(
+        candidate=candidate,
+        verdicts=verdicts,
+        panel="train",
+        purpose="regression_veto",
+    ) == ("discard", "train aggregate regressed: 2/3 vs 3/3")
 
 
 @pytest.mark.parametrize(
-    ("train_ids", "baseline_solves", "candidate_solves"),
+    ("train_ids", "baseline_solves", "candidate_solves", "reason"),
     [
         pytest.param(
             ["frontier"],
             {"frontier": [True] * 5 + [False] * 5},
             {"frontier": [True] * 6 + [False] * 4},
+            "train aggregate did not improve: 1/1 vs 1/1",
             id="small-train-gain",
         ),
         pytest.param(
             ["a", "h"],
             {"a": [True] * 6 + [False] * 4, "h": [True] * 3 + [False] * 7},
             {"a": [True] * 6 + [False] * 4, "h": [True] * 3 + [False] * 7},
+            "train aggregate did not improve: 1/2 vs 1/2",
             id="identical-candidate",
         ),
         pytest.param(
             ["a"],
             {"a": [True] * 10},
             {},
+            "train aggregate did not improve: 0/1 vs 1/1",
             id="empty-candidate-panel",
         ),
     ],
 )
 def test_evaluate_discards_without_significant_train_improvement(
-    train_ids, baseline_solves, candidate_solves
+    train_ids, baseline_solves, candidate_solves, reason
 ):
     baseline = _make_record(
         experiment_id="baseline",
@@ -378,7 +458,7 @@ def test_evaluate_discards_without_significant_train_improvement(
 
     assert _gate(candidate=candidate, pool=_pool_from_baseline(baseline)) == (
         "discard",
-        "no train task improvement reached significance",
+        reason,
     )
 
 
@@ -405,7 +485,7 @@ def test_evaluate_does_not_regress_on_small_sample_majority_loss():
 
     assert _gate(candidate=candidate, pool=_pool_from_baseline(baseline)) == (
         "discard",
-        "no train task improvement reached significance",
+        "train aggregate did not improve: 0/1 vs 1/1",
     )
 
 
@@ -426,8 +506,10 @@ def test_evaluate_uses_rates_not_counts_when_trial_counts_differ():
     _record_solves(candidate, "frontier", [True] * 10)
 
     status, reason = _gate(candidate=candidate, pool=_pool_from_baseline(baseline))
-    assert status == "keep"
-    assert reason == "train task frontier improved"
+    assert (status, reason) == (
+        "discard",
+        "train aggregate did not improve: 1/1 vs 1/1",
+    )
 
 
 def test_evaluate_no_baseline_discards_unsolved_candidate():
@@ -443,7 +525,7 @@ def test_evaluate_no_baseline_discards_unsolved_candidate():
     _record_solves(candidate, "a", [False, False, False])
     assert _gate(candidate=candidate, pool={}) == (
         "discard",
-        "no train task improvement reached significance",
+        "train aggregate did not improve: 0/1 vs 0/0",
     )
 
 
@@ -470,7 +552,7 @@ def test_evaluate_train_regression_wins_over_train_improvement():
 
     assert _gate(candidate=candidate, pool=_pool_from_baseline(baseline)) == (
         "discard",
-        "train task loser regressed",
+        "train aggregate did not improve: 1/2 vs 1/2",
     )
 
 
@@ -494,12 +576,11 @@ def test_evaluate_keeps_when_no_baseline_task_solved_with_no_baseline_entry():
     _record_solves(candidate, "b", [True] * 4 + [False] * 2)
     _record_solves(candidate, "c", [True] * 5 + [False])
 
-    # Under compare_candidate_against_baseline, a missing pool entry is the
-    # baseline_solved == 0 path: a candidate that majority-solves becomes an
-    # "improvement". The reason reads like any other train-task improvement.
+    # The per-task verdict still records c as a useful frontier solve, but a
+    # one-task aggregate gain is not enough evidence to promote the baseline.
     assert _gate(candidate=candidate, pool=_pool_from_baseline(baseline)) == (
-        "keep",
-        "train task c improved",
+        "discard",
+        "train aggregate improvement not significant: 2/2 vs 1/2 (p=1 > 0.2)",
     )
 
 
@@ -525,7 +606,7 @@ def test_evaluate_discards_when_no_baseline_task_unsolved():
 
     assert _gate(candidate=candidate, pool=_pool_from_baseline(baseline)) == (
         "discard",
-        "no train task improvement reached significance",
+        "train aggregate did not improve: 1/2 vs 1/2",
     )
 
 

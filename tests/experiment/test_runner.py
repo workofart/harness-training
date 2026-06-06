@@ -405,6 +405,7 @@ def test_run_experiment_uses_configured_panel_ids(monkeypatch, tmp_path):
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
+    promotion_tasks = [f"promotion-{index}" for index in range(10)]
     experiment_runner = make_runner(
         monkeypatch,
         tmp_path,
@@ -412,36 +413,36 @@ def test_run_experiment_uses_configured_panel_ids(monkeypatch, tmp_path):
         focus_name="focus",
         promotion_panel_id="promotion",
         regression_veto_panel_id="holdout",
-        train_task_names=["promotion-a"],
+        train_task_names=promotion_tasks,
         test_task_names=["holdout-a"],
-        task_trials=4,
+        task_trials=1,
         max_trial_concurrency=1,
-        task_dirs=["promotion-a", "holdout-a"],
+        task_dirs=[*promotion_tasks, "holdout-a"],
     )
     stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
-    # Baseline never solves promotion-a (0/4 -> frontier) and solves holdout-a
-    # 4/4, so the candidate's holdout 0/3 is a genuine Fisher regression.
     baseline = init_generic_record(
         experiment_id="baseline",
         git_commit_hash="base123",
         parent_baseline_experiment_id=None,
         panel_specs=[
-            ("promotion", "promotion", ["promotion-a"], 4),
-            ("holdout", "regression_veto", ["holdout-a"], 4),
+            ("promotion", "promotion", promotion_tasks, 1),
+            ("holdout", "regression_veto", ["holdout-a"], 1),
         ],
     )
-    for index in range(4):
+    for index, task_name in enumerate(promotion_tasks):
         baseline.record_task_result(
-            _panel_trial_result("promotion-a", solved=False, index=index)
+            _panel_trial_result(task_name, solved=index == 0, index=index)
         )
-        baseline.record_task_result(
-            _panel_trial_result("holdout-a", solved=True, index=index)
-        )
+    baseline.record_task_result(_panel_trial_result("holdout-a", solved=True, index=0))
 
     async def fake_run_task(*, task_name, **_kwargs):
+        if task_name == "holdout-a":
+            return _panel_trial_result(task_name, solved=False, index=0)
         return _panel_trial_result(
-            task_name, solved=task_name == "promotion-a", index=0
+            task_name,
+            solved=promotion_tasks.index(task_name) < 8,
+            index=promotion_tasks.index(task_name),
         )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
@@ -450,7 +451,8 @@ def test_run_experiment_uses_configured_panel_ids(monkeypatch, tmp_path):
 
     assert experiment_runner.record.status == "discard"
     assert (
-        experiment_runner.record.decision_reason == "holdout task holdout-a regressed"
+        experiment_runner.record.decision_reason
+        == "holdout aggregate regressed: 0/1 vs 1/1"
     )
     assert experiment_runner.record.panels["promotion"].evaluation is not None
     assert experiment_runner.record.panels["promotion"].evaluation.status == "keep"
@@ -1899,7 +1901,7 @@ def test_run_experiment_excludes_crash_trial_but_scores_valid_ones(
     assert trials.solved_count == 2
     # 2/2 valid trials solved on the frontier ⇒ improvement ⇒ keep.
     assert record.status == "keep"
-    assert record.decision_reason == "train task task-a improved"
+    assert record.decision_reason == "train aggregate improved: 1/1 vs 0/0"
 
 
 def _baseline_with_train_and_test(
@@ -1927,6 +1929,34 @@ def _baseline_with_train_and_test(
         )
     baseline.finalize(status="keep", decision_reason="baseline seed")
     return baseline
+
+
+def _baseline_with_frontier_train_panel(
+    *, test_solved: bool
+) -> tuple[ExperimentRecord, list[str]]:
+    """Baseline with ten single-trial train tasks (only the first solved, a
+    1/10 frontier) and one test task. Returns the finalized baseline and the
+    train task ids the candidate run reuses."""
+    train_tasks = [f"train-{index}" for index in range(10)]
+    baseline = init_record(
+        experiment_id="baseline",
+        git_commit_hash="base123",
+        parent_baseline_experiment_id=None,
+        train_task_ids=train_tasks,
+        test_task_ids=["test-a"],
+        started_at="2026-05-05T00:00:00+00:00",
+        expected_trial_count=1,
+        expected_test_trial_count=1,
+    )
+    for index, task_name in enumerate(train_tasks):
+        baseline.record_task_result(
+            _panel_trial_result(task_name, solved=index == 0, index=index)
+        )
+    baseline.record_task_result(
+        _panel_trial_result("test-a", solved=test_solved, index=0)
+    )
+    baseline.finalize(status="keep", decision_reason="baseline seed")
+    return baseline, train_tasks
 
 
 def test_run_experiment_skips_test_panel_when_train_gate_discards(
@@ -1966,7 +1996,10 @@ def test_run_experiment_skips_test_panel_when_train_gate_discards(
     asyncio.run(experiment_runner._run_experiment(baseline=baseline))
 
     assert experiment_runner.record.status == "discard"
-    assert experiment_runner.record.decision_reason == "train task train-a regressed"
+    assert (
+        experiment_runner.record.decision_reason
+        == "train aggregate did not improve: 0/1 vs 1/1"
+    )
     assert experiment_runner.record.panels["train"].evaluation is not None
     assert experiment_runner.record.panels["train"].evaluation.status == "discard"
     assert experiment_runner.record.panels["test"].lifecycle == "skipped"
@@ -1988,22 +2021,17 @@ def test_run_experiment_runs_test_panel_after_train_pass_and_blocks_regression(
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
-    # Baseline solves test-a 4/4 so the candidate's 0/3 is a genuine Fisher
-    # regression on the regression-veto panel (a small-sample dip no longer is).
-    baseline = _baseline_with_train_and_test(
-        train_solves=[False, False, False],
-        test_solves=[True, True, True, True],
-    )
+    baseline, train_tasks = _baseline_with_frontier_train_panel(test_solved=True)
     experiment_runner = make_runner(
         monkeypatch,
         tmp_path,
         experiment_id="exp-test-blocks-regression",
         focus_name="focus",
-        train_task_names=["train-a"],
+        train_task_names=train_tasks,
         test_task_names=["test-a"],
-        task_trials=3,
+        task_trials=1,
         max_trial_concurrency=1,
-        task_dirs=["train-a", "test-a"],
+        task_dirs=[*train_tasks, "test-a"],
     )
     stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -2015,9 +2043,13 @@ def test_run_experiment_runs_test_panel_after_train_pass_and_blocks_regression(
     monkeypatch.setattr(runner, "_prepare_task_dirs", fake_prepare_task_dirs)
 
     async def fake_run_task(*, task_name, task_timeout_sec, **_kwargs):
-        if task_name == "train-a":
+        if task_name in train_tasks:
             assert task_timeout_sec == 600.0
-            return _panel_trial_result(task_name, solved=True, index=0)
+            return _panel_trial_result(
+                task_name,
+                solved=train_tasks.index(task_name) < 8,
+                index=train_tasks.index(task_name),
+            )
         assert task_name == "test-a"
         assert task_timeout_sec == 1200.0
         return _panel_trial_result(task_name, solved=False, index=0)
@@ -2027,23 +2059,26 @@ def test_run_experiment_runs_test_panel_after_train_pass_and_blocks_regression(
     asyncio.run(experiment_runner._run_experiment(baseline=baseline))
 
     assert experiment_runner.record.status == "discard"
-    assert experiment_runner.record.decision_reason == "test task test-a regressed"
+    assert (
+        experiment_runner.record.decision_reason
+        == "test aggregate regressed: 0/1 vs 1/1"
+    )
     assert experiment_runner.record.panels["train"].evaluation is not None
     assert experiment_runner.record.panels["train"].evaluation.status == "keep"
     assert experiment_runner.record.panels["test"].lifecycle == "finished"
     assert experiment_runner.record.panels["test"].evaluation is not None
     assert experiment_runner.record.panels["test"].evaluation.status == "discard"
     assert (
-        experiment_runner.record.panels["train"].task_results["train-a"].majority_solved
+        experiment_runner.record.panels["train"].task_results["train-0"].majority_solved
         is True
     )
     assert (
-        experiment_runner.record.panels["test"].task_results["test-a"].trial_count == 3
+        experiment_runner.record.panels["test"].task_results["test-a"].trial_count == 1
     )
     assert experiment_runner.record.evidence is not None
     assert (
         experiment_runner.record.evidence.panel_outcomes["test"][0].outcome
-        == "regression"
+        == "unchanged_unsolved"
     )
 
 
@@ -2086,20 +2121,17 @@ def test_run_experiment_resolves_pending_panel_tasks_inside_event_loop(
         staticmethod(lambda: FakeRegistryClient()),
     )
     monkeypatch.setattr(tasks_client, "TaskClient", FakeTaskClient)
-    baseline = _baseline_with_train_and_test(
-        train_solves=[False, False, False],
-        test_solves=[False, False, False],
-    )
+    baseline, train_tasks = _baseline_with_frontier_train_panel(test_solved=False)
     experiment_runner = make_runner(
         monkeypatch,
         tmp_path,
         experiment_id="exp-pending-panel-resolves",
         focus_name="focus",
-        train_task_names=["train-a"],
+        train_task_names=train_tasks,
         test_task_names=["test-a"],
-        task_trials=3,
+        task_trials=1,
         max_trial_concurrency=1,
-        task_dirs=["train-a"],
+        task_dirs=train_tasks,
         harbor_config=_FakeHarborConfig(
             experiments_dir=tmp_path / "experiments",
             task_overrides_dir=tmp_path / "overrides",
@@ -2120,7 +2152,13 @@ def test_run_experiment_resolves_pending_panel_tasks_inside_event_loop(
     monkeypatch.setattr(experiment_runner, "_make_env", fake_make_env, raising=False)
 
     async def fake_run_task(*, task_name, **_kwargs):
-        return _panel_trial_result(task_name, solved=True, index=0)
+        if task_name == "test-a":
+            return _panel_trial_result(task_name, solved=True, index=0)
+        return _panel_trial_result(
+            task_name,
+            solved=train_tasks.index(task_name) < 8,
+            index=train_tasks.index(task_name),
+        )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
 
@@ -2140,40 +2178,46 @@ def test_run_experiment_test_panel_improvement_does_not_replace_promotion_decisi
         "update_ref",
         lambda ref_name, commit_hash, *, cwd=None: None,
     )
-    baseline = _baseline_with_train_and_test(
-        train_solves=[False, False, False],
-        test_solves=[False, False, False],
-    )
+    baseline, train_tasks = _baseline_with_frontier_train_panel(test_solved=False)
     experiment_runner = make_runner(
         monkeypatch,
         tmp_path,
         experiment_id="exp-test-improvement-is-not-promotion",
         focus_name="focus",
-        train_task_names=["train-a"],
+        train_task_names=train_tasks,
         test_task_names=["test-a"],
-        task_trials=3,
+        task_trials=1,
         max_trial_concurrency=1,
-        task_dirs=["train-a", "test-a"],
+        task_dirs=[*train_tasks, "test-a"],
     )
     stub_trial_factories(monkeypatch, experiment_runner)
     experiment_runner.experiment_dir.mkdir(parents=True, exist_ok=True)
 
     async def fake_run_task(*, task_name, **_kwargs):
-        return _panel_trial_result(task_name, solved=True, index=0)
+        if task_name == "test-a":
+            return _panel_trial_result(task_name, solved=True, index=0)
+        return _panel_trial_result(
+            task_name,
+            solved=train_tasks.index(task_name) < 8,
+            index=train_tasks.index(task_name),
+        )
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
 
     asyncio.run(experiment_runner._run_experiment(baseline=baseline))
 
     assert experiment_runner.record.status == "keep"
-    assert experiment_runner.record.decision_reason == "train task train-a improved"
+    assert (
+        experiment_runner.record.decision_reason
+        == "train aggregate improved: 8/10 vs 1/10 (p=0.00548 <= 0.2)"
+    )
     assert experiment_runner.record.panels["train"].evaluation is not None
     assert experiment_runner.record.panels["train"].evaluation.status == "keep"
     assert experiment_runner.record.panels["test"].evaluation is not None
     assert experiment_runner.record.panels["test"].evaluation.status == "keep"
     assert (
         experiment_runner.record.panels["test"].evaluation.decision_reason
-        == "test tasks did not regress"
+        == "test aggregate did not regress: 1/1 vs 0/1"
     )
     assert experiment_runner.record.evidence is not None
     assert (
@@ -2224,7 +2268,7 @@ def test_run_experiment_discards_task_timeout_without_crashing(monkeypatch, tmp_
     record = experiment_runner.record
     assert record.status == "discard"
     assert record.error == ""
-    assert record.decision_reason == "no train task improvement reached significance"
+    assert record.decision_reason == "train aggregate did not improve: 0/1 vs 0/0"
 
 
 @pytest.mark.parametrize("trial_mode", ["result", "exception"])

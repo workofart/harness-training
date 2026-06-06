@@ -29,6 +29,7 @@ Boundary contracts:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
 from abc import ABC
@@ -43,6 +44,18 @@ from src.trace import NOOP_HARNESS_RECORDER, NOOP_STEP_RECORDER
 # ============================================================================
 # Constants
 # ============================================================================
+
+# Wall ceiling for a single graded verify (run in a separate build+test env). A
+# looping/deadlocked deliverable otherwise hangs the verifier until the whole-task
+# timeout (observed: 11-28 min hangs on tasks that normally verify in seconds); the
+# ceiling fails such a grader fast and terminally. Set above the longest verify seen
+# to complete, so only a hang is cut; keyed on wall time alone, not the task.
+VERIFY_TIMEOUT_SEC: float = 900.0
+VERIFY_TIMEOUT_NOTICE = (
+    "Grading did not complete within the time limit and was stopped. A correct "
+    "solution is graded quickly; a solution that loops or blocks during grading "
+    "is treated as failing."
+)
 
 MISSING_TOOL_CALL_REPAIR_PROMPT = (
     "Your previous response omitted the required tool call. "
@@ -377,6 +390,26 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
     raise TypeError(f"Unsupported action: {type(action).__name__}")
 
 
+async def _verify_within_ceiling(
+    env: HarnessEnv, action: VerifyAction, step_recorder: Any
+) -> RawState:
+    """Run the terminal verifier under `VERIFY_TIMEOUT_SEC`.
+
+    On expiry, returns a terminal non-passing `RawState` (the unsolved verdict the
+    task timeout would reach anyway, sooner) and records a `verify_timeout` fire.
+    Only the inner timeout is caught here; an outer task-timeout cancellation
+    passes through as `CancelledError` for upstream classification.
+    """
+    try:
+        async with asyncio.timeout(VERIFY_TIMEOUT_SEC):
+            return await execute_action(env, action)
+    except TimeoutError:
+        step_recorder.rule_fired("verify_timeout")
+        return RawState(
+            reward=0.0, done=True, passed=False, stdout=VERIFY_TIMEOUT_NOTICE
+        )
+
+
 # ============================================================================
 # Prompt building
 # ============================================================================
@@ -606,7 +639,10 @@ async def run_task_loop(
             action_name=action.NAME,
             action_summary=action_summary,
         )
-        raw_state = await execute_action(env, action)
+        if isinstance(action, VerifyAction):
+            raw_state = await _verify_within_ceiling(env, action, step_recorder)
+        else:
+            raw_state = await execute_action(env, action)
         step_recorder.env_step_completed(
             action_name=action.NAME,
             action_summary=action_summary,

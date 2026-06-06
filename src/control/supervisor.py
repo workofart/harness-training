@@ -461,7 +461,7 @@ def _discard_interrupted_baseline(
         )
     state = snapshot.experiment_state
     parent_id = baseline.parent_baseline_experiment_id
-    state.active_baseline_experiment_id = parent_id
+    state.set_active_baseline(experiment_id=parent_id, record=parent)
     if state.current_experiment_id == baseline.experiment_id:
         state.current_experiment_id = parent_id
     state.updated_at = datetime.now(timezone.utc).isoformat()
@@ -699,7 +699,7 @@ def recover_interrupted_launch(
             )
         state = snapshot.experiment_state
         if record.status == "keep":
-            state.active_baseline_experiment_id = record.experiment_id
+            state.set_active_baseline(experiment_id=record.experiment_id, record=record)
         state.current_experiment_id = record.experiment_id
         state.updated_at = record.finished_at
         state.save(root=snapshot.experiments_root)

@@ -54,7 +54,18 @@
         "polyglot-c-py",
         "polyglot-rust-c",
         "write-compressor",
-        "feal-linear-cryptanalysis"
+        "feal-linear-cryptanalysis",
+        "custom-memory-heap-crash",
+        "financial-document-processor",
+        "fix-code-vulnerability",
+        "feal-differential-cryptanalysis",
+        "mteb-leaderboard",
+        "path-tracing",
+        "make-mips-interpreter",
+        "path-tracing-reverse",
+        "mcmc-sampling-stan",
+        "dna-assembly",
+        "qemu-alpine-ssh"
       ],
       "task_timeout_sec": 1200.0,
       "run": {
@@ -103,42 +114,36 @@
       ],
       "reason": "held out because the active baseline record lacks these task results"
     },
+    "cyber_risk_unactionable": {
+      "task_names": [
+        "vulnerable-secret",
+        "model-extraction-relu-logits"
+      ],
+      "reason": "provider safety filtering intermittently returns empty completions on these dual-use security tasks (secret-key / model-weight extraction), yielding no_valid_action; not harness-addressable."
+    },
     "slow": {
       "task_names": [
         "query-optimize",
-        "mteb-leaderboard",
         "train-fasttext",
-        "qemu-alpine-ssh",
         "crack-7z-hash",
-        "custom-memory-heap-crash",
         "gcode-to-text",
         "extract-moves-from-video",
         "tune-mjcf",
-        "mcmc-sampling-stan",
-        "fix-code-vulnerability",
         "winning-avg-corewars",
-        "path-tracing",
-        "path-tracing-reverse",
-        "feal-differential-cryptanalysis",
         "compile-compcert",
         "make-doom-for-mips",
-        "make-mips-interpreter",
         "install-windows-3.11",
         "regex-chess",
-        "vulnerable-secret",
-        "model-extraction-relu-logits",
         "qemu-startup",
-        "financial-document-processor",
         "fix-ocaml-gc",
         "caffe-cifar-10",
-        "raman-fitting",
-        "dna-assembly"
+        "raman-fitting"
       ],
       "reason": "held out because these exhaust task_timeout_sec"
     }
   },
   "max_steps": 1000,
-  "max_trial_concurrency": 24,
+  "max_trial_concurrency": 30,
   "max_heavy_action_concurrency": 10,
   "env_setup_timeout_sec": 600.0,
   "max_output_retries": 2,

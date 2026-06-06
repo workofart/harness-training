@@ -18,7 +18,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.harness.contracts import TaskResult
 from src.metrics import BaselineComparison, FailureMode, TaskMetrics, is_majority_solved
@@ -307,6 +307,19 @@ class PanelRecord(BaseModel):
             1 for trials in self.task_results.values() if trials.majority_solved is True
         )
 
+    @property
+    def in_scope_task_results(self) -> dict[str, TaskTrials]:
+        """Task results this run exercised: configured to run
+        (``expected_trial_count > 0``) or with at least one recorded trial.
+        Excludes panel scaffolding so it matches ``solved_count``'s scope -- the
+        run's solved/total denominator.
+        """
+        return {
+            task_id: trials
+            for task_id, trials in self.task_results.items()
+            if trials.expected_trial_count > 0 or trials.trials
+        }
+
 
 class ExperimentRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -504,8 +517,7 @@ def build_experiment_evidence(
                 baseline_trials=baseline_results.get(task_id),
                 verdict=verdicts_map.get(task_id),
             )
-            for task_id, task_trials in candidate_panel.task_results.items()
-            if task_trials.expected_trial_count > 0 or task_trials.trials
+            for task_id, task_trials in candidate_panel.in_scope_task_results.items()
         ]
     return ExperimentEvidence(
         candidate_change=CandidateChangeEvidence(
@@ -519,12 +531,62 @@ def build_experiment_evidence(
     )
 
 
+class TaskSuccessRate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    solved: int
+    total: int
+    rate: float | None
+
+
+class ExperimentTaskSuccessSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: ExperimentStatus | None
+    started_at: str
+    finished_at: str | None
+    overall: TaskSuccessRate
+    panels: dict[str, TaskSuccessRate]
+
+
+def task_success_summary(record: ExperimentRecord) -> ExperimentTaskSuccessSummary:
+    panels = {
+        panel_id: _task_success_rate(panel) for panel_id, panel in record.panels.items()
+    }
+    solved = sum(panel.solved for panel in panels.values())
+    total = sum(panel.total for panel in panels.values())
+    return ExperimentTaskSuccessSummary(
+        status=record.status,
+        started_at=record.started_at,
+        finished_at=record.finished_at,
+        overall=TaskSuccessRate(
+            solved=solved,
+            total=total,
+            rate=None if total == 0 else solved / total,
+        ),
+        panels=panels,
+    )
+
+
+def _task_success_rate(panel: PanelRecord) -> TaskSuccessRate:
+    solved = panel.solved_count
+    total = len(panel.in_scope_task_results)
+    return TaskSuccessRate(
+        solved=solved,
+        total=total,
+        rate=None if total == 0 else solved / total,
+    )
+
+
 class ExperimentState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     active_baseline_experiment_id: str | None
     current_experiment_id: str | None = None
     updated_at: str | None = None
+    experiment_task_success_rates: dict[str, ExperimentTaskSuccessSummary] = Field(
+        default_factory=dict
+    )
 
     @classmethod
     def path(cls, *, root: Path) -> Path:
@@ -539,6 +601,22 @@ class ExperimentState(BaseModel):
                 updated_at=None,
             )
         return cls.model_validate_json(path.read_text())
+
+    def set_active_baseline(
+        self, *, experiment_id: str | None, record: ExperimentRecord | None
+    ) -> None:
+        """Point the active baseline at ``experiment_id`` and snapshot its
+        per-panel success rate (for manual inspection in state.json) from the
+        in-memory ``record``, so :meth:`save` need not reload it from disk.
+        ``record`` is ``None``/non-keep only on rollback to an unloadable parent
+        -- pointer set, summary empty.
+        """
+        self.active_baseline_experiment_id = experiment_id
+        self.experiment_task_success_rates = (
+            {record.experiment_id: task_success_summary(record)}
+            if record is not None and record.status == "keep"
+            else {}
+        )
 
     def save(self, *, root: Path) -> None:
         write_json_atomic(self.path(root=root), self.model_dump(mode="json"))
@@ -556,11 +634,7 @@ def raise_if_no_valid_evidence(record: ExperimentRecord) -> None:
         panel = record.panels[panel_name]
         if panel.lifecycle == "skipped":
             continue
-        panel_trials = [
-            trials
-            for trials in panel.task_results.values()
-            if trials.expected_trial_count > 0 or trials.trials
-        ]
+        panel_trials = list(panel.in_scope_task_results.values())
         if panel_trials and not any(trials.valid_trials for trials in panel_trials):
             raise RuntimeError(
                 f"experiment produced no valid trials in {panel_name} panel (every trial crashed)"
