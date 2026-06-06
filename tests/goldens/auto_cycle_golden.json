@@ -1,0 +1,149 @@
+{
+  "_doc": "DETERMINISTIC semantic golden for the redesign (plan.md §15 Step 0). The Step-5 e2e drives ONE full auto cycle with a STUB llm + STUB env (scripted pass/fail) on `stub_config` and asserts the new system reproduces, for each scenario: the decide() command sequence (§6), per-run/per-task solved-sets + trial-counts (orchestrator §8), and the keep/discard decision (gate §9). This is NOT the real 2-task smoke (config/smoke_config.json), which is plumbing-only and asserts no outcome parity.",
+  "_why_not_old_capture": "Values are derived from first principles (§6 truth table + §8 scheduling + §9 gate) and GROUNDED in already-passing deterministic tests, not captured from the old control-FSM (which §13 deletes). The old auto loop has no 1:1 command-sequence analog; its preserved orchestrator/gate math is what the cited tests already pin.",
+  "_determinism_basis": "tests/experiment/test_runner.py (87 pass, 0.69s) proves stub-driven scheduling is deterministic: staggered trial completions + majority watcher reproduce stable trial-counts.",
+
+  "stub_config": {
+    "_note": "Synthetic task names only — the stub env returns scripted pass/fail keyed by name; tasks need not be real. Sized so the promotion Fisher is exercisable both ways (>=3 train tasks).",
+    "task_trials": 3,
+    "train_tasks": ["t-improve-1", "t-improve-2", "t-improve-3"],
+    "test_tasks": ["v-stable-1", "v-stable-2"]
+  },
+
+  "majority": {
+    "expected_total": 3,
+    "threshold": 2,
+    "_rule": "is_majority_solved = solved >= ceil(total/2); for total=3 -> 2. is_majority_decided locks once remaining trials cannot flip the verdict: all-pass and all-fail both lock at 2/3 (metrics.py is_majority_decided)."
+  },
+
+  "budget_rules": {
+    "_baseline": "RefreshBaseline runs ALL tasks at uniform-full budget k=task_trials=3 (budget_from_baseline(baseline=None)).",
+    "_candidate_not_solved_by_baseline": "baseline did NOT majority-solve -> k=full=3.",
+    "_candidate_deterministic_solved_by_baseline": "baseline solved ALL its trials (e.g. 2/2 all-pass) -> deterministic fast-path k=1 (test_run_experiment_runs_single_trial_for_deterministic_baseline_task).",
+    "_confirm_on_fail": "k=1 fast-path whose single trial FAILS expands to k=3, then majority early-stop (test_run_experiment_confirms_on_fail_when_deterministic_trial_fails: fail,fail -> stop at 2, majority False)."
+  },
+
+  "scenarios": [
+    {
+      "name": "keep__candidate_improves_all_train__no_veto",
+      "grounding": "command_seq=§6 candidate-keep walkthrough; trial-counts=majority early-stop (test_run_panel_early_stops_after_majority_decided) + deterministic k=1 (test_run_experiment_runs_single_trial...); decision=gate.py:136-147 Fisher [[3,0],[0,3]] p=0.10<=0.20.",
+      "given": {
+        "candidate_edit": "stub proposer makes a fixed trivial edit to src/harness/core.py that passes validate_candidate (changed paths subset of EDITABLE_PATHS, no task ids) and keeps test_core green.",
+        "stub_pass_fail": {
+          "baseline": {
+            "t-improve-1": ["fail", "fail", "fail"],
+            "t-improve-2": ["fail", "fail", "fail"],
+            "t-improve-3": ["fail", "fail", "fail"],
+            "v-stable-1": ["pass", "pass", "pass"],
+            "v-stable-2": ["pass", "pass", "pass"]
+          },
+          "candidate_train": {
+            "t-improve-1": ["pass", "pass", "pass"],
+            "t-improve-2": ["pass", "pass", "pass"],
+            "t-improve-3": ["pass", "pass", "pass"]
+          },
+          "candidate_test": {
+            "v-stable-1": ["pass"],
+            "v-stable-2": ["pass"]
+          }
+        }
+      },
+      "expect": {
+        "command_sequence": ["RefreshBaseline", "Conclude", "ProposeAndLaunch", "RunVeto", "Conclude", "Diagnose"],
+        "baseline": {
+          "t-improve-1": {"budget_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false},
+          "t-improve-2": {"budget_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false},
+          "t-improve-3": {"budget_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false},
+          "v-stable-1": {"budget_k": 3, "trial_count": 2, "solved_count": 2, "majority_solved": true},
+          "v-stable-2": {"budget_k": 3, "trial_count": 2, "solved_count": 2, "majority_solved": true}
+        },
+        "candidate_train": {
+          "t-improve-1": {"budget_k": 3, "trial_count": 2, "solved_count": 2, "majority_solved": true},
+          "t-improve-2": {"budget_k": 3, "trial_count": 2, "solved_count": 2, "majority_solved": true},
+          "t-improve-3": {"budget_k": 3, "trial_count": 2, "solved_count": 2, "majority_solved": true}
+        },
+        "candidate_test": {
+          "v-stable-1": {"budget_k": 1, "trial_count": 1, "solved_count": 1, "majority_solved": true},
+          "v-stable-2": {"budget_k": 1, "trial_count": 1, "solved_count": 1, "majority_solved": true}
+        },
+        "gate_train": {"decision": "keep", "candidate_solved": 3, "baseline_solved": 0, "fisher_p": 0.10},
+        "gate_test": {"decision": "keep", "candidate_solved": 2, "baseline_solved": 2},
+        "decision": "keep",
+        "head_advances": true
+      }
+    },
+
+    {
+      "name": "discard_at_train__candidate_no_improvement",
+      "grounding": "command_seq=§6 candidate-discard-at-train (test NEVER runs); decision=gate.py:134-135 candidate_solved(0) <= baseline_solved(0) -> 'did not improve'.",
+      "given": {
+        "candidate_edit": "fixed trivial edit (passes validate_candidate + test_core), same as the keep scenario.",
+        "stub_pass_fail": {
+          "baseline": {
+            "t-improve-1": ["fail", "fail", "fail"],
+            "t-improve-2": ["fail", "fail", "fail"],
+            "t-improve-3": ["fail", "fail", "fail"],
+            "v-stable-1": ["pass", "pass", "pass"],
+            "v-stable-2": ["pass", "pass", "pass"]
+          },
+          "candidate_train": {
+            "t-improve-1": ["fail", "fail", "fail"],
+            "t-improve-2": ["fail", "fail", "fail"],
+            "t-improve-3": ["fail", "fail", "fail"]
+          }
+        }
+      },
+      "expect": {
+        "command_sequence": ["RefreshBaseline", "Conclude", "ProposeAndLaunch", "Conclude", "Diagnose"],
+        "candidate_train": {
+          "t-improve-1": {"budget_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false},
+          "t-improve-2": {"budget_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false},
+          "t-improve-3": {"budget_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false}
+        },
+        "candidate_test": "NOT RUN (gate(train)=discard short-circuits the veto; combine(discard, None)=discard)",
+        "gate_train": {"decision": "discard", "candidate_solved": 0, "baseline_solved": 0},
+        "decision": "discard",
+        "head_advances": false,
+        "failed_ref_written": true
+      }
+    },
+
+    {
+      "name": "veto_discard__train_keeps_then_test_regresses_via_confirm_on_fail",
+      "grounding": "exercises confirm-on-fail (test_run_experiment_confirms_on_fail: k=1 fail -> expand k=3 -> fail,fail stop at 2) + regression_veto discard (gate.py:131-132 candidate_solved(1) < baseline_solved(2)) + combine(keep, discard)=discard. Same command_seq as keep (RunVeto runs because train kept), but Conclude combines to discard.",
+      "given": {
+        "candidate_edit": "fixed trivial edit (passes validate_candidate + test_core).",
+        "stub_pass_fail": {
+          "baseline": {
+            "t-improve-1": ["fail", "fail", "fail"],
+            "t-improve-2": ["fail", "fail", "fail"],
+            "t-improve-3": ["fail", "fail", "fail"],
+            "v-stable-1": ["pass", "pass", "pass"],
+            "v-stable-2": ["pass", "pass", "pass"]
+          },
+          "candidate_train": {
+            "t-improve-1": ["pass", "pass", "pass"],
+            "t-improve-2": ["pass", "pass", "pass"],
+            "t-improve-3": ["pass", "pass", "pass"]
+          },
+          "candidate_test": {
+            "v-stable-1": ["fail", "fail", "fail"],
+            "v-stable-2": ["pass"]
+          }
+        }
+      },
+      "expect": {
+        "command_sequence": ["RefreshBaseline", "Conclude", "ProposeAndLaunch", "RunVeto", "Conclude", "Diagnose"],
+        "candidate_test": {
+          "v-stable-1": {"budget_k": 1, "expanded_to_k": 3, "trial_count": 2, "solved_count": 0, "majority_solved": false, "_note": "confirm-on-fail: k=1 trial fails -> expand k=3 -> fail,fail -> majority-decided False at 2"},
+          "v-stable-2": {"budget_k": 1, "trial_count": 1, "solved_count": 1, "majority_solved": true}
+        },
+        "gate_train": {"decision": "keep", "candidate_solved": 3, "baseline_solved": 0, "fisher_p": 0.10},
+        "gate_test": {"decision": "discard", "candidate_solved": 1, "baseline_solved": 2, "_reason": "regression_veto: candidate_solved < baseline_solved"},
+        "decision": "discard",
+        "head_advances": false,
+        "failed_ref_written": true
+      }
+    }
+  ]
+}
