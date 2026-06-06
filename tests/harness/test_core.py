@@ -36,6 +36,7 @@ from src.harness.core import (
     run_task_loop,
     validate_action_args,
 )
+from src.trace import HarnessRecorder
 
 from conftest import _StubLlm, _StubEnv, _tool_call, _completion
 
@@ -515,6 +516,45 @@ def test_act_returns_all_calls_in_multi_tool_response():
 # ----------------------------------------------------------------------------
 # run_task_loop
 # ----------------------------------------------------------------------------
+
+
+def test_run_task_loop_caps_a_hung_graded_verify(monkeypatch):
+    # A graded verify exceeding VERIFY_TIMEOUT_SEC is stopped: the loop ends the
+    # trial unsolved (terminal non-passing judgment) and fires `verify_timeout`.
+    monkeypatch.setattr("src.harness.core.VERIFY_TIMEOUT_SEC", 0.05)
+
+    class _HangingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(30)  # never returns within the ceiling
+            return RawState(done=True, passed=True, reward=1.0)
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _HangingVerifyEnv()
+    recorder = HarnessRecorder.create()
+    state = TaskLoopState()
+
+    async def _drive() -> None:
+        # wait_for turns a non-firing ceiling into a clear failure, not a hang.
+        await asyncio.wait_for(
+            run_task_loop(
+                llm=llm,
+                env=env,
+                reset_state=await env.reset(),
+                max_steps=20,
+                recorder=recorder,
+                state=state,
+            ),
+            timeout=2,
+        )
+
+    asyncio.run(_drive())
+
+    assert env.verify_calls == 1  # the verifier was invoked, then stopped
+    assert state.final_passed is False  # terminal judgment, not a pass
+    assert state.solved is False
+    assert recorder.build_metrics().rule_fires.get("verify_timeout") == 1
+    assert state.steps_used == 1
 
 
 def test_run_task_loop_solved_when_verify_returns_passed_true():
