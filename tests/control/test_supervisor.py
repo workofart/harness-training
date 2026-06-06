@@ -841,6 +841,35 @@ def test_validate_learning_memo_update_rejects_unchanged_learning() -> None:
         )
 
 
+def test_validate_learning_memo_update_rejects_over_budget_memo() -> None:
+    payload = {"experiment_id": "exp-1", "status": "discard"}
+    over_budget = "\n".join(
+        f"- line {i}" for i in range(gates.LEARNING_MEMO_MAX_LINES + 5)
+    )
+
+    with pytest.raises(RuntimeError, match="over the .* budget"):
+        gates.validate_learning_memo_update(
+            before_payload=payload,
+            after_payload=dict(payload),
+            before_learning="# Learnings\n",
+            after_learning=over_budget,
+        )
+
+
+def test_validate_learning_memo_update_allows_memo_within_budget() -> None:
+    payload = {"experiment_id": "exp-1", "status": "discard"}
+    within_budget = "\n".join(
+        f"- line {i}" for i in range(gates.LEARNING_MEMO_MAX_LINES - 1)
+    )
+
+    gates.validate_learning_memo_update(
+        before_payload=payload,
+        after_payload=dict(payload),
+        before_learning="# Learnings\n",
+        after_learning=within_budget,
+    )
+
+
 def test_run_prelaunch_phase_reruns_with_feedback_until_workspace_is_valid(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
