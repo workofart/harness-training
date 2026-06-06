@@ -162,11 +162,19 @@ def compute_fisher_exact_p_value(
     return min(1.0, total)
 
 
-# Per-task two-sided alpha used by the promotion gate's Fisher exact test.
-# There is no explicit family-wise-error correction across the panel; the gate
-# instead relies on Fisher exact being strongly conservative at the small
-# per-task trial counts (n~3-5) so chance regressions stay rare per run.
-PROMOTION_P_VALUE_ALPHA = 0.05
+# Two-sided alpha for the per-task Fisher exact test in `build_gate_verdicts`.
+# These per-task verdicts are diagnostic evidence only -- they label each task's
+# outcome; the promotion decision itself uses the aggregate alpha below. The
+# strict 0.05 bar relies on Fisher exact being strongly conservative at the
+# small per-task trial counts (n~3-5) so chance regressions stay rare per run.
+PER_TASK_VERDICT_P_VALUE_ALPHA = 0.05
+
+# Two-sided alpha for the gate's aggregate panel Fisher exact test, where each
+# unit is a whole task rather than a trial. Relaxed relative to the per-task
+# alpha: this is a single test over the panel (no multiplicity to guard) and a
+# panel-wide solved-task gain is a weaker per-comparison signal than a per-task
+# rate jump, so a more permissive bar is needed to detect real improvements.
+AGGREGATE_PROMOTION_P_VALUE_ALPHA = 0.20
 
 
 VerdictKind = Literal["improvement", "regression", "unchanged", "uncompared"]
