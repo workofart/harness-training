@@ -11,7 +11,7 @@ import tomllib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -789,16 +789,31 @@ class Harbor:
     async def _collect_separate_verifier_artifacts(
         self,
         verifier_session: SeparateVerifierSession,
-    ) -> None:
+    ) -> tuple[Path, ...]:
         agent_env_paths = EnvironmentPaths.for_os(
             self.session.task.config.environment.os
         )
+        extra_artifacts = self._separate_verifier_extra_artifacts(verifier_session)
         await self._artifact_handler().download_artifacts(
             self.session.environment,
             self.session.trial_paths.artifacts_dir,
             source_artifacts_dir=agent_env_paths.artifacts_dir,
-            artifacts=self._separate_verifier_extra_artifacts(verifier_session),
+            artifacts=extra_artifacts,
         )
+        return tuple(
+            self.session.trial_paths.artifacts_dir / PurePosixPath(source).name
+            for source in extra_artifacts
+        )
+
+    def _cleanup_separate_verifier_transfer_artifacts(
+        self,
+        paths: tuple[Path, ...],
+    ) -> None:
+        for path in paths:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
 
     async def _upload_separate_verifier_artifacts(
         self,
@@ -897,30 +912,35 @@ class Harbor:
         self,
         verifier_session: SeparateVerifierSession,
     ) -> VerifierResult:
-        await self._collect_separate_verifier_artifacts(verifier_session)
-        async with self._separate_verifier_environment(
+        transfer_paths = await self._collect_separate_verifier_artifacts(
             verifier_session
-        ) as verifier_environment:
-            with verifier_environment.with_default_user(
-                self.session.task.config.verifier.user
-            ):
-                env_paths = EnvironmentPaths.for_os(verifier_environment.os)
-                await verifier_environment.empty_dirs(
-                    [env_paths.verifier_dir],
-                    chmod=True,
-                )
-                await self._upload_separate_verifier_artifacts(
-                    verifier_session,
-                    verifier_environment,
-                )
-                await self._apply_verifier_network_preamble(verifier_environment)
-                verifier = Verifier(
-                    task=self.session.task,
-                    trial_paths=self.session.trial_paths,
-                    environment=verifier_environment,
-                    skip_tests_upload=True,
-                )
-                return await verifier.verify()
+        )
+        try:
+            async with self._separate_verifier_environment(
+                verifier_session
+            ) as verifier_environment:
+                with verifier_environment.with_default_user(
+                    self.session.task.config.verifier.user
+                ):
+                    env_paths = EnvironmentPaths.for_os(verifier_environment.os)
+                    await verifier_environment.empty_dirs(
+                        [env_paths.verifier_dir],
+                        chmod=True,
+                    )
+                    await self._upload_separate_verifier_artifacts(
+                        verifier_session,
+                        verifier_environment,
+                    )
+                    await self._apply_verifier_network_preamble(verifier_environment)
+                    verifier = Verifier(
+                        task=self.session.task,
+                        trial_paths=self.session.trial_paths,
+                        environment=verifier_environment,
+                        skip_tests_upload=True,
+                    )
+                    return await verifier.verify()
+        finally:
+            self._cleanup_separate_verifier_transfer_artifacts(transfer_paths)
 
     async def verify(self) -> RawState:
         async with self._env_gate():

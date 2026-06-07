@@ -1218,6 +1218,8 @@ def test_harbor_auto_separate_verifier_generates_context_for_plain_tests(
         in verifier_env.upload_dir_calls
         for verifier_env in verifier_envs
     )
+    assert not (harbor.session.trial_paths.artifacts_dir / "app").exists()
+    assert (harbor.session.trial_paths.artifacts_dir / "manifest.json").exists()
     build_calls = [args for args in docker_calls if args[:2] == ["build", "--tag"]]
     assert len(build_calls) == 1
     assert build_calls[0][-1] == str(verifier_context.resolve())
