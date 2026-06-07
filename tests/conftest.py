@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from src.llm.base import BaseLlm, LlmCompletion, LlmToolCall
-from src.contracts import RawState, TaskResult
+from src.contracts import RawState
 
 
 class _StubLlm(BaseLlm):
@@ -88,30 +88,6 @@ def _tool_call(name: str, **args: Any) -> LlmToolCall:
 
 def _completion(*calls: LlmToolCall, content: str | None = None) -> LlmCompletion:
     return LlmCompletion(tool_calls=tuple(calls), content=content)
-
-
-def _task_result(
-    *,
-    task_name: str,
-    reward: float | None,
-    solved: bool | None = None,
-    error: str | None = None,
-) -> TaskResult:
-    """A finished TaskResult; `solved` defaults to whether a non-error trial
-    earned positive reward."""
-    if solved is None:
-        solved = error is None and reward is not None and reward > 0.0
-    return TaskResult(
-        task_name=task_name,
-        reward=reward,
-        steps_used=1,
-        error=error,
-        trial_dir=None,
-        verifier_stdout_path=None,
-        started_at="2026-04-10T00:00:00+00:00",
-        finished_at="2026-04-10T00:00:01+00:00",
-        solved=solved,
-    )
 
 
 def _write_task_artifacts(root: Path, task_name: str) -> dict[str, str]:

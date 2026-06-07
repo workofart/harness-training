@@ -2,12 +2,12 @@
 
 `RawState` and `HarnessEnv` define the environment-side input contract: what the
 environment must hand the harness on reset/exec/verify, and the lifecycle
-methods the harness can call. `TaskResult` is the experiment trial output
-contract: the value `src.experiment.trial.run_task()` returns and the runner
-persists. `TaskMetrics` is the mutable per-trial telemetry recorded by
-`trace.py` and persisted to `metrics.json`; `FailureMode` is its terminal-state
-bucket. `is_majority_solved`/`is_majority_decided` are the majority-vote
-predicates shared by the runner's early-stop and the gate.
+methods the harness can call. `TaskMetrics` is the mutable per-trial telemetry
+recorded by `trace.py` and persisted to `metrics.json`; `FailureMode` is its
+terminal-state bucket. `is_majority_solved`/`is_majority_decided` are the
+majority-vote predicates shared by the runner's early-stop and the gate. The
+trial *output* contract (one trial's result) lives in `experiment.record`
+(`TrialResult`), a layer up — `contracts` owns only the boundary + telemetry.
 
 Keeping these in one foundation module lets `src/harness/core.py` and
 `src/experiment/*` share a single source of truth without depending on each
@@ -178,34 +178,6 @@ class TaskMetrics(BaseModel):
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.model_dump(mode="json"), indent=2) + "\n")
-
-
-class TaskResult(BaseModel):
-    """Experiment trial output contract: one trial's full result.
-
-    Returned by `src.experiment.trial.run_task()`, aggregated by the runner
-    into `TaskTrials`, persisted to `experiment.json`, and reloaded via
-    `model_validate` for diagnosis.
-    Every constructor passes concrete values for `solved` and `steps_used` —
-    crash and timeout paths resolve to `solved=False` with a recorded step
-    count — so neither is optional. (`reward` stays optional: a trial that
-    never reached the verifier has no reward.)
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    task_name: str
-    reward: float | None = None
-    solved: bool
-    error: str | None = None
-    steps_used: int = 0
-    trial_dir: str | None = None
-    trace_path: str | None = None
-    metrics_path: str | None = None
-    verifier_stdout_path: str | None = None
-    metrics: TaskMetrics = Field(default_factory=TaskMetrics)
-    started_at: str | None = None
-    finished_at: str | None = None
 
 
 def is_majority_solved(*, solved: int, total: int) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,17 +56,154 @@ def _require_clean_worktree_for_exp() -> bool:
     }
 
 
-def _panel_task_summary(harness_config: HarnessConfig) -> str:
-    summaries = []
-    for panel in harness_config.panels:
-        task_label = "task" if len(panel.task_names) == 1 else "tasks"
-        summaries.append(
-            f"{panel.id}({panel.purpose}): {len(panel.task_names)} {task_label}"
+def _selected_task_ids(harness_config) -> list[str]:
+    # exp runs a task SET (plan.md §2): `EXP_TASK_IDS` (comma-separated) selects a
+    # subset -- how `auto` drives train, then test, as separate calls -- and the
+    # default is every configured task. exp itself stays decision-free; the §12
+    # asserts that `auto` only ever passes sanctioned shapes live in the loop.
+    raw = os.getenv("EXP_TASK_IDS")
+    if raw is not None and raw.strip():
+        selected = [task_id.strip() for task_id in raw.split(",") if task_id.strip()]
+    else:
+        selected = [t for panel in harness_config.panels for t in panel.task_names]
+    return list(dict.fromkeys(selected))
+
+
+def _selected_experiment_id() -> str:
+    # `EXP_EXPERIMENT_ID` names an existing dir to append into (auto's shared id
+    # across its train and test calls); a standalone run gets a fresh id (§2).
+    existing = os.getenv("EXP_EXPERIMENT_ID")
+    if existing is not None and existing.strip():
+        return existing.strip()
+    return f"exp-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+
+def _task_timeout_by_task(harness_config) -> dict[str, float]:
+    # Each task carries its owning panel's wall budget; tasks are disjoint across
+    # panels (config §12), so this is unambiguous for any selected subset.
+    return {
+        task_id: panel.task_timeout_sec
+        for panel in harness_config.panels
+        for task_id in panel.task_names
+    }
+
+
+def _make_llm_for_config(*, config, api_key: str | None):
+    match config.provider:
+        case "openrouter":
+            if api_key is None:
+                raise ValueError("OPENROUTER_API_KEY is not set")
+            from src.llm.openrouter import OpenRouter
+
+            return OpenRouter(config=config, api_key=api_key)
+        case "chatgpt_codex":
+            from src.llm.codex import ChatGptCodex
+
+            return ChatGptCodex(config=config)
+
+
+async def _resolve_task_dirs(*, trial_harbor_config, task_names):
+    from src.env.harbor import TaskDirectoryResolver
+
+    return dict(
+        await TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names))
+    )
+
+
+async def _build_trial_runner(
+    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
+):
+    """Resolve the selected tasks' directories once, then return the `run_tasks`
+    trial_runner -- the seam the orchestrator schedules. It builds each trial's
+    Harbor (handed the run-scoped heavy gate) + llm and calls `executor.run_trial`
+    with that task's panel wall budget."""
+    from src.env.harbor import Harbor
+    from src.experiment.executor import run_trial
+
+    trial_harbor_config = harbor_config.model_copy(
+        update={
+            "experiments_dir": harbor_config.experiments_dir / experiment_id / "tasks"
+        }
+    )
+    task_dirs = await _resolve_task_dirs(
+        trial_harbor_config=trial_harbor_config, task_names=task_ids
+    )
+    task_timeout_sec = _task_timeout_by_task(harness_config)
+
+    async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
+        env = Harbor(
+            trial_harbor_config,
+            task_name=task_id,
+            task_dir=task_dirs[task_id],
+            exec_semaphore=heavy_action_semaphore,
         )
-    return "; ".join(summaries)
+        return await run_trial(
+            task_id=task_id,
+            run_id=run_id,
+            llm=_make_llm_for_config(
+                config=harness_config.llm_provider_config, api_key=api_key
+            ),
+            env=env,
+            max_steps=harness_config.max_steps,
+            max_output_retries=harness_config.max_output_retries,
+            task_timeout_sec=task_timeout_sec[task_id],
+            env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
+            slot_release=slot_release,
+        )
+
+    return trial_runner
+
+
+async def run_experiment(
+    *,
+    harness_config,
+    harbor_config,
+    git_commit_hash,
+    task_ids,
+    experiment_id,
+    trial_runner,
+):
+    """Run the selected `task_ids` at the uniform full budget into `experiment_id`
+    -> a raw `ExperimentResult` (plan.md §2). One `run_tasks` call per `uv run exp`
+    invocation; an existing `experiment_id` is appended to (auto's train-then-test
+    across two calls). No baseline, gate, decision, or git -- the loop's (Step 5)."""
+    from src.experiment.orchestrator import run_tasks
+
+    return await run_tasks(
+        experiment_id=experiment_id,
+        git_commit_hash=git_commit_hash,
+        task_ids=task_ids,
+        budget={task_id: harness_config.task_trials for task_id in task_ids},
+        full_trial_count=harness_config.task_trials,
+        max_trial_concurrency=harness_config.max_trial_concurrency,
+        max_heavy_action_concurrency=harness_config.max_heavy_action_concurrency,
+        trial_runner=trial_runner,
+        experiments_root=harbor_config.experiments_dir,
+    )
+
+
+async def _run_exp_async(
+    *, harness_config, harbor_config, api_key, git_commit_hash, task_ids, experiment_id
+):
+    trial_runner = await _build_trial_runner(
+        harness_config=harness_config,
+        harbor_config=harbor_config,
+        api_key=api_key,
+        task_ids=task_ids,
+        experiment_id=experiment_id,
+    )
+    return await run_experiment(
+        harness_config=harness_config,
+        harbor_config=harbor_config,
+        git_commit_hash=git_commit_hash,
+        task_ids=task_ids,
+        experiment_id=experiment_id,
+        trial_runner=trial_runner,
+    )
 
 
 def main_exp() -> int:
+    import asyncio
     import sys
 
     from src.llm.codex import (
@@ -73,24 +211,33 @@ def main_exp() -> int:
         ChatGptCodexCredentialsExpiredError,
     )
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
-    from src.experiment.runner import ExperimentRunner
+    from src.control.repo import get_head_commit, require_clean_worktree
 
     harbor_config, harness_config, api_key = load_runtime_config()
-    print(f"experiment: {harness_config.experiment_id}")
-    print(f"panels: {_panel_task_summary(harness_config)}")
+    task_ids = _selected_task_ids(harness_config)
+    experiment_id = _selected_experiment_id()
+    print(f"experiment: {experiment_id}")
+    print(f"tasks ({len(task_ids)}): {', '.join(task_ids)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
     print(f"harness config: {DEFAULT_HARNESS_CONFIG_PATH}")
+    if _require_clean_worktree_for_exp():
+        require_clean_worktree()
+    git_commit_hash = get_head_commit()
     try:
-        record = ExperimentRunner(
-            harness_config=harness_config,
-            harbor_config=harbor_config,
-            api_key=api_key,
-            require_clean_worktree=_require_clean_worktree_for_exp(),
-        ).run()
+        result = asyncio.run(
+            _run_exp_async(
+                harness_config=harness_config,
+                harbor_config=harbor_config,
+                api_key=api_key,
+                git_commit_hash=git_commit_hash,
+                task_ids=task_ids,
+                experiment_id=experiment_id,
+            )
+        )
     except ChatGptCodexCredentialsExpiredError as exc:
         print(str(exc), file=sys.stderr)
         return CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
-    print(f"evaluation: {record.status}")
+    print(f"run status: {result.run_status}")
     print("run complete")
     return 0
 

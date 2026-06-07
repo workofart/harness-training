@@ -588,6 +588,96 @@ def test_harbor_light_exec_bypasses_shared_heavy_semaphore(tmp_path: Path) -> No
     assert order[:2] == ["enter:heavy", "enter:light"]
 
 
+def test_harbor_exec_concurrency_never_exceeds_heavy_cap(tmp_path: Path) -> None:
+    # #1-caps (heavy): a size-N gate admits up to N concurrent heavy execs and
+    # no more. The size-1 serialize test above proves mutual exclusion; this
+    # proves the cap is the *limit* -- with cap=2 and 5 concurrent execs, peak
+    # in-flight reaches 2 (the gate does admit up to the cap) and never 3.
+    inflight = 0
+    peak = 0
+
+    async def fake_exec(*, command, cwd=None, env=None, timeout_sec=None):
+        del command, cwd, env, timeout_sec
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+        exec_semaphore=asyncio.Semaphore(2),
+    )
+    fake_session = MagicMock()
+    fake_session.environment.exec = fake_exec
+    agent_dir = tmp_path / "trial" / "agent"
+    agent_dir.mkdir(parents=True)
+    fake_session.trial_paths.agent_dir = agent_dir
+    harbor._session = fake_session
+
+    async def go():
+        await asyncio.gather(*(harbor.exec(command=f"c{i}") for i in range(5)))
+
+    asyncio.run(go())
+
+    assert peak == 2
+
+
+def test_harbor_verify_serializes_under_shared_semaphore(tmp_path: Path) -> None:
+    # #1-enforcer: verify() is heavyweight container work (a separate build+test
+    # env that can re-pull multi-GB toolchains) and must acquire the same gate as
+    # exec/reset, else a panel of concurrent trials runs N verifiers at once and
+    # oversubscribes cores. A graded verify and a heavy exec under a size-1 gate
+    # must not overlap.
+    order: list[str] = []
+
+    async def fake_exec(*, command, cwd=None, env=None, timeout_sec=None):
+        del cwd, env, timeout_sec
+        order.append(f"enter:{command}")
+        await asyncio.sleep(0.01)
+        order.append(f"exit:{command}")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    class _RecordingVerifier:
+        async def verify(self):
+            order.append("enter:verify")
+            await asyncio.sleep(0.01)
+            order.append("exit:verify")
+            return SimpleNamespace(rewards={"reward": 1.0})
+
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+        exec_semaphore=asyncio.Semaphore(1),
+    )
+    agent_dir = tmp_path / "trial" / "agent"
+    agent_dir.mkdir(parents=True)
+    harbor._session = SimpleNamespace(
+        environment=SimpleNamespace(exec=fake_exec),
+        verifier_session=_RecordingVerifier(),
+        trial_paths=SimpleNamespace(
+            agent_dir=agent_dir,
+            test_stdout_path=tmp_path / "trial" / "stdout.txt",
+            test_stderr_path=tmp_path / "trial" / "stderr.txt",
+        ),
+    )
+
+    async def go():
+        await asyncio.gather(harbor.verify(), harbor.exec(command="heavy"))
+
+    asyncio.run(go())
+
+    # verify acquires the same gate as exec -> the two never interleave.
+    assert order in (
+        ["enter:verify", "exit:verify", "enter:heavy", "exit:heavy"],
+        ["enter:heavy", "exit:heavy", "enter:verify", "exit:verify"],
+    )
+
+
 def test_harbor_reset_serializes_startup_under_shared_semaphore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

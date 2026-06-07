@@ -2,12 +2,13 @@
 Harness policy core.
 
 Public critical path from `uv run exp`:
-- `src.cli.main_exp()` loads runtime config and constructs
-  `src.experiment.runner.ExperimentRunner`.
-- `ExperimentRunner.run()` creates the experiment record, resolves task dirs,
-  and runs the train panel.
-- `src.experiment.trial.run_task()` owns reset, timeout, artifact paths,
-  tracing/metrics, cleanup, and the returned `TaskResult`.
+- `src.cli.main_exp()` loads runtime config and runs the experiment
+  orchestrator over the task set.
+- `src.experiment.orchestrator` schedules trials (two-level concurrency,
+  admission, majority early-stop) and aggregates them into an `ExperimentResult`.
+- `src.experiment.executor.run_trial()` owns one trial: reset, the two timeouts
+  (env-setup vs agent), the verify-ceiling env wrapper, classification, cleanup,
+  and the returned `TrialResult`.
 - `run_task_loop()` owns the post-reset policy/environment loop.
 
 This module defines the loop-local design:
@@ -24,12 +25,12 @@ This module defines the loop-local design:
 Boundary contracts:
 - Environment adapters implement `src.contracts.HarnessEnv`.
 - LLM adapters implement `src.llm.base.BaseLlm`.
-- Trial results cross back to the runner as `src.contracts.TaskResult`.
+- Trial results cross back to the orchestrator as
+  `src.experiment.record.TrialResult`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import shlex
 from abc import ABC
@@ -49,18 +50,6 @@ from src.trace import (
 # ============================================================================
 # Constants
 # ============================================================================
-
-# Wall ceiling for a single graded verify (run in a separate build+test env). A
-# looping/deadlocked deliverable otherwise hangs the verifier until the whole-task
-# timeout (observed: 11-28 min hangs on tasks that normally verify in seconds); the
-# ceiling fails such a grader fast and terminally. Set above the longest verify seen
-# to complete, so only a hang is cut; keyed on wall time alone, not the task.
-VERIFY_TIMEOUT_SEC: float = 900.0
-VERIFY_TIMEOUT_NOTICE = (
-    "Grading did not complete within the time limit and was stopped. A correct "
-    "solution is graded quickly; a solution that loops or blocks during grading "
-    "is treated as failing."
-)
 
 MISSING_TOOL_CALL_REPAIR_PROMPT = (
     "Your previous response omitted the required tool call. "
@@ -404,26 +393,6 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
     raise TypeError(f"Unsupported action: {type(action).__name__}")
 
 
-async def _verify_within_ceiling(
-    env: HarnessEnv, action: VerifyAction, step_recorder: StepRecorder
-) -> RawState:
-    """Run the terminal verifier under `VERIFY_TIMEOUT_SEC`.
-
-    On expiry, returns a terminal non-passing `RawState` (the unsolved verdict the
-    task timeout would reach anyway, sooner) and records a `verify_timeout` fire.
-    Only the inner timeout is caught here; an outer task-timeout cancellation
-    passes through as `CancelledError` for upstream classification.
-    """
-    try:
-        async with asyncio.timeout(VERIFY_TIMEOUT_SEC):
-            return await execute_action(env, action)
-    except TimeoutError:
-        step_recorder.rule_fired("verify_timeout")
-        return RawState(
-            reward=0.0, done=True, passed=False, stdout=VERIFY_TIMEOUT_NOTICE
-        )
-
-
 # ============================================================================
 # Prompt building
 # ============================================================================
@@ -653,10 +622,7 @@ async def run_task_loop(
             action_name=action.NAME,
             action_summary=action_summary,
         )
-        if isinstance(action, VerifyAction):
-            raw_state = await _verify_within_ceiling(env, action, step_recorder)
-        else:
-            raw_state = await execute_action(env, action)
+        raw_state = await execute_action(env, action)
         step_recorder.env_step_completed(
             action_name=action.NAME,
             action_summary=action_summary,

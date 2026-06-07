@@ -345,6 +345,12 @@ class HarnessRecorder:
             failure_mode=failure_mode,
         )
 
+    def rule_fired(self, rule_name: str) -> None:
+        # Trial-level rule fire (no step attribution): used by the executor's
+        # verify-ceiling env wrapper, which runs outside any agent step.
+        if self.metrics is not None:
+            self.metrics.record_rule_fire(rule_name)
+
 
 NOOP_STEP_RECORDER = StepRecorder()
 NOOP_HARNESS_RECORDER = HarnessRecorder()
