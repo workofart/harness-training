@@ -46,6 +46,31 @@ def minimal_config_payload(**updates) -> dict[str, object]:
     return payload
 
 
+def test_train_and_test_tasks_derive_from_the_panels():
+    # The redesign train/test vocabulary (§5/§12) is a derivation off the
+    # promotion/regression_veto panels -- no schema change, additive to panels[].
+    config = HarnessConfig.model_validate(
+        minimal_config_payload(
+            panels=[
+                promotion_panel(["task-a", "task-b"]),
+                regression_veto_panel(["task-c"]),
+            ]
+        )
+    )
+    assert config.train_tasks == frozenset({"task-a", "task-b"})
+    assert config.test_tasks == frozenset({"task-c"})
+    # Disjoint by construction (panel_contract_is_valid enforces it).
+    assert config.train_tasks.isdisjoint(config.test_tasks)
+
+
+def test_test_tasks_is_empty_without_a_veto_panel():
+    # A config with only a promotion panel has no test panel; test_tasks is empty
+    # (scan() rejects that at World-build time per §12, not config-load).
+    config = HarnessConfig.model_validate(minimal_config_payload())
+    assert config.train_tasks == frozenset({"task-a"})
+    assert config.test_tasks == frozenset()
+
+
 def test_harness_config_accepts_literal_narrow_loop_shape():
     payload = minimal_config_payload(
         panels=[promotion_panel(task_timeout_sec=30.0)],

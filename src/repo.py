@@ -54,6 +54,20 @@ def git_ref_exists(*, cwd: Path | None = None, ref: str) -> bool:
     return completed.returncode == 0
 
 
+def resolve_ref(ref: str, *, cwd: Path | None = None) -> str:
+    return _git_stdout("rev-parse", ref, cwd=cwd).strip()
+
+
+def is_dirty(*, cwd: Path | None = None) -> bool:
+    """Whether the worktree has uncommitted changes (the predicate form of
+    :func:`require_clean_worktree`). Respects ``.gitignore``, so the gitignored
+    ``experiments/`` data dir never reads as dirty."""
+    status = _git_stdout(
+        "status", "--porcelain", "--untracked-files=all", cwd=cwd
+    ).strip()
+    return bool(status)
+
+
 def _added_lines(diff_stdout: str) -> list[str]:
     """Extract the added (`+`) source lines from `git diff --unified=0` output,
     stripping the leading `+` and skipping the `+++` file header."""
@@ -176,6 +190,31 @@ def add_worktree(
         args.append("--detach")
     args.extend([str(worktree_path), ref])
     _git_run(*args, cwd=cwd)
+
+
+def remove_worktree(
+    worktree_path: Path, *, cwd: Path | None = None, force: bool = True
+) -> None:
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(str(worktree_path))
+    _git_run(*args, cwd=cwd)
+
+
+def merge_ff_only(commit_hash: str, *, cwd: Path | None = None) -> None:
+    """Fast-forward the current branch to `commit_hash`, refusing a 3-way merge.
+
+    The only HEAD-moving op the supervisor performs (on keep). `--ff-only` is the
+    HEAD-drift guard: if HEAD diverged so `commit_hash` can't fast-forward onto
+    it, git exits non-zero and this raises -- the caller Halts rather than merging
+    onto the read-only primary (plan.md §6/§7).
+    """
+    _git_run("merge", "--ff-only", commit_hash, cwd=cwd)
+
+
+def delete_ref(ref_name: str, *, cwd: Path | None = None) -> None:
+    _git_run("update-ref", "-d", ref_name, cwd=cwd)
 
 
 def sparse_checkout_init_no_cone(*, cwd: Path | None = None) -> None:

@@ -98,6 +98,37 @@ def test_selected_experiment_id_generates_fresh_id_by_default(monkeypatch):
     assert fresh.startswith("exp-") and len(fresh) > len("exp-")
 
 
+def test_experiments_dir_override_anchors_to_exp_experiments_dir(monkeypatch, tmp_path):
+    # §12: auto runs exp in a candidate worktree but passes the absolute main-repo
+    # experiments dir, so artifacts + the verifier-context cache stay canonical.
+    from src.env.harbor import HarborConfig
+
+    target = tmp_path / "main-experiments"
+    monkeypatch.setenv("EXP_EXPERIMENTS_DIR", str(target))
+    overridden = cli._apply_experiments_dir_override(HarborConfig())
+    assert overridden.experiments_dir == target.resolve()
+    # the shared verifier-context cache re-derives under the new root
+    assert overridden.verifier_contexts_dir == (target / "_verifier_contexts").resolve()
+
+
+def test_experiments_dir_override_is_a_noop_without_the_env(monkeypatch):
+    from src.env.harbor import HarborConfig
+
+    monkeypatch.delenv("EXP_EXPERIMENTS_DIR", raising=False)
+    base = HarborConfig()
+    assert cli._apply_experiments_dir_override(base) is base  # standalone exp
+
+
+def test_experiments_dir_override_rejects_a_relative_path(monkeypatch):
+    import pytest
+
+    from src.env.harbor import HarborConfig
+
+    monkeypatch.setenv("EXP_EXPERIMENTS_DIR", "relative/experiments")
+    with pytest.raises(ValueError, match="absolute"):
+        cli._apply_experiments_dir_override(HarborConfig())
+
+
 # --- auto entry point (unchanged; control rebuilt Steps 3-5) ----------------
 
 

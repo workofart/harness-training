@@ -328,3 +328,22 @@ class HarnessConfig(BaseModel):
             (panel for panel in self.panels if panel.purpose == "regression_veto"),
             None,
         )
+
+    @property
+    def train_tasks(self) -> frozenset[str]:
+        # The promotion panel's task set -- what `auto` runs as the train panel
+        # and `gate(.., purpose="promotion")` scores. Derived from panels, not a
+        # separate persisted field, so the new `supervisor` consumes the redesign
+        # train/test vocabulary (§5/§12) while the config schema is unchanged and
+        # the old stack keeps reading `panels[]`. Always non-empty (promotion
+        # `task_names` has min_length 1).
+        return frozenset(self.promotion_panel.task_names)
+
+    @property
+    def test_tasks(self) -> frozenset[str]:
+        # The regression-veto panel's task set; empty when no veto panel is
+        # configured. `scan()` asserts both panels non-empty + disjoint when it
+        # builds `World` (§12); panel disjointness itself is already enforced by
+        # `panel_contract_is_valid`.
+        veto = self.regression_veto_panel
+        return frozenset() if veto is None else frozenset(veto.task_names)

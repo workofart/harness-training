@@ -44,8 +44,31 @@ def load_runtime_config() -> tuple[HarborConfig, HarnessConfig, str | None]:
         harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
         harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
     )
+    harbor_config = _apply_experiments_dir_override(harbor_config)
     api_key = _load_llm_provider_secret(harness_config=harness_config)
     return harbor_config, harness_config, api_key
+
+
+def _apply_experiments_dir_override(harbor_config: HarborConfig) -> HarborConfig:
+    """Honor `EXP_EXPERIMENTS_DIR` (plan.md §12 path anchoring): when `auto` runs
+    `exp` inside a throwaway candidate worktree it passes the absolute
+    `<main_repo>/experiments` so trial artifacts, `experiment.json`, and the shared
+    verifier-context cache land in the one canonical dir -- never relative to the
+    worktree cwd. Re-validates so the cache dir re-derives under the new root.
+    A no-op (returns the same config) when the var is unset, e.g. a standalone
+    `uv run exp` in the primary repo."""
+    override = os.getenv("EXP_EXPERIMENTS_DIR")
+    if not override:
+        return harbor_config
+    experiments_dir = Path(override)
+    if not experiments_dir.is_absolute():  # §12: never relative to cwd
+        raise ValueError(
+            f"EXP_EXPERIMENTS_DIR must be an absolute path, got: {override!r}"
+        )
+    payload = harbor_config.model_dump()
+    payload["experiments_dir"] = experiments_dir
+    payload["verifier_contexts_dir"] = None  # re-derive under the new experiments dir
+    return type(harbor_config).model_validate(payload)
 
 
 def _require_clean_worktree_for_exp() -> bool:
@@ -211,7 +234,7 @@ def main_exp() -> int:
         ChatGptCodexCredentialsExpiredError,
     )
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
-    from src.control.repo import get_head_commit, require_clean_worktree
+    from src.repo import get_head_commit, require_clean_worktree
 
     harbor_config, harness_config, api_key = load_runtime_config()
     task_ids = _selected_task_ids(harness_config)
@@ -249,7 +272,7 @@ def main_auto() -> int:
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
         ChatGptCodexCredentialsExpiredError,
     )
-    from src.control.agent_backend import create_backend
+    from src.supervisor.agent_backend import create_backend
     from src.control.supervisor import run_supervisor_loop
 
     agent_type = "codex"
