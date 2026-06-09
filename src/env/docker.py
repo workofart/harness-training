@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import weakref
 from collections.abc import Awaitable, Callable
 from hashlib import sha1
 
@@ -18,6 +20,15 @@ _HARBOR_COMPOSE_PROJECT_SUFFIX_RE = re.compile(
     r"^\d{8}-\d{6}-[0-9a-f]{8}(?:__verifier)?$"
 )
 _TERMINAL_DOCKER_STATES = frozenset({"dead", "exited"})
+# `docker {container,volume,network} rm` can lose a race to a concurrent cleanup
+# or to the daemon's own `compose down`: the resource is either still being
+# removed ("is already in progress") or already gone ("not found"). Both reach
+# the intended end state, so the failed removal is a no-op success.
+_IDEMPOTENT_REMOVE_RACE_MARKERS = ("is already in progress", "not found")
+_CLEANUP_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, asyncio.Lock],
+] = weakref.WeakKeyDictionary()
 
 _DockerCli = Callable[..., Awaitable[ExecResult]]
 
@@ -86,6 +97,16 @@ class DockerCleanup:
             )
         return tuple(prefixes)
 
+    def _cleanup_lock(self) -> asyncio.Lock:
+        # One lock per task project, per event loop: serializes sibling trials of
+        # the same task so their stale-project cleanups don't race `docker rm` on
+        # shared IDs. Keyed by loop so multiple `asyncio.run` calls (tests) never
+        # share a lock bound to a finished loop.
+        loop = asyncio.get_running_loop()
+        locks = _CLEANUP_LOCKS_BY_LOOP.setdefault(loop, {})
+        key = self._docker_compose_task_project_prefix()
+        return locks.setdefault(key, asyncio.Lock())
+
     async def docker_ids_by_project_label(
         self,
         *,
@@ -102,15 +123,27 @@ class DockerCleanup:
         )
         return [line for line in (result.stdout or "").splitlines() if line]
 
+    async def _remove_docker_ids(self, args: list[str]) -> None:
+        try:
+            await self._run_docker_cli(
+                args,
+                failure_context="Docker cleanup command failed",
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if any(marker in message for marker in _IDEMPOTENT_REMOVE_RACE_MARKERS):
+                self._logger.debug("Ignoring idempotent Docker cleanup race: %s", exc)
+                return
+            raise
+
     async def cleanup_docker_project_by_label(self, project_name: str) -> None:
         container_ids = await self.docker_ids_by_project_label(
             resource="container",
             project_name=project_name,
         )
         if container_ids:
-            await self._run_docker_cli(
+            await self._remove_docker_ids(
                 ["container", "rm", "--force", "--volumes", *container_ids],
-                failure_context="Docker cleanup command failed",
             )
 
         volume_ids = await self.docker_ids_by_project_label(
@@ -118,20 +151,14 @@ class DockerCleanup:
             project_name=project_name,
         )
         if volume_ids:
-            await self._run_docker_cli(
-                ["volume", "rm", "--force", *volume_ids],
-                failure_context="Docker cleanup command failed",
-            )
+            await self._remove_docker_ids(["volume", "rm", "--force", *volume_ids])
 
         network_ids = await self.docker_ids_by_project_label(
             resource="network",
             project_name=project_name,
         )
         if network_ids:
-            await self._run_docker_cli(
-                ["network", "rm", *network_ids],
-                failure_context="Docker cleanup command failed",
-            )
+            await self._remove_docker_ids(["network", "rm", *network_ids])
 
     @staticmethod
     def docker_compose_project_label(labels: str) -> str:
@@ -154,6 +181,10 @@ class DockerCleanup:
         ):
             return
 
+        async with self._cleanup_lock():
+            await self._cleanup_stale_docker_compose_projects()
+
+    async def _cleanup_stale_docker_compose_projects(self) -> None:
         result = await self._run_docker_cli(
             [
                 "container",
@@ -196,26 +227,27 @@ class DockerCleanup:
         from harbor.environments.docker.docker import DockerEnvironment
 
         if self.environment_config.delete and isinstance(env, DockerEnvironment):
-            try:
-                await env._run_docker_compose_command(
-                    ["down", "--volumes", "--remove-orphans"]
-                )
-            except RuntimeError as compose_error:
-                project_name = self.docker_compose_project_name(env)
+            async with self._cleanup_lock():
                 try:
-                    await self.cleanup_docker_project_by_label(project_name)
-                    self._logger.warning(
-                        "Docker compose down failed for project %r; "
-                        "recovered via label fallback: %s",
-                        project_name,
-                        compose_error,
+                    await env._run_docker_compose_command(
+                        ["down", "--volumes", "--remove-orphans"]
                     )
-                except RuntimeError as fallback_error:
-                    raise RuntimeError(
-                        "Docker cleanup failed after compose down and "
-                        f"project-label fallback for project {project_name!r}. "
-                        f"Compose error: {compose_error}. "
-                        f"Fallback error: {fallback_error}."
-                    ) from compose_error
+                except RuntimeError as compose_error:
+                    project_name = self.docker_compose_project_name(env)
+                    try:
+                        await self.cleanup_docker_project_by_label(project_name)
+                        self._logger.warning(
+                            "Docker compose down failed for project %r; "
+                            "recovered via label fallback: %s",
+                            project_name,
+                            compose_error,
+                        )
+                    except RuntimeError as fallback_error:
+                        raise RuntimeError(
+                            "Docker cleanup failed after compose down and "
+                            f"project-label fallback for project {project_name!r}. "
+                            f"Compose error: {compose_error}. "
+                            f"Fallback error: {fallback_error}."
+                        ) from compose_error
         else:
             await env.stop(delete=self.environment_config.delete)

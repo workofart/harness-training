@@ -1622,6 +1622,270 @@ def test_cleanup_stale_docker_projects_skips_malformed_rows(
     assert removed_projects == ["task-a__20260603-120001-abcdef12"]
 
 
+def test_cleanup_stale_docker_projects_ignores_idempotent_docker_cleanup_races(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stale_project = "task-a__20260603-120000-abcdef12"
+    calls: list[list[str]] = []
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
+        calls.append(args)
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ]:
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "ID": "container-1",
+                        "State": "exited",
+                        "Labels": f"com.docker.compose.project={stale_project}",
+                    }
+                ),
+                stderr=None,
+            )
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ]:
+            return ExecResult(return_code=0, stdout="container-1\n", stderr=None)
+        if args == [
+            "container",
+            "rm",
+            "--force",
+            "--volumes",
+            "container-1",
+        ]:
+            raise RuntimeError(
+                "Docker cleanup command failed. Command: docker container rm "
+                "--force --volumes container-1. Return code: 1. Output: "
+                "Error response from daemon: removal of container container-1 "
+                "is already in progress\n."
+            )
+        if args == [
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ]:
+            return ExecResult(return_code=0, stdout="", stderr=None)
+        if args == [
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ]:
+            return ExecResult(return_code=0, stdout="network-1\n", stderr=None)
+        if args == ["network", "rm", "network-1"]:
+            raise RuntimeError(
+                "Docker cleanup command failed. Command: docker network rm "
+                "network-1. Return code: 1. Output: Error response from "
+                "daemon: network network-1 not found\nexit status 1\n."
+            )
+        return ExecResult(return_code=0, stdout="", stderr=None)
+
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+
+    asyncio.run(cleanup.cleanup_stale_docker_compose_projects())
+
+    assert "Failed to clean stale Docker compose project" not in caplog.text
+    assert calls == [
+        [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ],
+        [
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ],
+        [
+            "container",
+            "rm",
+            "--force",
+            "--volumes",
+            "container-1",
+        ],
+        [
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ],
+        [
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ],
+        ["network", "rm", "network-1"],
+    ]
+
+
+def test_cleanup_stale_docker_projects_serializes_same_task_cleanup(
+    tmp_path: Path,
+) -> None:
+    stale_project = "task-a__20260603-120000-abcdef12"
+    active_stale_listings = 0
+    max_active_stale_listings = 0
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        nonlocal active_stale_listings, max_active_stale_listings
+        del failure_context
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ]:
+            active_stale_listings += 1
+            max_active_stale_listings = max(
+                max_active_stale_listings,
+                active_stale_listings,
+            )
+            await asyncio.sleep(0.01)
+            active_stale_listings -= 1
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "ID": "container-1",
+                        "State": "exited",
+                        "Labels": f"com.docker.compose.project={stale_project}",
+                    }
+                ),
+                stderr=None,
+            )
+        return ExecResult(return_code=0, stdout="", stderr=None)
+
+    cleanup_a = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+    cleanup_b = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+
+    async def go() -> None:
+        await asyncio.gather(
+            cleanup_a.cleanup_stale_docker_compose_projects(),
+            cleanup_b.cleanup_stale_docker_compose_projects(),
+        )
+
+    asyncio.run(go())
+
+    assert max_active_stale_listings == 1
+
+
+def test_cleanup_stale_docker_projects_waits_for_same_task_environment_teardown(
+    tmp_path: Path,
+) -> None:
+    stale_project = "task-a__20260603-120000-abcdef12"
+    teardown_active = False
+    stale_listing_overlapped_teardown = False
+
+    env = _stub_docker_environment(session_id=stale_project)
+
+    async def fake_compose_down(args: list[str]) -> None:
+        nonlocal teardown_active
+        assert args == ["down", "--volumes", "--remove-orphans"]
+        teardown_active = True
+        await asyncio.sleep(0.01)
+        teardown_active = False
+
+    env._run_docker_compose_command = AsyncMock(side_effect=fake_compose_down)
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        nonlocal stale_listing_overlapped_teardown
+        del failure_context
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ]:
+            stale_listing_overlapped_teardown = (
+                stale_listing_overlapped_teardown or teardown_active
+            )
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "ID": "container-1",
+                        "State": "exited",
+                        "Labels": f"com.docker.compose.project={stale_project}",
+                    }
+                ),
+                stderr=None,
+            )
+        return ExecResult(return_code=0, stdout="", stderr=None)
+
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+
+    async def go() -> None:
+        stop = asyncio.create_task(cleanup.stop_environment(env))
+        await asyncio.sleep(0)
+        await cleanup.cleanup_stale_docker_compose_projects()
+        await stop
+
+    asyncio.run(go())
+
+    assert not stale_listing_overlapped_teardown
+
+
 def test_harbor_reset_runs_stale_docker_project_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
