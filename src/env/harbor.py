@@ -5,15 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import logging
-import re
 import shutil
 import tomllib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from harbor.environments.base import BaseEnvironment, ExecResult
@@ -33,8 +31,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # behind first call to reset() / download path keeps `uv run exp` cold-start
 # fast and shaves cost from invocations that never reach those paths.
 
-from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
-from src.harness.contracts import EnvExecWorkload, RawState
+from src.retry import INFRA_RETRY_BUDGET, retry_transient
+from src.env.docker import (
+    DockerCleanup,
+    _MAX_VERIFIER_ENV_SESSION_ID_LEN,
+    _compact_verifier_task_session_prefix,
+    _safe_verifier_session_text,
+)
+from src.contracts import EnvExecWorkload, RawState
 
 DEFAULT_HARBOR_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "harbor_config.toml"
@@ -43,14 +47,8 @@ DEFAULT_TASK_OVERRIDES_DIR = Path(__file__).resolve().parents[2] / "task_overrid
 VERIFIER_CONTEXT_DOCKERFILE_TEMPLATE_PATH = (
     Path(__file__).resolve().parent / "verifier_context.Dockerfile"
 )
-_MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
-_HARBOR_RUN_ID_EXAMPLE = "20260603-120000-abcdef12"
 _VERIFIER_IMAGE_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
 _VERIFIER_CONTEXT_LOCKS: dict[str, asyncio.Lock] = {}
-_HARBOR_COMPOSE_PROJECT_SUFFIX_RE = re.compile(
-    r"^\d{8}-\d{6}-[0-9a-f]{8}(?:__verifier)?$"
-)
-_TERMINAL_DOCKER_STATES = frozenset({"dead", "exited"})
 
 logger = logging.getLogger(__name__)
 
@@ -199,26 +197,6 @@ def _string_hash(*values: str) -> str:
     return digest.hexdigest()
 
 
-def _safe_verifier_session_text(value: str) -> str:
-    return "".join(char if char.isalnum() or char in "-._" else "_" for char in value)
-
-
-def _compact_verifier_task_session_prefix(task_name: str) -> str | None:
-    safe_task = _safe_verifier_session_text(task_name)
-    if (
-        len(f"{safe_task}__{_HARBOR_RUN_ID_EXAMPLE}__verifier")
-        <= _MAX_VERIFIER_ENV_SESSION_ID_LEN
-    ):
-        return None
-
-    digest = hashlib.sha1(safe_task.encode()).hexdigest()[:8]
-    suffix_len = len(f"__{digest}__{_HARBOR_RUN_ID_EXAMPLE}__verifier")
-    task_prefix = safe_task[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - suffix_len].rstrip(
-        "-._"
-    )
-    return f"{task_prefix or digest}__{digest}__"
-
-
 def _trial_log_mounts(
     trial_paths: TrialPaths,
     task: Task,
@@ -286,15 +264,21 @@ class _ResourceCappedEnvironment:
 
 
 @dataclass
+class SeparateVerifierSession:
+    env_config: TaskEnvironmentConfig
+    build_context: Path | None
+
+
+VerifierSession = Verifier | SeparateVerifierSession
+
+
+@dataclass
 class HarborSession:
     task: Task
     trial_paths: TrialPaths
     environment: _ResourceCappedEnvironment
     raw_environment: BaseEnvironment
-    verifier: Verifier | None
-    verifier_env_config: TaskEnvironmentConfig | None
-    verifier_build_context: Path | None
-    verifier_extra_artifacts: tuple[str, ...] = ()
+    verifier_session: VerifierSession
     working_dir: str | None = None
 
 
@@ -450,22 +434,24 @@ class Harbor:
             verifier_env_config = (
                 verifier_env_config or task.config.environment.model_copy(deep=True)
             )
+        verifier_session: VerifierSession
+        if verifier_env_config is None:
+            verifier_session = Verifier(
+                task=task,
+                trial_paths=trial_paths,
+                environment=capped_environment,
+            )
+        else:
+            verifier_session = SeparateVerifierSession(
+                env_config=verifier_env_config,
+                build_context=verifier_build_context,
+            )
         self._session = HarborSession(
             task=task,
             trial_paths=trial_paths,
             environment=capped_environment,
             raw_environment=harbor_environment,
-            verifier=(
-                None
-                if verifier_env_config is not None
-                else Verifier(
-                    task=task,
-                    trial_paths=trial_paths,
-                    environment=capped_environment,
-                )
-            ),
-            verifier_env_config=verifier_env_config,
-            verifier_build_context=verifier_build_context,
+            verifier_session=verifier_session,
         )
 
     async def _sanitize_no_proxy(
@@ -562,7 +548,7 @@ class Harbor:
         if self._session is not None:
             await self.close()
 
-        await self._cleanup_stale_docker_compose_projects()
+        await self._docker_cleanup().cleanup_stale_docker_compose_projects()
 
         run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
         session_id = f"{self.task_name}__{run_id}"
@@ -596,14 +582,12 @@ class Harbor:
                 await self._bootstrap_environment()
                 working_dir = await self._detect_working_dir()
                 self.session.working_dir = working_dir
-                if self.session.verifier_build_context is None:
-                    self.session.verifier_extra_artifacts = (working_dir,)
             return RawState(
                 instruction=task.instruction,
                 working_dir=working_dir,
             )
         except Exception:
-            await self._stop_environment(harbor_environment)
+            await self._docker_cleanup().stop_environment(harbor_environment)
             raise
 
     def _env_gate(self, workload: EnvExecWorkload = "heavy"):
@@ -698,9 +682,12 @@ class Harbor:
             and not (build_context / "docker-compose.yaml").exists()
         )
 
-    async def _verifier_build_context(self) -> Path:
-        if self.session.verifier_build_context is not None:
-            return self.session.verifier_build_context
+    async def _verifier_build_context(
+        self,
+        verifier_session: SeparateVerifierSession,
+    ) -> Path:
+        if verifier_session.build_context is not None:
+            return verifier_session.build_context
         return await self._ensure_generated_verifier_context()
 
     def _generated_verifier_context_dir(self) -> Path:
@@ -789,19 +776,48 @@ class Harbor:
             logger=logger,
         )
 
-    async def _collect_separate_verifier_artifacts(self) -> None:
+    def _separate_verifier_extra_artifacts(
+        self,
+        verifier_session: SeparateVerifierSession,
+    ) -> tuple[str, ...]:
+        if verifier_session.build_context is not None:
+            return ()
+        working_dir = self.session.working_dir
+        assert working_dir is not None
+        return (working_dir,)
+
+    async def _collect_separate_verifier_artifacts(
+        self,
+        verifier_session: SeparateVerifierSession,
+    ) -> tuple[Path, ...]:
         agent_env_paths = EnvironmentPaths.for_os(
             self.session.task.config.environment.os
         )
+        extra_artifacts = self._separate_verifier_extra_artifacts(verifier_session)
         await self._artifact_handler().download_artifacts(
             self.session.environment,
             self.session.trial_paths.artifacts_dir,
             source_artifacts_dir=agent_env_paths.artifacts_dir,
-            artifacts=self.session.verifier_extra_artifacts,
+            artifacts=extra_artifacts,
         )
+        return tuple(
+            self.session.trial_paths.artifacts_dir / PurePosixPath(source).name
+            for source in extra_artifacts
+        )
+
+    def _cleanup_separate_verifier_transfer_artifacts(
+        self,
+        paths: tuple[Path, ...],
+    ) -> None:
+        for path in paths:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
 
     async def _upload_separate_verifier_artifacts(
         self,
+        verifier_session: SeparateVerifierSession,
         verifier_environment: _ResourceCappedEnvironment,
     ) -> None:
         agent_env_paths = EnvironmentPaths.for_os(
@@ -813,7 +829,7 @@ class Harbor:
             artifacts_dir=self.session.trial_paths.artifacts_dir,
             source_artifacts_dir=agent_env_paths.artifacts_dir,
             target_artifacts_dir=verifier_env_paths.artifacts_dir,
-            artifacts=self.session.verifier_extra_artifacts,
+            artifacts=self._separate_verifier_extra_artifacts(verifier_session),
         )
 
     async def _apply_verifier_network_preamble(
@@ -852,11 +868,12 @@ class Harbor:
     @contextlib.asynccontextmanager
     async def _separate_verifier_environment(
         self,
-        verifier_env_config: TaskEnvironmentConfig,
+        verifier_session: SeparateVerifierSession,
     ) -> AsyncGenerator[_ResourceCappedEnvironment, None]:
         from harbor.environments.factory import EnvironmentFactory
 
-        build_context = await self._verifier_build_context()
+        verifier_env_config = verifier_session.env_config
+        build_context = await self._verifier_build_context(verifier_session)
         verifier_env_config = await self._verifier_env_config_with_cached_image(
             verifier_env_config,
             build_context,
@@ -885,43 +902,55 @@ class Harbor:
             yield verifier_environment
         finally:
             try:
-                await asyncio.shield(self._stop_environment(raw_environment))
+                await asyncio.shield(
+                    self._docker_cleanup().stop_environment(raw_environment)
+                )
             except Exception as exc:
                 logger.debug("Failed to stop separate verifier environment: %s", exc)
 
-    async def _verify_in_separate_environment(self) -> VerifierResult:
-        verifier_env_config = self.session.verifier_env_config
-        if verifier_env_config is None:
-            raise RuntimeError("Separate verifier mode did not resolve an environment")
-
-        await self._collect_separate_verifier_artifacts()
-        async with self._separate_verifier_environment(
-            verifier_env_config
-        ) as verifier_environment:
-            with verifier_environment.with_default_user(
-                self.session.task.config.verifier.user
-            ):
-                env_paths = EnvironmentPaths.for_os(verifier_environment.os)
-                await verifier_environment.empty_dirs(
-                    [env_paths.verifier_dir],
-                    chmod=True,
-                )
-                await self._upload_separate_verifier_artifacts(verifier_environment)
-                await self._apply_verifier_network_preamble(verifier_environment)
-                verifier = Verifier(
-                    task=self.session.task,
-                    trial_paths=self.session.trial_paths,
-                    environment=verifier_environment,
-                    skip_tests_upload=True,
-                )
-                return await verifier.verify()
+    async def _verify_in_separate_environment(
+        self,
+        verifier_session: SeparateVerifierSession,
+    ) -> VerifierResult:
+        transfer_paths = await self._collect_separate_verifier_artifacts(
+            verifier_session
+        )
+        try:
+            async with self._separate_verifier_environment(
+                verifier_session
+            ) as verifier_environment:
+                with verifier_environment.with_default_user(
+                    self.session.task.config.verifier.user
+                ):
+                    env_paths = EnvironmentPaths.for_os(verifier_environment.os)
+                    await verifier_environment.empty_dirs(
+                        [env_paths.verifier_dir],
+                        chmod=True,
+                    )
+                    await self._upload_separate_verifier_artifacts(
+                        verifier_session,
+                        verifier_environment,
+                    )
+                    await self._apply_verifier_network_preamble(verifier_environment)
+                    verifier = Verifier(
+                        task=self.session.task,
+                        trial_paths=self.session.trial_paths,
+                        environment=verifier_environment,
+                        skip_tests_upload=True,
+                    )
+                    return await verifier.verify()
+        finally:
+            self._cleanup_separate_verifier_transfer_artifacts(transfer_paths)
 
     async def verify(self) -> RawState:
         async with self._env_gate():
-            if self.session.verifier is None:
-                verifier_result = await self._verify_in_separate_environment()
+            verifier_session = self.session.verifier_session
+            if isinstance(verifier_session, SeparateVerifierSession):
+                verifier_result = await self._verify_in_separate_environment(
+                    verifier_session
+                )
             else:
-                verifier_result = await self.session.verifier.verify()
+                verifier_result = await verifier_session.verify()
             rewards = verifier_result.rewards
             raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
             reward = 0.0 if raw_reward is None else float(raw_reward)
@@ -970,169 +999,16 @@ class Harbor:
             )
         return result
 
-    @staticmethod
-    def _docker_compose_project_name(env: BaseEnvironment) -> str:
-        from harbor.environments.docker.docker import (
-            _sanitize_docker_compose_project_name,
+    def _docker_cleanup(self) -> DockerCleanup:
+        return DockerCleanup(
+            task_name=self.task_name,
+            environment_config=self.config.environment,
+            run_docker_cli=lambda args, **kwargs: self._run_docker_cli(
+                args,
+                **kwargs,
+            ),
+            logger=logger,
         )
-
-        # Must stay in sync with Harbor's private DockerEnvironment
-        # `docker compose -p` derivation; drift makes label cleanup a no-op.
-        return _sanitize_docker_compose_project_name(env.session_id)
-
-    def _docker_compose_task_project_prefix(self) -> str:
-        from harbor.environments.docker.docker import (
-            _sanitize_docker_compose_project_name,
-        )
-
-        return f"{_sanitize_docker_compose_project_name(self.task_name)}__"
-
-    def _docker_compose_cleanup_project_prefixes(self) -> tuple[str, ...]:
-        from harbor.environments.docker.docker import (
-            _sanitize_docker_compose_project_name,
-        )
-
-        prefixes = [self._docker_compose_task_project_prefix()]
-        compact_verifier_prefix = _compact_verifier_task_session_prefix(self.task_name)
-        if compact_verifier_prefix is not None:
-            prefixes.append(
-                _sanitize_docker_compose_project_name(compact_verifier_prefix)
-            )
-        return tuple(prefixes)
-
-    async def _docker_ids_by_project_label(
-        self,
-        *,
-        resource: str,
-        project_name: str,
-    ) -> list[str]:
-        label = f"label=com.docker.compose.project={project_name}"
-        args = [resource, "ls", "--quiet", "--filter", label]
-        if resource == "container":
-            args.insert(2, "--all")
-        result = await self._run_docker_cli(
-            args,
-            failure_context="Docker cleanup command failed",
-        )
-        return [line for line in (result.stdout or "").splitlines() if line]
-
-    async def _cleanup_docker_project_by_label(self, project_name: str) -> None:
-        container_ids = await self._docker_ids_by_project_label(
-            resource="container",
-            project_name=project_name,
-        )
-        if container_ids:
-            await self._run_docker_cli(
-                ["container", "rm", "--force", "--volumes", *container_ids],
-                failure_context="Docker cleanup command failed",
-            )
-
-        volume_ids = await self._docker_ids_by_project_label(
-            resource="volume",
-            project_name=project_name,
-        )
-        if volume_ids:
-            await self._run_docker_cli(
-                ["volume", "rm", "--force", *volume_ids],
-                failure_context="Docker cleanup command failed",
-            )
-
-        network_ids = await self._docker_ids_by_project_label(
-            resource="network",
-            project_name=project_name,
-        )
-        if network_ids:
-            await self._run_docker_cli(
-                ["network", "rm", *network_ids],
-                failure_context="Docker cleanup command failed",
-            )
-
-    @staticmethod
-    def _docker_compose_project_label(labels: str) -> str:
-        for label in labels.split(","):
-            if label.startswith("com.docker.compose.project="):
-                return label.split("=", 1)[1]
-        raise ValueError("Docker compose project label is missing")
-
-    def _is_stale_cleanup_candidate_project(self, project_name: str) -> bool:
-        for prefix in self._docker_compose_cleanup_project_prefixes():
-            if project_name.startswith(prefix):
-                suffix = project_name[len(prefix) :]
-                return _HARBOR_COMPOSE_PROJECT_SUFFIX_RE.fullmatch(suffix) is not None
-        return False
-
-    async def _cleanup_stale_docker_compose_projects(self) -> None:
-        if (
-            not self.config.environment.delete
-            or self.config.environment.type != EnvironmentType.DOCKER
-        ):
-            return
-
-        result = await self._run_docker_cli(
-            [
-                "container",
-                "ls",
-                "--all",
-                "--filter",
-                "label=com.docker.compose.project",
-                "--format",
-                "{{json .}}",
-            ],
-            failure_context="Docker stale container listing failed",
-        )
-        project_states: dict[str, set[str]] = {}
-        for line in (result.stdout or "").splitlines():
-            try:
-                row = json.loads(line)
-                project_name = self._docker_compose_project_label(row["Labels"])
-                state = row["State"]
-            except (json.JSONDecodeError, KeyError, ValueError):
-                logger.debug(
-                    "Skipping malformed Docker compose container row: %r", line
-                )
-                continue
-            if self._is_stale_cleanup_candidate_project(project_name):
-                project_states.setdefault(project_name, set()).add(state)
-
-        for project_name, states in sorted(project_states.items()):
-            if not states <= _TERMINAL_DOCKER_STATES:
-                continue
-            try:
-                await self._cleanup_docker_project_by_label(project_name)
-            except RuntimeError as exc:
-                logger.warning(
-                    "Failed to clean stale Docker compose project %r: %s",
-                    project_name,
-                    exc,
-                )
-
-    async def _stop_environment(self, env: BaseEnvironment) -> None:
-        from harbor.environments.docker.docker import DockerEnvironment
-
-        if self.config.environment.delete and isinstance(env, DockerEnvironment):
-            try:
-                await env._run_docker_compose_command(
-                    ["down", "--volumes", "--remove-orphans"]
-                )
-            except RuntimeError as compose_error:
-                project_name = self._docker_compose_project_name(env)
-                try:
-                    await self._cleanup_docker_project_by_label(project_name)
-                    logger.warning(
-                        "Docker compose down failed for project %r; "
-                        "recovered via label fallback: %s",
-                        project_name,
-                        compose_error,
-                    )
-                except RuntimeError as fallback_error:
-                    raise RuntimeError(
-                        "Docker cleanup failed after compose down and "
-                        f"project-label fallback for project {project_name!r}. "
-                        f"Compose error: {compose_error}. "
-                        f"Fallback error: {fallback_error}."
-                    ) from compose_error
-        else:
-            await env.stop(delete=self.config.environment.delete)
 
     async def close(self) -> None:
         if self._session is None:
@@ -1141,7 +1017,7 @@ class Harbor:
             return
 
         try:
-            await self._stop_environment(self._session.raw_environment)
+            await self._docker_cleanup().stop_environment(self._session.raw_environment)
         finally:
             self._session = None
             self._trial_dir = None

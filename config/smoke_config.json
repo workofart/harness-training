@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "experiment_id": "smoke",
+  "focus_name": "smoke",
+  "panels": [
+    {
+      "id": "train",
+      "purpose": "promotion",
+      "task_names": [
+        "openssl-selfsigned-cert"
+      ],
+      "task_timeout_sec": 1200.0,
+      "run": {
+        "when": "always"
+      },
+      "baseline": {
+        "required": false
+      }
+    },
+    {
+      "id": "test",
+      "purpose": "regression_veto",
+      "task_names": [
+        "regex-log"
+      ],
+      "task_timeout_sec": 1800.0,
+      "run": {
+        "after_panel": "train",
+        "when_status": "keep"
+      },
+      "baseline": {
+        "required": true
+      }
+    }
+  ],
+  "excluded_task_groups": {},
+  "max_steps": 1000,
+  "max_trial_concurrency": 6,
+  "max_heavy_action_concurrency": 4,
+  "env_setup_timeout_sec": 600.0,
+  "max_output_retries": 2,
+  "task_trials": 3,
+  "llm_provider_config": {
+    "provider": "chatgpt_codex",
+    "model_name": "gpt-5.5",
+    "max_context_length": 200000,
+    "reasoning_effort": "high",
+    "timeout_seconds": 300.0,
+    "service_tier": null
+  }
+}

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import json
 
-from src.adapters.llm_base import LlmCompletion, LlmUsage
-from src.harness.contracts import RawState
-from src.metrics import TaskMetrics
+from src.llm.base import LlmCompletion, LlmUsage
+from src.contracts import RawState, TaskMetrics
 import src.trace as trace_module
 
 

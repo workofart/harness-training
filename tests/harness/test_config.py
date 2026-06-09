@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.harness.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
+from src.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
 
 
 def promotion_panel(
@@ -44,6 +44,31 @@ def minimal_config_payload(**updates) -> dict[str, object]:
     }
     payload.update(updates)
     return payload
+
+
+def test_train_and_test_tasks_derive_from_the_panels():
+    # The redesign train/test vocabulary (§5/§12) is a derivation off the
+    # promotion/regression_veto panels -- no schema change, additive to panels[].
+    config = HarnessConfig.model_validate(
+        minimal_config_payload(
+            panels=[
+                promotion_panel(["task-a", "task-b"]),
+                regression_veto_panel(["task-c"]),
+            ]
+        )
+    )
+    assert config.train_tasks == frozenset({"task-a", "task-b"})
+    assert config.test_tasks == frozenset({"task-c"})
+    # Disjoint by construction (panel_contract_is_valid enforces it).
+    assert config.train_tasks.isdisjoint(config.test_tasks)
+
+
+def test_test_tasks_is_empty_without_a_veto_panel():
+    # A config with only a promotion panel has no test panel; test_tasks is empty
+    # (scan() rejects that at World-build time per §12, not config-load).
+    config = HarnessConfig.model_validate(minimal_config_payload())
+    assert config.train_tasks == frozenset({"task-a"})
+    assert config.test_tasks == frozenset()
 
 
 def test_harness_config_accepts_literal_narrow_loop_shape():
@@ -294,7 +319,7 @@ def test_harness_config_accepts_chatgpt_codex_provider():
             "model_name": "gpt-5.5",
             "max_context_length": 200000,
             "reasoning_effort": "low",
-            "service_tier": "priority",
+            "service_tier": "standard",
         }
     )
 
@@ -303,7 +328,7 @@ def test_harness_config_accepts_chatgpt_codex_provider():
     assert config.llm_provider_config.provider == "chatgpt_codex"
     assert config.llm_provider_config.model_name == "gpt-5.5"
     assert config.llm_provider_config.max_context_length == 200000
-    assert config.llm_provider_config.service_tier == "priority"
+    assert config.llm_provider_config.service_tier == "standard"
 
 
 def test_harness_config_rejects_openrouter_priority_service_tier():

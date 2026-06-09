@@ -7,9 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.adapters.llm_base import LlmCompletion
-from src.harness.contracts import RawState
-from src.metrics import FailureMode, TaskMetrics
+from src.llm.base import LlmCompletion
+from src.contracts import FailureMode, RawState, TaskMetrics
 from src.serialization import json_safe
 
 STEP_TRACE_FILENAME = "steps.jsonl"
@@ -345,6 +344,12 @@ class HarnessRecorder:
             verifier_passed=verifier_passed,
             failure_mode=failure_mode,
         )
+
+    def rule_fired(self, rule_name: str) -> None:
+        # Trial-level rule fire (no step attribution): used by the executor's
+        # verify-ceiling env wrapper, which runs outside any agent step.
+        if self.metrics is not None:
+            self.metrics.record_rule_fire(rule_name)
 
 
 NOOP_STEP_RECORDER = StepRecorder()

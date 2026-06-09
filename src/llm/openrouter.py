@@ -12,8 +12,8 @@ from openrouter import OpenRouter as OpenRouterClient
 from openrouter import errors
 from dotenv import load_dotenv
 
-from src.adapters.infra_retry import retry_transient
-from src.adapters.llm_base import (
+from src.retry import retry_transient
+from src.llm.base import (
     BaseLlm,
     LlmCompletion,
     LlmToolCall,
@@ -24,7 +24,7 @@ from src.adapters.llm_base import (
 from src.serialization import json_safe
 
 if TYPE_CHECKING:
-    from src.harness.config import OpenRouterConfig
+    from src.config import OpenRouterConfig
 
 
 OPENROUTER_MAX_ATTEMPTS = 3

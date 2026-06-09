@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 from openrouter import components, utils
 
-import src.adapters.open_router as open_router_module
-from src.harness.config import OpenRouterConfig
+import src.llm.openrouter as open_router_module
+from src.config import OpenRouterConfig
 
 
 @dataclass

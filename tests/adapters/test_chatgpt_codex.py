@@ -9,9 +9,9 @@ from typing import Any
 import httpx
 import pytest
 
-import src.adapters.chatgpt_codex as chatgpt_codex_module
-from src.adapters.infra_retry import INFRA_RETRY_BUDGET
-from src.harness.config import ChatGptCodexConfig
+import src.llm.codex as chatgpt_codex_module
+from src.retry import INFRA_RETRY_BUDGET
+from src.config import ChatGptCodexConfig
 
 
 def _jwt(payload: dict[str, Any]) -> str:

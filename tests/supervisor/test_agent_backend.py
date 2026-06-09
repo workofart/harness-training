@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.control.agent_backend import (
+from src.supervisor.agent_backend import (
     ClaudeBackend,
     CodexBackend,
     MissingThreadRollout,
@@ -34,7 +34,7 @@ def test_run_codex_turn_sets_supervisor_codex_home_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -79,7 +79,7 @@ def test_run_codex_turn_provisions_missing_supervisor_codex_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -125,7 +125,7 @@ def test_run_codex_turn_relinks_stale_supervisor_codex_home_entries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -179,7 +179,7 @@ def test_run_codex_turn_prints_agent_and_toolcall_logs_to_terminal(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -231,7 +231,7 @@ def test_run_claude_turn_prints_agent_and_toolcall_logs_to_terminal(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -278,7 +278,7 @@ def test_run_codex_turn_reports_missing_resume_thread(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -321,7 +321,7 @@ def test_run_claude_turn_reports_missing_resume_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.control.agent_backend as agent_backend_mod
+    import src.supervisor.agent_backend as agent_backend_mod
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

@@ -6,8 +6,8 @@ import asyncio
 
 import pytest
 
-from src.adapters import infra_retry
-from src.adapters.infra_retry import retry_transient
+from src import retry as infra_retry
+from src.retry import retry_transient
 
 
 def _no_sleep(monkeypatch) -> None:

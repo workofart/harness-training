@@ -6,13 +6,14 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DEFAULT_HARNESS_CONFIG_PATH = (
-    Path(__file__).resolve().parents[2] / "config" / "harness_config.json"
+    Path(__file__).resolve().parents[1] / "config" / "harness_config.json"
 )
 ReasoningEffort = Literal["none", "low", "medium", "high"]
 OpenRouterServiceTier = Literal["auto", "default", "flex"]
-ChatGptCodexServiceTier = Literal["auto", "default", "flex", "priority"]
+ChatGptCodexServiceTier = Literal["auto", "default", "flex", "priority", "standard"]
 PanelPurpose = Literal["promotion", "regression_veto"]
 PanelRunStatus = Literal["keep", "discard", "crash"]
+PanelLifecycle = Literal["pending", "active", "finished", "skipped"]
 
 
 class OpenRouterProviderRouting(BaseModel):
@@ -155,6 +156,25 @@ class PanelConfig(BaseModel):
     task_timeout_sec: float = Field(default=600.0, gt=0)
     run: PanelRunConfig = Field(default_factory=lambda: PanelRunConfig(when="always"))
     baseline: PanelBaselineConfig = Field(default_factory=PanelBaselineConfig)
+
+    # Runtime policy derived from run/baseline so the runner consumes PanelConfig
+    # directly with no separate compiled mirror. Declared as @property (not Fields)
+    # so the persisted config schema is unaffected.
+    @property
+    def initial_lifecycle(self) -> PanelLifecycle:
+        return "active" if self.run.when == "always" else "pending"
+
+    @property
+    def after_panel(self) -> str | None:
+        return None if self.run.when == "always" else self.run.after_panel
+
+    @property
+    def when_status(self) -> PanelRunStatus | None:
+        return None if self.run.when == "always" else self.run.when_status
+
+    @property
+    def requires_baseline(self) -> bool:
+        return self.baseline.required
 
 
 class ExcludedTaskGroup(BaseModel):
@@ -308,3 +328,22 @@ class HarnessConfig(BaseModel):
             (panel for panel in self.panels if panel.purpose == "regression_veto"),
             None,
         )
+
+    @property
+    def train_tasks(self) -> frozenset[str]:
+        # The promotion panel's task set -- what `auto` runs as the train panel
+        # and `gate(.., purpose="promotion")` scores. Derived from panels, not a
+        # separate persisted field, so the new `supervisor` consumes the redesign
+        # train/test vocabulary (§5/§12) while the config schema is unchanged and
+        # the old stack keeps reading `panels[]`. Always non-empty (promotion
+        # `task_names` has min_length 1).
+        return frozenset(self.promotion_panel.task_names)
+
+    @property
+    def test_tasks(self) -> frozenset[str]:
+        # The regression-veto panel's task set; empty when no veto panel is
+        # configured. `scan()` asserts both panels non-empty + disjoint when it
+        # builds `World` (§12); panel disjointness itself is already enforced by
+        # `panel_contract_is_valid`.
+        veto = self.regression_veto_panel
+        return frozenset() if veto is None else frozenset(veto.task_names)

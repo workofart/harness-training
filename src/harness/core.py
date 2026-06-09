@@ -2,12 +2,13 @@
 Harness policy core.
 
 Public critical path from `uv run exp`:
-- `src.cli.main_exp()` loads runtime config and constructs
-  `src.experiment.runner.ExperimentRunner`.
-- `ExperimentRunner.run()` creates the experiment record, resolves task dirs,
-  and runs the train panel.
-- `src.experiment.trial.run_task()` owns reset, timeout, artifact paths,
-  tracing/metrics, cleanup, and the returned `TaskResult`.
+- `src.cli.main_exp()` loads runtime config and runs the experiment
+  orchestrator over the task set.
+- `src.experiment.orchestrator` schedules trials (two-level concurrency,
+  admission, majority early-stop) and aggregates them into an `ExperimentResult`.
+- `src.experiment.executor.run_trial()` owns one trial: reset, the two timeouts
+  (env-setup vs agent), the verify-ceiling env wrapper, classification, cleanup,
+  and the returned `TrialResult`.
 - `run_task_loop()` owns the post-reset policy/environment loop.
 
 This module defines the loop-local design:
@@ -22,40 +23,33 @@ This module defines the loop-local design:
   `TaskLoopState`
 
 Boundary contracts:
-- Environment adapters implement `src.harness.contracts.HarnessEnv`.
-- LLM adapters implement `src.adapters.llm_base.BaseLlm`.
-- Trial results cross back to the runner as `src.harness.contracts.TaskResult`.
+- Environment adapters implement `src.contracts.HarnessEnv`.
+- LLM adapters implement `src.llm.base.BaseLlm`.
+- Trial results cross back to the orchestrator as
+  `src.experiment.record.TrialResult`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import shlex
 from abc import ABC
 from dataclasses import MISSING, asdict, dataclass, fields
-from typing import Any, ClassVar, Literal, TypeAlias
+from typing import Any, ClassVar, Literal, TypeAlias, get_args, get_type_hints
 
-from src.adapters.llm_base import BaseLlm
-from src.harness.contracts import EnvExecWorkload, HarnessEnv, RawState
-from src.trace import NOOP_HARNESS_RECORDER, NOOP_STEP_RECORDER
+from src.llm.base import BaseLlm
+from src.contracts import EnvExecWorkload, HarnessEnv, RawState
+from src.trace import (
+    NOOP_HARNESS_RECORDER,
+    NOOP_STEP_RECORDER,
+    HarnessRecorder,
+    StepRecorder,
+)
 
 
 # ============================================================================
 # Constants
 # ============================================================================
-
-# Wall ceiling for a single graded verify (run in a separate build+test env). A
-# looping/deadlocked deliverable otherwise hangs the verifier until the whole-task
-# timeout (observed: 11-28 min hangs on tasks that normally verify in seconds); the
-# ceiling fails such a grader fast and terminally. Set above the longest verify seen
-# to complete, so only a hang is cut; keyed on wall time alone, not the task.
-VERIFY_TIMEOUT_SEC: float = 900.0
-VERIFY_TIMEOUT_NOTICE = (
-    "Grading did not complete within the time limit and was stopped. A correct "
-    "solution is graded quickly; a solution that loops or blocks during grading "
-    "is treated as failing."
-)
 
 MISSING_TOOL_CALL_REPAIR_PROMPT = (
     "Your previous response omitted the required tool call. "
@@ -80,6 +74,7 @@ ActionName: TypeAlias = Literal[
     "run",
     "verify",
 ]
+JsonScalarType: TypeAlias = Literal["integer", "string"]
 
 Trajectory: TypeAlias = tuple[tuple["Action", "RawState"], ...]
 
@@ -96,17 +91,20 @@ class Action(ABC):
     """
 
     NAME: ClassVar[ActionName]
+    DESCRIPTION: ClassVar[str]
 
 
 @dataclass(frozen=True, slots=True)
 class ListDirAction(Action):
     NAME: ClassVar[Literal["list_dir"]] = "list_dir"
+    DESCRIPTION: ClassVar[str] = "List directory contents."
     path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class FindFilesAction(Action):
     NAME: ClassVar[Literal["find_files"]] = "find_files"
+    DESCRIPTION: ClassVar[str] = "Find files by filename pattern."
     pattern: str
     root: str | None = None
 
@@ -114,6 +112,7 @@ class FindFilesAction(Action):
 @dataclass(frozen=True, slots=True)
 class SearchTextAction(Action):
     NAME: ClassVar[Literal["search_text"]] = "search_text"
+    DESCRIPTION: ClassVar[str] = "Search file contents for text."
     query: str
     root: str | None = None
 
@@ -121,6 +120,7 @@ class SearchTextAction(Action):
 @dataclass(frozen=True, slots=True)
 class ReadFileAction(Action):
     NAME: ClassVar[Literal["read_file"]] = "read_file"
+    DESCRIPTION: ClassVar[str] = "Read a file, optionally by line range."
     path: str
     start_line: int | None = None
     end_line: int | None = None
@@ -129,6 +129,7 @@ class ReadFileAction(Action):
 @dataclass(frozen=True, slots=True)
 class WriteFileAction(Action):
     NAME: ClassVar[Literal["write_file"]] = "write_file"
+    DESCRIPTION: ClassVar[str] = "Write the full contents of a file."
     path: str
     content: str
 
@@ -136,6 +137,7 @@ class WriteFileAction(Action):
 @dataclass(frozen=True, slots=True)
 class EditFileAction(Action):
     NAME: ClassVar[Literal["edit_file"]] = "edit_file"
+    DESCRIPTION: ClassVar[str] = "Replace one exact text span in a file."
     path: str
     old_text: str
     new_text: str
@@ -144,6 +146,7 @@ class EditFileAction(Action):
 @dataclass(frozen=True, slots=True)
 class RunAction(Action):
     NAME: ClassVar[Literal["run"]] = "run"
+    DESCRIPTION: ClassVar[str] = "Run one shell command."
     command: str
     cwd: str | None = None
     timeout_sec: int | None = None
@@ -152,6 +155,9 @@ class RunAction(Action):
 @dataclass(frozen=True, slots=True)
 class VerifyAction(Action):
     NAME: ClassVar[Literal["verify"]] = "verify"
+    DESCRIPTION: ClassVar[str] = (
+        "Ask the environment for the authoritative task judgment."
+    )
 
 
 @dataclass(slots=True)
@@ -180,10 +186,7 @@ class TaskLoopState:
 
 
 # The 8 action dataclasses above are the single source of truth for action
-# structure. `ACTION_BY_NAME` maps the model-facing name to its class; a spec's
-# required vs optional keys are derived from the class's fields (a field with a
-# default is optional). Only the model-facing descriptions and the names of
-# integer-typed fields are declared by hand here.
+# structure, descriptions, required/optional keys, and JSON scalar types.
 ACTION_CLASSES: tuple[type[Action], ...] = (
     ListDirAction,
     FindFilesAction,
@@ -198,46 +201,44 @@ ACTION_BY_NAME: dict[ActionName, type[Action]] = {
     cls.NAME: cls for cls in ACTION_CLASSES
 }
 
-# Fields typed `int | None`; every other action field is a string. Drives both
-# the tool-spec JSON type and argument validation.
-INTEGER_FIELDS: frozenset[str] = frozenset({"start_line", "end_line", "timeout_sec"})
-
-_ACTION_DESCRIPTIONS: dict[ActionName, str] = {
-    "list_dir": "List directory contents.",
-    "find_files": "Find files by filename pattern.",
-    "search_text": "Search file contents for text.",
-    "read_file": "Read a file, optionally by line range.",
-    "write_file": "Write the full contents of a file.",
-    "edit_file": "Replace one exact text span in a file.",
-    "run": "Run one shell command.",
-    "verify": "Ask the environment for the authoritative task judgment.",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class ActionSpec:
     name: ActionName
     description: str
     required_keys: tuple[str, ...]
-    optional_keys: tuple[str, ...] = ()
+    optional_keys: tuple[str, ...]
+    json_type_by_key: dict[str, JsonScalarType]
+
+
+def _json_scalar_type(annotation: Any) -> JsonScalarType:
+    args = get_args(annotation)
+    if annotation is int or (int in args and type(None) in args):
+        return "integer"
+    return "string"
 
 
 def _action_spec(cls: type[Action]) -> ActionSpec:
+    action_fields = fields(cls)
+    type_hints = get_type_hints(cls)
     required = tuple(
         f.name
-        for f in fields(cls)
+        for f in action_fields
         if f.default is MISSING and f.default_factory is MISSING
     )
     optional = tuple(
         f.name
-        for f in fields(cls)
+        for f in action_fields
         if f.default is not MISSING or f.default_factory is not MISSING
     )
     return ActionSpec(
         name=cls.NAME,
-        description=_ACTION_DESCRIPTIONS[cls.NAME],
+        description=cls.DESCRIPTION,
         required_keys=required,
         optional_keys=optional,
+        json_type_by_key={
+            f.name: _json_scalar_type(type_hints[f.name]) for f in action_fields
+        },
     )
 
 
@@ -254,7 +255,7 @@ def build_tool_specs() -> list[dict[str, Any]]:
         properties: dict[str, Any] = {}
         for key in (*spec.required_keys, *spec.optional_keys):
             required = key in spec.required_keys
-            base = "integer" if key in INTEGER_FIELDS else "string"
+            base = spec.json_type_by_key[key]
             properties[key] = {"type": base if required else [base, "null"]}
         tools.append(
             {
@@ -298,7 +299,9 @@ def validate_action_args(action_name: ActionName, args: Any) -> dict[str, Any]:
     unknown = sorted(set(args) - allowed)
     if unknown:
         raise ValueError(f"{action_name}: unknown keys {unknown}")
-    for key in INTEGER_FIELDS & args.keys():
+    for key, value_type in spec.json_type_by_key.items():
+        if value_type != "integer" or key not in args:
+            continue
         value = args[key]
         if value is not None and not isinstance(value, int):
             raise ValueError(f"{key}: expected integer or null")
@@ -307,7 +310,7 @@ def validate_action_args(action_name: ActionName, args: Any) -> dict[str, Any]:
     # bad type surfaces as a ValueError inside act()'s repair loop, and
     # build_action can construct the dataclass from already-typed args.
     for key in (*spec.required_keys, *spec.optional_keys):
-        if key in INTEGER_FIELDS or key not in args:
+        if spec.json_type_by_key[key] == "integer" or key not in args:
             continue
         value = args[key]
         if key in required:
@@ -388,26 +391,6 @@ async def execute_action(env: HarnessEnv, action: Action) -> RawState:
         case VerifyAction():
             return await env.verify()
     raise TypeError(f"Unsupported action: {type(action).__name__}")
-
-
-async def _verify_within_ceiling(
-    env: HarnessEnv, action: VerifyAction, step_recorder: Any
-) -> RawState:
-    """Run the terminal verifier under `VERIFY_TIMEOUT_SEC`.
-
-    On expiry, returns a terminal non-passing `RawState` (the unsolved verdict the
-    task timeout would reach anyway, sooner) and records a `verify_timeout` fire.
-    Only the inner timeout is caught here; an outer task-timeout cancellation
-    passes through as `CancelledError` for upstream classification.
-    """
-    try:
-        async with asyncio.timeout(VERIFY_TIMEOUT_SEC):
-            return await execute_action(env, action)
-    except TimeoutError:
-        step_recorder.rule_fired("verify_timeout")
-        return RawState(
-            reward=0.0, done=True, passed=False, stdout=VERIFY_TIMEOUT_NOTICE
-        )
 
 
 # ============================================================================
@@ -535,7 +518,7 @@ async def act(
     working_dir: str | None,
     trajectory: Trajectory,
     max_output_retries: int,
-    recorder: Any = NOOP_STEP_RECORDER,
+    recorder: StepRecorder = NOOP_STEP_RECORDER,
 ) -> tuple[Action, ...]:
     """One LLM round-trip. Returns the typed Actions parsed from its tool calls.
 
@@ -615,7 +598,7 @@ async def run_task_loop(
     reset_state: RawState,
     max_steps: int,
     max_output_retries: int = 2,
-    recorder: Any = NOOP_HARNESS_RECORDER,
+    recorder: HarnessRecorder = NOOP_HARNESS_RECORDER,
     state: TaskLoopState,
 ) -> None:
     """Run the agent loop after environment reset, recording into `state`.
@@ -639,10 +622,7 @@ async def run_task_loop(
             action_name=action.NAME,
             action_summary=action_summary,
         )
-        if isinstance(action, VerifyAction):
-            raw_state = await _verify_within_ceiling(env, action, step_recorder)
-        else:
-            raw_state = await execute_action(env, action)
+        raw_state = await execute_action(env, action)
         step_recorder.env_step_completed(
             action_name=action.NAME,
             action_summary=action_summary,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -14,7 +15,8 @@ from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
-from src.adapters.env import (
+from src.env.docker import DockerCleanup
+from src.env.harbor import (
     Harbor,
     HarborConfig,
     TaskDirectoryResolver,
@@ -382,7 +384,7 @@ def test_harbor_verifier_applies_caps_while_preserving_verifier_env(
         verifier_env={"OMP_NUM_THREADS": "7", "CUSTOM_ENV": "set"},
     )
 
-    asyncio.run(harbor.session.verifier.verify())
+    asyncio.run(harbor.verify())
 
     chmod_env = environment.exec_calls[0]["env"]
     verifier_env = environment.exec_calls[1]["env"]
@@ -485,10 +487,11 @@ def test_harbor_close_uses_raw_environment_for_lifecycle_cleanup(
     harbor, environment = _attach_recording_harbor(tmp_path, cpus=2)
     stopped = []
 
-    async def fake_stop_environment(target):
-        stopped.append(target)
+    class _FakeDockerCleanup:
+        async def stop_environment(self, target):
+            stopped.append(target)
 
-    monkeypatch.setattr(harbor, "_stop_environment", fake_stop_environment)
+    monkeypatch.setattr(harbor, "_docker_cleanup", _FakeDockerCleanup)
 
     asyncio.run(harbor.close())
 
@@ -583,6 +586,96 @@ def test_harbor_light_exec_bypasses_shared_heavy_semaphore(tmp_path: Path) -> No
     asyncio.run(go())
 
     assert order[:2] == ["enter:heavy", "enter:light"]
+
+
+def test_harbor_exec_concurrency_never_exceeds_heavy_cap(tmp_path: Path) -> None:
+    # #1-caps (heavy): a size-N gate admits up to N concurrent heavy execs and
+    # no more. The size-1 serialize test above proves mutual exclusion; this
+    # proves the cap is the *limit* -- with cap=2 and 5 concurrent execs, peak
+    # in-flight reaches 2 (the gate does admit up to the cap) and never 3.
+    inflight = 0
+    peak = 0
+
+    async def fake_exec(*, command, cwd=None, env=None, timeout_sec=None):
+        del command, cwd, env, timeout_sec
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+        exec_semaphore=asyncio.Semaphore(2),
+    )
+    fake_session = MagicMock()
+    fake_session.environment.exec = fake_exec
+    agent_dir = tmp_path / "trial" / "agent"
+    agent_dir.mkdir(parents=True)
+    fake_session.trial_paths.agent_dir = agent_dir
+    harbor._session = fake_session
+
+    async def go():
+        await asyncio.gather(*(harbor.exec(command=f"c{i}") for i in range(5)))
+
+    asyncio.run(go())
+
+    assert peak == 2
+
+
+def test_harbor_verify_serializes_under_shared_semaphore(tmp_path: Path) -> None:
+    # #1-enforcer: verify() is heavyweight container work (a separate build+test
+    # env that can re-pull multi-GB toolchains) and must acquire the same gate as
+    # exec/reset, else a panel of concurrent trials runs N verifiers at once and
+    # oversubscribes cores. A graded verify and a heavy exec under a size-1 gate
+    # must not overlap.
+    order: list[str] = []
+
+    async def fake_exec(*, command, cwd=None, env=None, timeout_sec=None):
+        del cwd, env, timeout_sec
+        order.append(f"enter:{command}")
+        await asyncio.sleep(0.01)
+        order.append(f"exit:{command}")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    class _RecordingVerifier:
+        async def verify(self):
+            order.append("enter:verify")
+            await asyncio.sleep(0.01)
+            order.append("exit:verify")
+            return SimpleNamespace(rewards={"reward": 1.0})
+
+    harbor = Harbor(
+        HarborConfig(experiments_dir=tmp_path / "experiments"),
+        task_name="task-a",
+        task_dir=tmp_path / "task",
+        exec_semaphore=asyncio.Semaphore(1),
+    )
+    agent_dir = tmp_path / "trial" / "agent"
+    agent_dir.mkdir(parents=True)
+    harbor._session = SimpleNamespace(
+        environment=SimpleNamespace(exec=fake_exec),
+        verifier_session=_RecordingVerifier(),
+        trial_paths=SimpleNamespace(
+            agent_dir=agent_dir,
+            test_stdout_path=tmp_path / "trial" / "stdout.txt",
+            test_stderr_path=tmp_path / "trial" / "stderr.txt",
+        ),
+    )
+
+    async def go():
+        await asyncio.gather(harbor.verify(), harbor.exec(command="heavy"))
+
+    asyncio.run(go())
+
+    # verify acquires the same gate as exec -> the two never interleave.
+    assert order in (
+        ["enter:verify", "exit:verify", "enter:heavy", "exit:heavy"],
+        ["enter:heavy", "exit:heavy", "enter:verify", "exit:verify"],
+    )
 
 
 def test_harbor_reset_serializes_startup_under_shared_semaphore(
@@ -859,7 +952,7 @@ def test_harbor_verify_runs_separate_verifier_environment(
         raise AssertionError(f"prebuilt verifier image should not build: {args}")
 
     monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     result = asyncio.run(harbor.verify())
@@ -918,7 +1011,7 @@ def test_long_separate_verifier_session_ids_remain_cleanup_candidates(
         raise AssertionError(f"prebuilt verifier image should not build: {args}")
 
     monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     asyncio.run(harbor.verify())
@@ -927,11 +1020,12 @@ def test_long_separate_verifier_session_ids_remain_cleanup_candidates(
     run_id = harbor.session.trial_paths.trial_dir.name
     assert len(verifier_session_id) <= 63
     assert verifier_session_id.endswith(f"__{run_id}__verifier")
-    assert harbor._is_stale_cleanup_candidate_project(verifier_session_id)
+    cleanup = harbor._docker_cleanup()
+    assert cleanup.is_stale_cleanup_candidate_project(verifier_session_id)
 
     prefix, digest, suffix = verifier_session_id.split("__", 2)
     other_digest = "ffffffff" if digest != "ffffffff" else "00000000"
-    assert not harbor._is_stale_cleanup_candidate_project(
+    assert not cleanup.is_stale_cleanup_candidate_project(
         f"{prefix}__{other_digest}__{suffix}"
     )
 
@@ -977,7 +1071,7 @@ def test_harbor_verify_caches_dockerfile_verifier_image(
         raise AssertionError(f"unexpected docker call: {args}")
 
     monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     first = asyncio.run(harbor.verify())
@@ -1018,7 +1112,7 @@ def test_harbor_separate_verifier_applies_network_preamble_as_root_before_tests(
     )
 
     _patch_docker_image_cache(harbor, monkeypatch)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     result = asyncio.run(harbor.verify())
@@ -1057,7 +1151,7 @@ def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
     )
 
     docker_calls = _patch_docker_image_cache(harbor, monkeypatch)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     result = asyncio.run(harbor.verify())
@@ -1083,7 +1177,7 @@ def test_harbor_auto_separates_docker_task_when_task_does_not_request_mode(
 def test_harbor_auto_separate_verifier_generates_context_for_plain_tests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
+    created_envs, create_calls = _patch_lifecycle_environment_factory(monkeypatch)
     task_dir = tmp_path / "task-a"
     _write_minimal_task(task_dir)
     harbor = Harbor(
@@ -1093,7 +1187,7 @@ def test_harbor_auto_separate_verifier_generates_context_for_plain_tests(
     )
 
     docker_calls = _patch_docker_image_cache(harbor, monkeypatch)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     asyncio.run(harbor.verify())
@@ -1111,6 +1205,21 @@ def test_harbor_auto_separate_verifier_generates_context_for_plain_tests(
         "COPY . /tests/\n"
         "RUN chmod +x /tests/test.sh && mkdir -p /logs/verifier /logs/artifacts\n"
     )
+    agent_env = created_envs[0]
+    verifier_envs = created_envs[1:]
+    assert ("/app", harbor.session.trial_paths.artifacts_dir / "app") in (
+        agent_env.download_dir_calls
+    )
+    assert all(
+        (
+            harbor.session.trial_paths.artifacts_dir / "app",
+            "/app",
+        )
+        in verifier_env.upload_dir_calls
+        for verifier_env in verifier_envs
+    )
+    assert not (harbor.session.trial_paths.artifacts_dir / "app").exists()
+    assert (harbor.session.trial_paths.artifacts_dir / "manifest.json").exists()
     build_calls = [args for args in docker_calls if args[:2] == ["build", "--tag"]]
     assert len(build_calls) == 1
     assert build_calls[0][-1] == str(verifier_context.resolve())
@@ -1142,7 +1251,7 @@ def test_harbor_keeps_configured_service_task_verifier_shared(
         raise AssertionError(f"shared verifier should not build verifier image: {args}")
 
     monkeypatch.setattr(harbor, "_run_docker_cli", fail_docker_cli)
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", AsyncMock())
+    _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
     result = asyncio.run(harbor.verify())
@@ -1209,7 +1318,7 @@ def test_bootstrap_timeout_exhausts_budget_and_marks_status(
     # A persistent bootstrap timeout exhausts the within-trial budget and
     # re-raises; the only debuggable artifact (Harbor discards partial output on
     # timeout) is a status.txt marker recording the exhausted timeout.
-    from src.adapters.infra_retry import INFRA_RETRY_BUDGET
+    from src.retry import INFRA_RETRY_BUDGET
 
     monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     harbor = _stub_harbor_for_bootstrap(
@@ -1233,17 +1342,51 @@ def _stub_docker_environment(*, session_id: str) -> DockerEnvironment:
     return env
 
 
+def _docker_cleanup(
+    *,
+    tmp_path: Path,
+    task_name: str,
+    run_docker_cli,
+) -> DockerCleanup:
+    return DockerCleanup(
+        task_name=task_name,
+        environment_config=HarborConfig(
+            experiments_dir=tmp_path / "experiments"
+        ).environment,
+        run_docker_cli=run_docker_cli,
+        logger=logging.getLogger("tests.adapters.test_env.docker_cleanup"),
+    )
+
+
+def _skip_stale_docker_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    harbor: Harbor,
+):
+    cleanup = harbor._docker_cleanup()
+    cleanup.cleanup_stale_docker_compose_projects = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr(harbor, "_docker_cleanup", lambda: cleanup)
+    return cleanup.cleanup_stale_docker_compose_projects
+
+
 def test_stop_docker_environment_uses_image_preserving_compose_down(
     tmp_path: Path,
 ) -> None:
-    harbor = Harbor(
-        HarborConfig(experiments_dir=tmp_path / "experiments"),
+    async def fail_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del args, failure_context
+        raise AssertionError("docker CLI should not run when compose down succeeds")
+
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
         task_name="Task.A",
-        task_dir=tmp_path / "task",
+        run_docker_cli=fail_docker_cli,
     )
     env = _stub_docker_environment(session_id="Task.Name__Run.ID")
 
-    asyncio.run(harbor._stop_environment(env))
+    asyncio.run(cleanup.stop_environment(env))
 
     env._run_docker_compose_command.assert_awaited_once_with(
         ["down", "--volumes", "--remove-orphans"]
@@ -1255,11 +1398,6 @@ def test_stop_docker_environment_fallback_cleans_only_same_compose_project(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    harbor = Harbor(
-        HarborConfig(experiments_dir=tmp_path / "experiments"),
-        task_name="task-a",
-        task_dir=tmp_path / "task",
-    )
     env = _stub_docker_environment(session_id="Task.Name__Run.ID")
     env._run_docker_compose_command = AsyncMock(
         side_effect=RuntimeError("compose network cleanup failed")
@@ -1289,9 +1427,13 @@ def test_stop_docker_environment_fallback_cleans_only_same_compose_project(
             return ExecResult(stdout="network-1\n", return_code=0)
         return ExecResult(stdout="", return_code=0)
 
-    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
 
-    asyncio.run(harbor._stop_environment(env))
+    asyncio.run(cleanup.stop_environment(env))
 
     assert "recovered via label fallback" in caplog.text
     assert "compose network cleanup failed" in caplog.text
@@ -1324,11 +1466,6 @@ def test_stop_docker_environment_raises_when_compose_and_fallback_cleanup_fail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    harbor = Harbor(
-        HarborConfig(experiments_dir=tmp_path / "experiments"),
-        task_name="task-a",
-        task_dir=tmp_path / "task",
-    )
     env = _stub_docker_environment(session_id="task-a__run-id")
     env._run_docker_compose_command = AsyncMock(
         side_effect=RuntimeError("compose down failed")
@@ -1342,21 +1479,20 @@ def test_stop_docker_environment_raises_when_compose_and_fallback_cleanup_fail(
         del failure_context
         raise RuntimeError("docker API unavailable")
 
-    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
 
     with pytest.raises(RuntimeError, match="Docker cleanup failed"):
-        asyncio.run(harbor._stop_environment(env))
+        asyncio.run(cleanup.stop_environment(env))
 
 
 def test_cleanup_stale_docker_projects_selects_stopped_agent_and_verifier_projects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    harbor = Harbor(
-        HarborConfig(experiments_dir=tmp_path / "experiments"),
-        task_name="Task.A",
-        task_dir=tmp_path / "task",
-    )
     removed_projects: list[str] = []
 
     async def fake_docker_cli(
@@ -1425,10 +1561,14 @@ def test_cleanup_stale_docker_projects_selects_stopped_agent_and_verifier_projec
     async def fake_cleanup(project_name: str) -> None:
         removed_projects.append(project_name)
 
-    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
-    monkeypatch.setattr(harbor, "_cleanup_docker_project_by_label", fake_cleanup)
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="Task.A",
+        run_docker_cli=fake_docker_cli,
+    )
+    monkeypatch.setattr(cleanup, "cleanup_docker_project_by_label", fake_cleanup)
 
-    asyncio.run(harbor._cleanup_stale_docker_compose_projects())
+    asyncio.run(cleanup.cleanup_stale_docker_compose_projects())
 
     assert removed_projects == [
         "task-a__20260603-120000-abcdef12",
@@ -1440,11 +1580,6 @@ def test_cleanup_stale_docker_projects_skips_malformed_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    harbor = Harbor(
-        HarborConfig(experiments_dir=tmp_path / "experiments"),
-        task_name="task-a",
-        task_dir=tmp_path / "task",
-    )
     removed_projects: list[str] = []
 
     async def fake_docker_cli(
@@ -1475,12 +1610,280 @@ def test_cleanup_stale_docker_projects_skips_malformed_rows(
     async def fake_cleanup(project_name: str) -> None:
         removed_projects.append(project_name)
 
-    monkeypatch.setattr(harbor, "_run_docker_cli", fake_docker_cli)
-    monkeypatch.setattr(harbor, "_cleanup_docker_project_by_label", fake_cleanup)
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+    monkeypatch.setattr(cleanup, "cleanup_docker_project_by_label", fake_cleanup)
 
-    asyncio.run(harbor._cleanup_stale_docker_compose_projects())
+    asyncio.run(cleanup.cleanup_stale_docker_compose_projects())
 
     assert removed_projects == ["task-a__20260603-120001-abcdef12"]
+
+
+def test_cleanup_stale_docker_projects_ignores_idempotent_docker_cleanup_races(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stale_project = "task-a__20260603-120000-abcdef12"
+    calls: list[list[str]] = []
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        del failure_context
+        calls.append(args)
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ]:
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "ID": "container-1",
+                        "State": "exited",
+                        "Labels": f"com.docker.compose.project={stale_project}",
+                    }
+                ),
+                stderr=None,
+            )
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ]:
+            return ExecResult(return_code=0, stdout="container-1\n", stderr=None)
+        if args == [
+            "container",
+            "rm",
+            "--force",
+            "--volumes",
+            "container-1",
+        ]:
+            raise RuntimeError(
+                "Docker cleanup command failed. Command: docker container rm "
+                "--force --volumes container-1. Return code: 1. Output: "
+                "Error response from daemon: removal of container container-1 "
+                "is already in progress\n."
+            )
+        if args == [
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ]:
+            return ExecResult(return_code=0, stdout="", stderr=None)
+        if args == [
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ]:
+            return ExecResult(return_code=0, stdout="network-1\n", stderr=None)
+        if args == ["network", "rm", "network-1"]:
+            raise RuntimeError(
+                "Docker cleanup command failed. Command: docker network rm "
+                "network-1. Return code: 1. Output: Error response from "
+                "daemon: network network-1 not found\nexit status 1\n."
+            )
+        return ExecResult(return_code=0, stdout="", stderr=None)
+
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+
+    asyncio.run(cleanup.cleanup_stale_docker_compose_projects())
+
+    assert "Failed to clean stale Docker compose project" not in caplog.text
+    assert calls == [
+        [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ],
+        [
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ],
+        [
+            "container",
+            "rm",
+            "--force",
+            "--volumes",
+            "container-1",
+        ],
+        [
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ],
+        [
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={stale_project}",
+        ],
+        ["network", "rm", "network-1"],
+    ]
+
+
+def test_cleanup_stale_docker_projects_serializes_same_task_cleanup(
+    tmp_path: Path,
+) -> None:
+    stale_project = "task-a__20260603-120000-abcdef12"
+    active_stale_listings = 0
+    max_active_stale_listings = 0
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        nonlocal active_stale_listings, max_active_stale_listings
+        del failure_context
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ]:
+            active_stale_listings += 1
+            max_active_stale_listings = max(
+                max_active_stale_listings,
+                active_stale_listings,
+            )
+            await asyncio.sleep(0.01)
+            active_stale_listings -= 1
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "ID": "container-1",
+                        "State": "exited",
+                        "Labels": f"com.docker.compose.project={stale_project}",
+                    }
+                ),
+                stderr=None,
+            )
+        return ExecResult(return_code=0, stdout="", stderr=None)
+
+    cleanup_a = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+    cleanup_b = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+
+    async def go() -> None:
+        await asyncio.gather(
+            cleanup_a.cleanup_stale_docker_compose_projects(),
+            cleanup_b.cleanup_stale_docker_compose_projects(),
+        )
+
+    asyncio.run(go())
+
+    assert max_active_stale_listings == 1
+
+
+def test_cleanup_stale_docker_projects_waits_for_same_task_environment_teardown(
+    tmp_path: Path,
+) -> None:
+    stale_project = "task-a__20260603-120000-abcdef12"
+    teardown_active = False
+    stale_listing_overlapped_teardown = False
+
+    env = _stub_docker_environment(session_id=stale_project)
+
+    async def fake_compose_down(args: list[str]) -> None:
+        nonlocal teardown_active
+        assert args == ["down", "--volumes", "--remove-orphans"]
+        teardown_active = True
+        await asyncio.sleep(0.01)
+        teardown_active = False
+
+    env._run_docker_compose_command = AsyncMock(side_effect=fake_compose_down)
+
+    async def fake_docker_cli(
+        args: list[str],
+        *,
+        failure_context: str = "Docker command failed",
+    ) -> ExecResult:
+        nonlocal stale_listing_overlapped_teardown
+        del failure_context
+        if args == [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{json .}}",
+        ]:
+            stale_listing_overlapped_teardown = (
+                stale_listing_overlapped_teardown or teardown_active
+            )
+            return ExecResult(
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "ID": "container-1",
+                        "State": "exited",
+                        "Labels": f"com.docker.compose.project={stale_project}",
+                    }
+                ),
+                stderr=None,
+            )
+        return ExecResult(return_code=0, stdout="", stderr=None)
+
+    cleanup = _docker_cleanup(
+        tmp_path=tmp_path,
+        task_name="task-a",
+        run_docker_cli=fake_docker_cli,
+    )
+
+    async def go() -> None:
+        stop = asyncio.create_task(cleanup.stop_environment(env))
+        await asyncio.sleep(0)
+        await cleanup.cleanup_stale_docker_compose_projects()
+        await stop
+
+    asyncio.run(go())
+
+    assert not stale_listing_overlapped_teardown
 
 
 def test_harbor_reset_runs_stale_docker_project_cleanup(
@@ -1495,8 +1898,7 @@ def test_harbor_reset_runs_stale_docker_project_cleanup(
         task_name="task-a",
         task_dir=task_dir,
     )
-    cleanup = AsyncMock()
-    monkeypatch.setattr(harbor, "_cleanup_stale_docker_compose_projects", cleanup)
+    cleanup = _skip_stale_docker_cleanup(monkeypatch, harbor)
 
     asyncio.run(harbor.reset())
 

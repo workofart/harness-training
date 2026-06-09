@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 
-from src.adapters.llm_base import BaseLlm, LlmCompletion
+from src.llm.base import BaseLlm, LlmCompletion
 
 
 class _FakeLlm(BaseLlm):

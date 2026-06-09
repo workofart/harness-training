@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from src.adapters.infra_retry import INFRA_RETRY_BUDGET, retry_transient
-from src.adapters.llm_base import (
+from src.retry import INFRA_RETRY_BUDGET, retry_transient
+from src.llm.base import (
     BaseLlm,
     LlmCompletion,
     LlmToolCall,
@@ -24,7 +24,7 @@ from src.adapters.llm_base import (
 )
 
 if TYPE_CHECKING:
-    from src.harness.config import ChatGptCodexConfig
+    from src.config import ChatGptCodexConfig
 
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -430,6 +430,23 @@ def _parse_sse_data(data_lines: list[str]) -> dict[str, Any] | None:
     return json.loads(data)
 
 
+def _function_call_item(
+    item: dict[str, Any], *, empty_arguments: str
+) -> tuple[str, dict[str, Any]]:
+    """Build the (id, call) pair for a `function_call` output item.
+
+    `empty_arguments` is the placeholder used when the item carries no arguments
+    yet: `""` for the streaming `output_item.added` event (deltas append onto it)
+    and `"{}"` for terminal items that are already complete.
+    """
+    item_id = str(item.get("id") or item.get("call_id"))
+    return item_id, {
+        "name": item.get("name"),
+        "arguments": item.get("arguments") or empty_arguments,
+        "call_id": item.get("call_id"),
+    }
+
+
 def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
     final_response: dict[str, Any] | None = None
     calls: dict[str, dict[str, Any]] = {}
@@ -441,12 +458,8 @@ def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
         if event_type == "response.output_item.added":
             item = event.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
-                item_id = str(item.get("id") or item.get("call_id"))
-                calls[item_id] = {
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments") or "",
-                    "call_id": item.get("call_id"),
-                }
+                item_id, call = _function_call_item(item, empty_arguments="")
+                calls[item_id] = call
         elif event_type == "response.function_call_arguments.delta":
             item_id = str(event.get("item_id"))
             if item_id in calls and isinstance(event.get("delta"), str):
@@ -500,12 +513,8 @@ def _merge_done_item(
     if not isinstance(item, dict):
         return
     if item.get("type") == "function_call":
-        item_id = str(item.get("id") or item.get("call_id"))
-        calls[item_id] = {
-            "name": item.get("name"),
-            "arguments": item.get("arguments") or "{}",
-            "call_id": item.get("call_id"),
-        }
+        item_id, call = _function_call_item(item, empty_arguments="{}")
+        calls[item_id] = call
     elif item.get("type") == "message":
         text = _text_from_content(item.get("content"))
         if text:
@@ -524,12 +533,8 @@ def _extract_final_output(
         if not isinstance(item, dict):
             continue
         if item.get("type") == "function_call":
-            item_id = str(item.get("id") or item.get("call_id"))
-            calls[item_id] = {
-                "name": item.get("name"),
-                "arguments": item.get("arguments") or "{}",
-                "call_id": item.get("call_id"),
-            }
+            item_id, call = _function_call_item(item, empty_arguments="{}")
+            calls[item_id] = call
         elif item.get("type") == "message":
             text = _text_from_content(item.get("content"))
             if text:

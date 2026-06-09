@@ -8,9 +8,10 @@ def _git_run(
     *args: str,
     cwd: Path | None = None,
     input: str | None = None,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     kwargs = {
-        "check": True,
+        "check": check,
         "capture_output": True,
         "text": True,
     }
@@ -47,14 +48,24 @@ def require_clean_worktree(*, cwd: Path | None = None) -> None:
 
 
 def git_ref_exists(*, cwd: Path | None = None, ref: str) -> bool:
-    completed = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
+    completed = _git_run(
+        "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", cwd=cwd, check=False
     )
     return completed.returncode == 0
+
+
+def resolve_ref(ref: str, *, cwd: Path | None = None) -> str:
+    return _git_stdout("rev-parse", ref, cwd=cwd).strip()
+
+
+def is_dirty(*, cwd: Path | None = None) -> bool:
+    """Whether the worktree has uncommitted changes (the predicate form of
+    :func:`require_clean_worktree`). Respects ``.gitignore``, so the gitignored
+    ``experiments/`` data dir never reads as dirty."""
+    status = _git_stdout(
+        "status", "--porcelain", "--untracked-files=all", cwd=cwd
+    ).strip()
+    return bool(status)
 
 
 def _added_lines(diff_stdout: str) -> list[str]:
@@ -78,12 +89,8 @@ def git_diff_added_lines_between(
         return []
     if not git_ref_exists(cwd=cwd, ref=head_ref):
         return []
-    completed = subprocess.run(
-        ["git", "diff", "--unified=0", base_ref, head_ref, "--", *paths],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
+    completed = _git_run(
+        "diff", "--unified=0", base_ref, head_ref, "--", *paths, cwd=cwd, check=False
     )
     if completed.returncode != 0:
         return []
@@ -100,13 +107,7 @@ def git_diff_added_lines_worktree(
     The working-tree sibling of `git_diff_added_lines_between` (which diffs two
     commits): used to scan a candidate's not-yet-committed edits.
     """
-    completed = subprocess.run(
-        ["git", "diff", "--unified=0", "--", *paths],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
+    completed = _git_run("diff", "--unified=0", "--", *paths, cwd=cwd, check=False)
     if completed.returncode != 0:
         return []
     return _added_lines(completed.stdout)
@@ -118,13 +119,7 @@ def git_show_at_head(path: str, *, cwd: Path | None = None) -> str:
     Uses `check=False` so a missing/unreadable blob raises a RuntimeError that
     carries the captured stdout+stderr, rather than an opaque CalledProcessError.
     """
-    completed = subprocess.run(
-        ["git", "show", f"HEAD:{path}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
+    completed = _git_run("show", f"HEAD:{path}", cwd=cwd, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
             f"failed to read HEAD {path}:\n"
@@ -195,6 +190,31 @@ def add_worktree(
         args.append("--detach")
     args.extend([str(worktree_path), ref])
     _git_run(*args, cwd=cwd)
+
+
+def remove_worktree(
+    worktree_path: Path, *, cwd: Path | None = None, force: bool = True
+) -> None:
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(str(worktree_path))
+    _git_run(*args, cwd=cwd)
+
+
+def merge_ff_only(commit_hash: str, *, cwd: Path | None = None) -> None:
+    """Fast-forward the current branch to `commit_hash`, refusing a 3-way merge.
+
+    The only HEAD-moving op the supervisor performs (on keep). `--ff-only` is the
+    HEAD-drift guard: if HEAD diverged so `commit_hash` can't fast-forward onto
+    it, git exits non-zero and this raises -- the caller Halts rather than merging
+    onto the read-only primary (plan.md §6/§7).
+    """
+    _git_run("merge", "--ff-only", commit_hash, cwd=cwd)
+
+
+def delete_ref(ref_name: str, *, cwd: Path | None = None) -> None:
+    _git_run("update-ref", "-d", ref_name, cwd=cwd)
 
 
 def sparse_checkout_init_no_cone(*, cwd: Path | None = None) -> None:

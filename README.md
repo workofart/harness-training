@@ -23,7 +23,7 @@ The committed default is a bounded smoke run, not benchmark-quality evidence.
 
 There are two layers here.
 - task-solving LLM
-  - A LLM provider is required because every task step sends model requests. Unless you're running a local LLM, in which case, you can extend the `src/adapters/llm_base.py` to support that yourself. Currently we support two types of LLM providers:
+  - A LLM provider is required because every task step sends model requests. Unless you're running a local LLM, in which case, you can extend the `src/llm/base.py` to support that yourself. Currently we support two types of LLM providers:
     - <details>
         <summary>OpenRouter setup</summary>
 
@@ -36,7 +36,7 @@ There are two layers here.
     - <details>
         <summary>Codex subscription setup</summary>
 
-        Run `codex login` once. The `chatgpt_codex` LLM provider (`src/adapters/chatgpt_codex.py`) reads Codex auth from `CODEX_HOME/auth.json` or `~/.codex/auth.json`
+        Run `codex login` once. The `chatgpt_codex` LLM provider (`src/llm/codex.py`) reads Codex auth from `CODEX_HOME/auth.json` or `~/.codex/auth.json`
 
     </details>
 - outer self-improving Agent
@@ -58,9 +58,9 @@ uv run exp
 It should print out a progress bar indicating the progress of this one-off experiment. Something like this:
 
 ```
-[------------------------] 0/49 tasks (0%) | trials 1/105 | solved 1/1 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 2/105 | solved 2/2 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/2 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/3 | errors 0 | active 8 | 14s elapsed, ~-- left
+[####--------------------] 10/49 tasks (20%) | trials 28/105 | solved 9/12 | errors 0 | active 8 | 1m12s elapsed, ~4m40s left
+[################--------] 33/49 tasks (67%) | trials 78/105 | solved 27/35 | errors 1 | active 8 | 5m02s elapsed, ~2m26s left
 ```
 
 ## Run Self-Improvement
@@ -69,7 +69,7 @@ Prerequisites: all experiment prerequisites, a clean committed `HEAD`, and an au
 
 For `uv run auto`, Codex is the default agent. The run provisions a separate Codex home under `../harness-experiment_supervisor/codex-home` with symlinks to your `~/.codex/auth.json` and `~/.codex/config.toml`.
 
-Warnings: `uv run auto` has no built-in budget cap, keeps running until Ctrl+C or an error, uses paid/quota-limited calls for both the self-improvement agent and task-solving LLM, runs agent CLIs without permission prompts, and hard-resets the primary worktree between baseline/candidate commits. Use a dedicated checkout.
+Warnings: `uv run auto` has no built-in budget cap, keeps running until Ctrl+C or an error, uses paid/quota-limited calls for both the self-improvement agent and task-solving LLM, runs agent CLIs without permission prompts, and runs each baseline/candidate in a throwaway sibling worktree (a kept candidate lands on the primary via fast-forward). Use a dedicated checkout.
 
 ```bash
 uv run auto
@@ -91,36 +91,29 @@ Once it starts, it should print out the self-improvement agent's thinking and to
 
 ...
 
-[------------------------] 0/49 tasks (0%) | trials 1/105 | solved 1/1 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 2/105 | solved 2/2 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/2 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/3 | errors 0 | active 8 | 14s elapsed, ~-- left
+[####--------------------] 10/49 tasks (20%) | trials 28/105 | solved 9/12 | errors 0 | active 8 | 1m12s elapsed, ~4m40s left
+[################--------] 33/49 tasks (67%) | trials 78/105 | solved 27/35 | errors 1 | active 8 | 5m02s elapsed, ~2m26s left
 ```
 
 ## Results
 
 After you've ran `uv run auto` for a while to complete a couple of iterations, you can start to examine:
-- `experiments/learning.md`: the cumulative agent-generated human-readable diagnosis memo. Then read 
-- `experiments/state.json` for the current baseline/current experiment and `experiments/<experiment_id>/experiment.json` for the verdict.
+- `experiments/learning.md`: the cumulative agent-generated human-readable diagnosis memo.
+- `experiments/<experiment_id>/experiment.json` for a run's outcome, and its `loop.json` for the keep/discard decision. The current baseline and any in-flight run are derived by scanning these files plus git.
 
-- In `experiment.json`, `status` is the run decision (`keep`, `discard`, or `crash`) and `evidence.panel_outcomes` links the verdict to representative task artifacts.
+- `experiment.json` carries `run_status` (`running`, `completed`, or `crashed`); the keep/discard decision lives alongside it in `loop.json`. Evidence linking the verdict to representative task artifacts is derived at gate time.
 - Per-trial artifacts live under `experiments/<experiment_id>/tasks/<task>/<run_id>/`.
-- Automation state/events live under `../harness-experiment_supervisor/<repo-fingerprint>/`.
+- Automation working dirs (`codex-home/`, per-repo `worktrees/`, agent thread cache) live under `../harness-experiment_supervisor/`.
 
 <details>
 <summary>Result examples</summary>
-
-```json
-{
-  "active_baseline_experiment_id": "baseline-20260525-190114",
-  "current_experiment_id": "exp-20260525-191311",
-  "updated_at": "2026-05-25T19:20:06.438753+00:00"
-}
-```
 
 ```text
 experiments/
 └── exp-.../
     ├── experiment.json
+    ├── loop.json
     └── tasks/
         └── regex-log/
             └── 20260525-215314-213b2141/
@@ -138,9 +131,9 @@ experiments/
 
 ```text
 ../harness-experiment_supervisor/
+├── codex-home/
 └── harness-experiment-<hash>/
-    ├── events.jsonl
-    ├── state.json
+    ├── worktrees/
     └── workspace/
 ```
 
