@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import time
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,6 +14,7 @@ from src.config import DEFAULT_HARNESS_CONFIG_PATH
 if TYPE_CHECKING:
     from src.env.harbor import HarborConfig
     from src.config import HarnessConfig
+    from src.experiment.record import TaskResult
 
 
 def load_strict_runtime_config(
@@ -197,6 +201,114 @@ async def _build_trial_runner(
     return trial_runner
 
 
+# --- uv run exp live progress bar -------------------------------------------
+
+_PROGRESS_BAR_WIDTH = 24
+
+
+def _format_hms(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def format_exp_progress(
+    *,
+    tasks_done: int,
+    total_tasks: int,
+    trials_done: int,
+    trials_planned: int,
+    solved: int,
+    decided: int,
+    error_trials: int,
+    in_flight: int,
+    elapsed_sec: float,
+) -> str:
+    """Render one `uv run exp` progress line.
+
+    Anchored on task completion (`tasks_done/total_tasks`): that denominator is
+    fixed so the bar never moves backward, whereas `trials_planned` shifts as the
+    majority decides early or a candidate confirms-on-fail, so trials are detail
+    text. `solved/decided` mirror the live record (`decided` = tasks with at least
+    one valid trial). ETA divides remaining tasks by the observed completion rate.
+    """
+    frac = tasks_done / total_tasks if total_tasks else 0.0
+    filled = int(frac * _PROGRESS_BAR_WIDTH)
+    bar = "#" * filled + "-" * (_PROGRESS_BAR_WIDTH - filled)
+    if tasks_done > 0 and elapsed_sec > 0:
+        remaining = _format_hms((total_tasks - tasks_done) / (tasks_done / elapsed_sec))
+        eta = f"~{remaining} left"
+    else:
+        eta = "~-- left"
+    return (
+        f"[{bar}] {tasks_done}/{total_tasks} tasks ({frac * 100:.0f}%) | "
+        f"trials {trials_done}/{trials_planned} | "
+        f"solved {solved}/{decided} | errors {error_trials} | active {in_flight} | "
+        f"{_format_hms(elapsed_sec)} elapsed, {eta}"
+    )
+
+
+class _ExpProgressBar:
+    """Live single-line `uv run exp` progress bar on stderr.
+
+    Active only when stderr is a TTY -- a direct interactive run, or an `auto`
+    cycle (the loop runs `uv run exp` under a PTY, so the bar streams through
+    live). Event-driven: `render` fires from `run_tasks`'s persist hook, once per
+    task state change, and counts only this run's `task_ids` (an `auto` veto run
+    appends to a record that already holds the train tasks). `close` caps the
+    dangling line with a newline so later stdout never appends to it.
+    """
+
+    def __init__(
+        self,
+        *,
+        task_ids: Iterable[str],
+        max_trial_concurrency: int,
+        stream=None,
+    ) -> None:
+        self._stream = sys.stderr if stream is None else stream
+        self._task_ids = list(task_ids)
+        self._max_trial_concurrency = max_trial_concurrency
+        self._enabled = bool(getattr(self._stream, "isatty", lambda: False)())
+        self._start = time.monotonic()
+        self._drawn = False
+
+    def render(self, task_results: Mapping[str, "TaskResult"]) -> None:
+        if not self._enabled:
+            return
+        scoped = [task_results[t] for t in self._task_ids if t in task_results]
+        trials_done = sum(len(t.trials) for t in scoped)
+        valid_done = sum(len(t.valid_trials) for t in scoped)
+        trials_planned = sum(t.expected_trial_count for t in scoped)
+        line = format_exp_progress(
+            tasks_done=sum(1 for t in scoped if t.is_finished),
+            total_tasks=len(self._task_ids),
+            trials_done=trials_done,
+            trials_planned=trials_planned,
+            solved=sum(t.solved_count for t in scoped),
+            decided=sum(1 for t in scoped if t.majority_solved is not None),
+            error_trials=trials_done - valid_done,
+            in_flight=max(
+                0, min(self._max_trial_concurrency, trials_planned - trials_done)
+            ),
+            elapsed_sec=time.monotonic() - self._start,
+        )
+        self._stream.write("\r\033[K" + line)
+        self._stream.flush()
+        self._drawn = True
+
+    def close(self) -> None:
+        if self._enabled and self._drawn:
+            self._stream.write("\n")
+            self._stream.flush()
+            self._drawn = False
+
+
 async def run_experiment(
     *,
     harness_config,
@@ -206,6 +318,7 @@ async def run_experiment(
     experiment_id,
     trial_runner,
     budget=None,
+    on_progress: Callable[[Mapping[str, "TaskResult"]], None] | None = None,
 ):
     """Run the selected `task_ids` into `experiment_id` -> a raw `ExperimentResult`
     (plan.md §2). `budget` is the per-task trial count (the gate's
@@ -228,6 +341,7 @@ async def run_experiment(
         max_heavy_action_concurrency=harness_config.max_heavy_action_concurrency,
         trial_runner=trial_runner,
         experiments_root=harbor_config.experiments_dir,
+        on_progress=on_progress,
     )
 
 
@@ -240,6 +354,7 @@ async def _run_exp_async(
     task_ids,
     experiment_id,
     budget,
+    on_progress=None,
 ):
     trial_runner = await _build_trial_runner(
         harness_config=harness_config,
@@ -256,6 +371,7 @@ async def _run_exp_async(
         experiment_id=experiment_id,
         trial_runner=trial_runner,
         budget=budget,
+        on_progress=on_progress,
     )
 
 
@@ -281,6 +397,10 @@ def main_exp() -> int:
     if _require_clean_worktree_for_exp():
         require_clean_worktree()
     git_commit_hash = get_head_commit()
+    bar = _ExpProgressBar(
+        task_ids=task_ids,
+        max_trial_concurrency=harness_config.max_trial_concurrency,
+    )
     try:
         result = asyncio.run(
             _run_exp_async(
@@ -291,11 +411,14 @@ def main_exp() -> int:
                 task_ids=task_ids,
                 experiment_id=experiment_id,
                 budget=budget,
+                on_progress=bar.render,
             )
         )
     except ChatGptCodexCredentialsExpiredError as exc:
+        bar.close()
         print(str(exc), file=sys.stderr)
         return CODEX_CREDENTIALS_EXPIRED_EXIT_CODE
+    bar.close()
     print(f"run status: {result.run_status}")
     print("run complete")
     return 0

@@ -58,9 +58,9 @@ uv run exp
 It should print out a progress bar indicating the progress of this one-off experiment. Something like this:
 
 ```
-[------------------------] 0/49 tasks (0%) | trials 1/105 | solved 1/1 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 2/105 | solved 2/2 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/2 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/3 | errors 0 | active 8 | 14s elapsed, ~-- left
+[####--------------------] 10/49 tasks (20%) | trials 28/105 | solved 9/12 | errors 0 | active 8 | 1m12s elapsed, ~4m40s left
+[################--------] 33/49 tasks (67%) | trials 78/105 | solved 27/35 | errors 1 | active 8 | 5m02s elapsed, ~2m26s left
 ```
 
 ## Run Self-Improvement
@@ -91,9 +91,9 @@ Once it starts, it should print out the self-improvement agent's thinking and to
 
 ...
 
-[------------------------] 0/49 tasks (0%) | trials 1/105 | solved 1/1 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 2/105 | solved 2/2 | errors 0
-[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/2 | errors 0
+[------------------------] 0/49 tasks (0%) | trials 3/105 | solved 2/3 | errors 0 | active 8 | 14s elapsed, ~-- left
+[####--------------------] 10/49 tasks (20%) | trials 28/105 | solved 9/12 | errors 0 | active 8 | 1m12s elapsed, ~4m40s left
+[################--------] 33/49 tasks (67%) | trials 78/105 | solved 27/35 | errors 1 | active 8 | 5m02s elapsed, ~2m26s left
 ```
 
 ## Results

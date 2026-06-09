@@ -417,6 +417,7 @@ async def run_tasks(
     experiments_root: Path,
     started_at: str | None = None,
     duration_priors: Mapping[str, float] | None = None,
+    on_progress: Callable[[Mapping[str, TaskResult]], None] | None = None,
 ) -> ExperimentResult:
     """Run ``task_ids`` (each to its ``budget`` trial count) -> ``ExperimentResult``.
 
@@ -427,6 +428,10 @@ async def run_tasks(
     ``completed`` again. A panel-level exception marks the record ``crashed``
     (mechanical run_status, never a keep/discard decision -- that is the auto
     layer's, in loop.json) and re-raises.
+
+    ``on_progress``, if given, is invoked with the live task mapping after every
+    persist (the initial empty record, each task state change, and the terminal
+    record) -- the orchestrator stays print-free; a caller (``cli``) renders it.
     """
     path = ExperimentResult.path(experiment_id, root=experiments_root)
     if path.exists():
@@ -448,6 +453,8 @@ async def run_tasks(
 
     def persist() -> None:
         write_experiment_result(result, root=experiments_root)
+        if on_progress is not None:
+            on_progress(result.tasks)
 
     persist()
     try:

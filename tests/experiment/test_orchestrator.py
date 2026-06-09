@@ -245,6 +245,46 @@ def test_run_tasks_appends_a_panel_without_disturbing_prior_tasks(
     assert set(reloaded.tasks) == {"train-a", "train-b", "test-a"}
 
 
+# --- the progress hook ------------------------------------------------------
+
+
+def test_run_tasks_invokes_on_progress_with_the_live_task_mapping(
+    tmp_path: Path,
+) -> None:
+    # on_progress fires from the persist hook with the live task mapping: once on
+    # the initial empty record (both tasks present, none finished) and a final
+    # time with every task finished. The orchestrator itself prints nothing.
+    async def always_solve(task_id, run_id, heavy_action_semaphore, slot_release):
+        return _trial(run_id, solved=True)
+
+    snapshots: list[tuple[int, int]] = []
+
+    def on_progress(task_results) -> None:
+        done = sum(1 for t in task_results.values() if t.is_finished)
+        snapshots.append((done, len(task_results)))
+
+    result = asyncio.run(
+        run_tasks(
+            experiment_id="exp-progress",
+            git_commit_hash="abc123",
+            task_ids=["a", "b"],
+            budget={"a": 1, "b": 1},
+            full_trial_count=1,
+            max_trial_concurrency=2,
+            max_heavy_action_concurrency=2,
+            trial_runner=always_solve,
+            experiments_root=tmp_path,
+            started_at="2026-01-01T00:00:00+00:00",
+            on_progress=on_progress,
+        )
+    )
+
+    assert result.run_status == "completed"
+    assert snapshots, "on_progress never fired"
+    assert snapshots[0] == (0, 2)  # initial persist: both tasks present, none done
+    assert snapshots[-1] == (2, 2)  # terminal persist: all finished
+
+
 # --- pure scheduling helpers ------------------------------------------------
 
 

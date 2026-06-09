@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from src import cli
-from src.experiment.record import ExperimentResult, TrialResult
+from src.experiment.record import ExperimentResult, TaskResult, TrialResult
 
 
 async def _always_solve(task_id, run_id, heavy_action_semaphore, slot_release):
@@ -257,3 +257,71 @@ def test_load_llm_provider_secret_skips_openrouter_key_for_chatgpt():
     )
 
     assert cli._load_llm_provider_secret(harness_config=harness_config) is None
+
+
+# --- the uv run exp progress bar --------------------------------------------
+
+
+class _FakeStream:
+    def __init__(self, *, tty: bool) -> None:
+        self._tty = tty
+        self.writes: list[str] = []
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def write(self, text: str) -> None:
+        self.writes.append(text)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_format_exp_progress_anchors_on_task_completion():
+    line = cli.format_exp_progress(
+        tasks_done=12,
+        total_tasks=48,
+        trials_done=30,
+        trials_planned=105,
+        solved=11,
+        decided=12,
+        error_trials=2,
+        in_flight=6,
+        elapsed_sec=125.0,
+    )
+    # 12/48 = 25% -> 6 of 24 cells filled.
+    assert line.startswith("[" + "#" * 6 + "-" * 18 + "]")
+    assert "12/48 tasks (25%)" in line
+    assert "trials 30/105" in line
+    assert "solved 11/12" in line
+    assert "errors 2" in line
+    assert "active 6" in line
+    assert "2m05s elapsed" in line
+
+
+def test_exp_progress_bar_is_silent_off_a_tty():
+    stream = _FakeStream(tty=False)
+    bar = cli._ExpProgressBar(task_ids=["a"], max_trial_concurrency=2, stream=stream)
+    bar.render({"a": TaskResult.empty(expected_trial_count=1)})
+    bar.close()
+    assert stream.writes == []
+
+
+def test_exp_progress_bar_renders_and_scopes_to_its_own_task_ids():
+    stream = _FakeStream(tty=True)
+    bar = cli._ExpProgressBar(task_ids=["a"], max_trial_concurrency=2, stream=stream)
+    finished = TaskResult(
+        expected_trial_count=1,
+        trials=[
+            TrialResult(
+                run_id="r1", solved=True, failure_mode="solved", verifier_passed=True
+            )
+        ],
+    )
+    # The live record also holds a prior "train" task (an auto veto append); the
+    # bar must count only its own task_ids, so this reads 1/1, not 2/2.
+    bar.render({"a": finished, "train": finished})
+    assert stream.writes, "a TTY render should write"
+    assert "1/1 tasks (100%)" in stream.writes[-1]
+    bar.close()
+    assert stream.writes[-1] == "\n"  # close caps the dangling line
