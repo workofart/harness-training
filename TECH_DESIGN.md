@@ -64,9 +64,9 @@ load config → run_tasks(task_ids, budget) → write experiment.json → print 
 
 The results nest (`TrialResult ⊂ TaskResult ⊂ ExperimentResult`); the execution does not, so they stay two files with separate test seams (fake `env`+`llm` for the executor; a stub executor for the orchestrator).
 
-Two optional inputs select what runs without changing measurement: `EXP_TASK_IDS` (a task subset) and `EXP_EXPERIMENT_ID` (an existing dir to append into) let `auto` drive train and test as separate calls into one experiment dir; `EXP_EXPERIMENTS_DIR` anchors artifacts to `<main_repo>/experiments` (absolute) so a run inside a throwaway worktree is byte-for-byte equivalent to a primary run. A standalone user passes none and gets all-tasks / fresh-id. `exp` stays decision-free either way.
+Optional flags select what runs without changing measurement: `--tasks` (a task subset) and `--experiment-id` (an existing dir to append into) let `auto` drive train and test as separate calls into one experiment dir; `--experiments-dir` anchors artifacts to `<main_repo>/experiments` (absolute) so a run inside a throwaway worktree is byte-for-byte equivalent to a primary run. A standalone user passes none and gets all-tasks / fresh-id. `exp` stays decision-free either way.
 
-Runtime optimizations: decoupled two-level concurrency (trial cap vs heavy-action cap); light/heavy action split; slot-release-before-teardown; LPT scheduling from `task_duration_priors.json`; priority admission with speculative slot reservation; majority early-stop (`is_majority_decided`); deterministic-solved single-trial fast path + confirm-on-fail; separate env-setup vs agent timeout; verify-timeout ceiling (executor wrapper); CPU fanout cap from the per-task budget.
+Runtime optimizations: decoupled two-level concurrency (trial cap vs heavy-action cap); light/heavy action split; slot-release-before-teardown; LPT scheduling from `task_duration_priors.json`; LPT-priority slot grant (a freed trial slot goes to the highest-priority queued waiter, not the first arrival); majority early-stop (`is_majority_decided`); deterministic-solved single-trial fast path + confirm-on-fail; separate env-setup vs agent timeout; verify-timeout ceiling (executor wrapper); CPU fanout cap from the per-task budget.
 
 ## State model & single source of truth
 
@@ -75,7 +75,7 @@ Runtime optimizations: decoupled two-level concurrency (trial cap vs heavy-actio
 | Type | File / Layer | SSOT for | Serialized to |
 |---|---|---|---|
 | `TrialResult` | `record.py` / exp | one trial: `solved`, `error`, `failure_mode`, `verifier_passed`, artifact paths (incl. `metrics_path`), timestamps | `experiment.json` (nested) |
-| `TaskResult` | `record.py` / exp | one task = `trials: [TrialResult]` + `expected_trial_count` + derived (`solved_count`, `majority_solved`, `representative`, `is_finished`) | `experiment.json` (nested) |
+| `TaskResult` | `record.py` / exp | one task = `trials: [TrialResult]` + `expected_trial_count` + derived (`solved_count`, `majority_solved`, `is_finished`) | `experiment.json` (nested) |
 | `ExperimentResult` | `record.py` / exp | the run: id, commit, `run_status`, timestamps, `tasks: {task_id → TaskResult}` | `experiment.json` |
 | `TaskMetrics` | `contracts.py` / foundation | live per-trial **telemetry**: counters, tokens, `rule_fires` | `tasks/.../agent/metrics.json` (sole owner) |
 | `BaselineComparison` | `policy.py` / auto | one task's candidate-vs-baseline **verdict** (`kind`, counts, `p_value`) | `loop.json` (nested in `Decision.verdicts`) |
@@ -164,7 +164,7 @@ def budget_from_baseline(baseline, *, task_ids, full) -> dict[str,int]
 
 `train` is the **promotion** panel (aggregate Fisher-exact improvement at α, per-task `BaselineComparison`s as diagnostic evidence, a majority-solve floor); `test` is **regression-veto** (can only block, never promote). Promotion proposes, veto disposes. The flow: `ProposeAndLaunch` runs train → `gate(train, purpose="promotion")`; discard ⟹ `Conclude` writes `combine(train, None)` (test never runs); keep ⟹ `RunVeto` runs test → `Conclude` writes `combine(train, gate(test, "regression_veto"))`. A still-majority-solved task floors a statistical regression to unchanged; tasks with no baseline samples are no-baseline frontier tasks. The gate being pure and swappable means its statistics can be revised as a one-module change.
 
-The per-task **budget is an input** (uniform-full for `exp`/baseline; baseline-derived for candidates via `budget_from_baseline` — the deterministic-solved single-trial fast path). It crosses the `uv run exp` seam as `EXP_TRIAL_BUDGET` (JSON), which is the auto→exp transport of a value *derived* from the committed `task_trials` + the measured baseline — a scheduling optimization, not an independent measurement knob, so `commit == HEAD` stays a complete staleness check.
+The per-task **budget is an input** (uniform-full for `exp`/baseline; baseline-derived for candidates via `budget_from_baseline` — the deterministic-solved single-trial fast path). It crosses the `uv run exp` seam as `--trial-budget` (JSON), which is the auto→exp transport of a value *derived* from the committed `task_trials` + the measured baseline — a scheduling optimization, not an independent measurement knob, so `commit == HEAD` stays a complete staleness check.
 
 **Evidence is derived on demand.** The diagnosis prompt hands the agent the raw `experiment.json` (plus its trial dirs and `learning.md`) and it reasons over those directly; the per-task `BaselineComparison` verdicts persisted in `loop.json` are the gate's own per-task evidence.
 
@@ -196,18 +196,17 @@ The supervisor never auto-recovers, resumes, or re-runs *broken* work. A run tha
 
 `uv run exp` and `uv run auto` load [config/harbor_config.toml](./config/harbor_config.toml) and [config/harness_config.json](./config/harness_config.json), load OpenRouter credentials when configured, and require a clean worktree unless `EXP_ALLOW_DIRTY_WORKTREE=1`.
 
-`HarnessConfig` (`src/config.py`) is strict `schema_version: 2`. Key fields:
+`HarnessConfig` (`src/config.py`) is strict `schema_version: 3`. Key fields:
 
-- `panels`: the task panels (see contract below). `train_tasks` / `test_tasks` are **derived properties** over the promotion / regression-veto panels — the loop reasons in train/test, the config file still validates panels.
-- `experiment_id`: manual `uv run exp` record id; supervisor-owned during `auto`.
+- `train`: the promotion panel — what `auto` trains and gates on. `test` (optional): the held-out regression-veto panel.
 - `max_steps`, `task_trials`: per-trial action budget and independent trials per task.
 - `max_trial_concurrency`, `max_heavy_action_concurrency`: live trial bound and reset/run/verify bound.
 - `env_setup_timeout_sec`, `max_output_retries`: reset/bootstrap timeout and invalid-output repair budget.
 - `llm_provider_config`: harness model provider.
 
-Panels carry only membership (`purpose`, `task_names`) and a per-trial wall budget (`task_timeout_sec`); the promotion→veto sequencing is hardcoded in `supervisor/policy.decide()`, not configured. The mechanism label is `LoopResult.focus_name`, captured from the proposal turn — it is not a config field.
+A panel carries only membership (`task_names`) and a per-trial wall budget (`task_timeout_sec`); the promotion→veto sequencing is hardcoded in `supervisor/policy.decide()`, not configured. The mechanism label is `LoopResult.focus_name`, captured from the proposal turn — it is not a config field.
 
-Panel contract (validated at load): exactly one `purpose: "promotion"` panel and at most one `purpose: "regression_veto"`; both panel task sets non-empty and disjoint (a task cannot sit in both); panel task sets and excluded task groups disjoint.
+Validated at load: `train`, `test`, and every `excluded_task_groups` entry are pairwise disjoint (a task sits in exactly one group). `scan()` additionally requires both panels non-empty before any `auto` command runs.
 
 ## LLM providers
 

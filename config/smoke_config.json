@@ -1,24 +1,17 @@
 {
-  "schema_version": 2,
-  "experiment_id": "smoke",
-  "panels": [
-    {
-      "id": "train",
-      "purpose": "promotion",
-      "task_names": [
-        "openssl-selfsigned-cert"
-      ],
-      "task_timeout_sec": 1200.0
-    },
-    {
-      "id": "test",
-      "purpose": "regression_veto",
-      "task_names": [
-        "regex-log"
-      ],
-      "task_timeout_sec": 1800.0
-    }
-  ],
+  "schema_version": 3,
+  "train": {
+    "task_names": [
+      "openssl-selfsigned-cert"
+    ],
+    "task_timeout_sec": 1200.0
+  },
+  "test": {
+    "task_names": [
+      "regex-log"
+    ],
+    "task_timeout_sec": 1800.0
+  },
   "excluded_task_groups": {},
   "max_steps": 1000,
   "max_trial_concurrency": 6,

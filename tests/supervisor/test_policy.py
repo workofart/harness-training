@@ -215,8 +215,6 @@ def test_compare_uncompared_when_both_arms_empty() -> None:
     )
     assert verdict.kind == "uncompared"
     assert verdict.p_value is None
-    assert verdict.candidate_rate is None
-    assert verdict.baseline_rate is None
 
 
 def test_compare_first_solve_ever_is_improvement() -> None:

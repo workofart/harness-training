@@ -58,18 +58,30 @@ class RawState:
 
     Contract notes:
     - `reset()` returns `instruction` and `working_dir`.
-    - `exec()` returns one command result.
-    - `verify()` returns the authoritative terminal judgment for the task.
+    - `exec()` returns one command result (`return_code`/`stdout`/`stderr`).
+    - `verify()` returns the authoritative terminal judgment for the task
+      (`passed` + `reward`). Loop termination is the harness's call (a verify
+      action ends the trial), not an env-owned flag.
     """
 
     instruction: str = ""
     working_dir: str | None = None
     reward: float | None = None
-    done: bool = False
     passed: bool | None = None
     return_code: int | None = None
     stdout: str | None = None
     stderr: str | None = None
+
+    @property
+    def action_passed(self) -> bool | None:
+        """Whether the action that produced this state succeeded: the explicit
+        verifier judgment when present, else the command's exit status; None
+        when the state carries neither (a reset state)."""
+        if self.passed is not None:
+            return self.passed
+        if self.return_code is not None:
+            return self.return_code == 0
+        return None
 
 
 class HarnessEnv(Protocol):
@@ -108,7 +120,7 @@ class HarnessEnv(Protocol):
 class TaskMetrics(BaseModel):
     """Per-trial counters and terminal-state summary.
 
-    Mutated in place over a trial by the recorders in ``trace.py`` (which own
+    Mutated in place over a trial by the ``trace.py`` recorder (which owns
     a single instance), then frozen into the persisted ``metrics.json`` and
     carried on ``TaskResult.metrics``. Not hashed anywhere, so it is a plain
     mutable model rather than a frozen target fronted by a builder.
@@ -125,7 +137,6 @@ class TaskMetrics(BaseModel):
     token_reasoning_total: int = 0
     token_cached_input_total: int = 0
     rule_fires: dict[str, int] = Field(default_factory=dict)
-    custom_counters: dict[str, int] = Field(default_factory=dict)
     # Trial-final summary fields. Populated by the runner once `final_passed`
     # is known so the supervisor can answer "where did it die" without
     # walking steps.jsonl. `failure_mode` is one of: "solved",
@@ -157,12 +168,6 @@ class TaskMetrics(BaseModel):
             self.token_reasoning_total += usage.reasoning_tokens
         if usage.cached_input_tokens is not None:
             self.token_cached_input_total += usage.cached_input_tokens
-
-    def record_step_passed(self, raw_state: RawState) -> None:
-        """Attribute the env outcome to the most recent agent-chosen action.
-        Called only from `env_step_completed` (in-loop)."""
-        if isinstance(raw_state.passed, bool):
-            self.final_action_passed = raw_state.passed
 
     def record_rule_fire(self, rule_name: str) -> None:
         self.rule_fires[rule_name] = self.rule_fires.get(rule_name, 0) + 1

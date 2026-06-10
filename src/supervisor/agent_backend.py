@@ -3,14 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Thread
 from typing import Any, Protocol
+
+from src.supervisor.subproc import LineSplitter, StreamTimeout, run_streamed
 
 # ── shared constants ──────────────────────────────────────────────
 
@@ -249,68 +247,28 @@ def _run_streamed_process(
     extract_id: Any,
     initial_id: str | None,
 ) -> tuple[str | None, list[str], list[str]]:
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=cwd,
-        env=env,
-    )
+    """Run one agent CLI turn, rendering its JSON event stream live.
+
+    Streams via ``subproc.run_streamed`` (pipes, no PTY) and reassembles lines
+    with ``LineSplitter``: stdout lines are parsed/normalized/rendered and
+    scanned for the thread id; stderr lines are echoed with the stderr role.
+    Returns ``(resolved_id, stdout_lines, stderr_lines)``; raises
+    ``TurnTimeout`` (child killed) carrying the last id seen."""
     enabled = color_enabled()
     resolved_id = initial_id
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
-    stream_queue: Queue[tuple[str, str | None]] = Queue()
-
-    def enqueue_stream(stream_name: str, stream: Any) -> None:
-        if stream is None:
-            stream_queue.put((stream_name, None))
-            return
-        for raw_line in stream:
-            stream_queue.put((stream_name, raw_line))
-        stream_queue.put((stream_name, None))
-
-    stdout_thread = Thread(
-        target=enqueue_stream,
-        args=("stdout", process.stdout),
-        daemon=True,
-    )
-    stderr_thread = Thread(
-        target=enqueue_stream,
-        args=("stderr", process.stderr),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-
     stderr_role = f"{role} stderr"
-    stdout_done = False
-    stderr_done = False
-    deadline = time.monotonic() + timeout_sec
-    while not (stdout_done and stderr_done):
-        if time.monotonic() > deadline:
-            process.kill()
-            process.wait()
-            raise TurnTimeout(resolved_id, timeout_sec)
-        try:
-            stream_name, raw_line = stream_queue.get(timeout=0.1)
-        except Empty:
-            continue
-        if raw_line is None:
-            if stream_name == "stdout":
-                stdout_done = True
-            else:
-                stderr_done = True
-            continue
+
+    def on_line(stream_name: str, raw_line: str) -> None:
+        nonlocal resolved_id
         if stream_name == "stderr":
             stderr_chunks.append(raw_line)
             print_terminal_lines(
                 [format_line(stderr_role, raw_line.rstrip("\n"), enabled=enabled)],
                 use_stderr=True,
             )
-            continue
-
+            return
         stdout_chunks.append(raw_line)
         payload = parse_event(raw_line)
         if payload is None:
@@ -320,7 +278,7 @@ def _run_streamed_process(
                     [format_line(role, stripped, enabled=enabled)],
                     use_stderr=False,
                 )
-            continue
+            return
         event = normalize_event(payload)
         if event is not None:
             print_terminal_lines(
@@ -330,7 +288,18 @@ def _run_streamed_process(
         if extracted is not None:
             resolved_id = extracted
 
-    process.wait()
+    splitter = LineSplitter(on_line)
+    try:
+        run_streamed(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            on_chunk=splitter.on_chunk,
+        )
+    except StreamTimeout:
+        raise TurnTimeout(resolved_id, timeout_sec) from None
+    splitter.flush()
     return resolved_id, stdout_chunks, stderr_chunks
 
 

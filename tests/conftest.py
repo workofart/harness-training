@@ -49,9 +49,7 @@ class _StubEnv:
             instruction="do the thing", working_dir="/work"
         )
         self._exec_states = list(exec_states or [])
-        self._verify_state = verify_state or RawState(
-            done=True, passed=True, reward=1.0
-        )
+        self._verify_state = verify_state or RawState(passed=True, reward=1.0)
         self.trial_dir: str | None = trial_dir
         self.verifier_stdout_path: str | None = verifier_stdout_path
         self.exec_calls: list[dict[str, Any]] = []

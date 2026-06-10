@@ -255,7 +255,7 @@ def test_execute_action_read_file_uses_sed_with_explicit_line_range():
 
 def test_execute_action_read_file_uses_default_window_when_no_end_line():
     stdout = "".join(f"{line}\n" for line in range(1, 202))
-    env = _StubEnv(exec_states=[RawState(return_code=0, stdout=stdout, passed=True)])
+    env = _StubEnv(exec_states=[RawState(return_code=0, stdout=stdout)])
     result = asyncio.run(execute_action(env, ReadFileAction(path="/x", start_line=1)))
     expected_end = DEFAULT_READ_WINDOW_LINES
     assert env.exec_calls[0]["command"] == f"sed -n '1,{expected_end}p' /x"
@@ -374,7 +374,7 @@ def test_build_messages_starts_with_system_then_user():
 def test_build_messages_renders_each_step_as_assistant_then_tool():
     trajectory = (
         (ListDirAction(path="/x"), RawState(return_code=0, stdout="a\nb\n")),
-        (VerifyAction(), RawState(done=True, passed=True, reward=1.0)),
+        (VerifyAction(), RawState(passed=True, reward=1.0)),
     )
     msgs = build_messages(instruction="do", working_dir="/w", trajectory=trajectory)
     # system + user + (assistant + tool) per step
@@ -411,7 +411,7 @@ def test_build_messages_emits_alphabetically_sorted_tool_arguments():
 
 
 def test_build_messages_prefix_is_byte_stable_when_step_appended():
-    t1 = ((VerifyAction(), RawState(done=True, passed=True)),)
+    t1 = ((VerifyAction(), RawState(passed=True)),)
     t2 = (
         *t1,
         (ListDirAction(path="/x"), RawState(return_code=0, stdout="hi")),
@@ -528,7 +528,7 @@ def test_act_returns_all_calls_in_multi_tool_response():
 
 def test_run_task_loop_solved_when_verify_returns_passed_true():
     llm = _StubLlm([_completion(_tool_call("verify"))])
-    env = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
+    env = _StubEnv(verify_state=RawState(passed=True, reward=1.0))
     state = TaskLoopState()
     asyncio.run(
         run_task_loop(
@@ -547,7 +547,7 @@ def test_run_task_loop_solved_when_verify_returns_passed_true():
 
 def test_run_task_loop_unsolved_when_verify_returns_passed_false():
     llm = _StubLlm([_completion(_tool_call("verify"))])
-    env = _StubEnv(verify_state=RawState(done=True, passed=False, reward=0.0))
+    env = _StubEnv(verify_state=RawState(passed=False, reward=0.0))
     state = TaskLoopState()
     asyncio.run(
         run_task_loop(
@@ -581,8 +581,8 @@ def test_run_task_loop_unsolved_when_max_steps_reached_without_verify():
     assert env.verify_calls == 0
 
 
-def test_run_task_loop_stops_batch_when_action_returns_done_true():
-    # act() emits two calls in one turn; the first marks the trial done,
+def test_run_task_loop_stops_batch_after_verify():
+    # act() emits two calls in one turn; the first is the terminal verify,
     # so the seed's inner break must skip executing the second.
     llm = _StubLlm(
         [
@@ -592,7 +592,7 @@ def test_run_task_loop_stops_batch_when_action_returns_done_true():
             )
         ]
     )
-    env = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
+    env = _StubEnv(verify_state=RawState(passed=True, reward=1.0))
     state = TaskLoopState()
     asyncio.run(
         run_task_loop(

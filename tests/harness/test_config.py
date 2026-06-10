@@ -5,23 +5,19 @@ import pytest
 from src.config import DEFAULT_HARNESS_CONFIG_PATH, HarnessConfig
 
 
-def promotion_panel(
+def train_panel(
     task_names: list[str] | None = None,
     *,
     task_timeout_sec: float = 600.0,
 ) -> dict[str, object]:
     return {
-        "id": "train",
-        "purpose": "promotion",
         "task_names": ["task-a"] if task_names is None else task_names,
         "task_timeout_sec": task_timeout_sec,
     }
 
 
-def regression_veto_panel(task_names: list[str] | None = None) -> dict[str, object]:
+def held_out_panel(task_names: list[str] | None = None) -> dict[str, object]:
     return {
-        "id": "test",
-        "purpose": "regression_veto",
         "task_names": ["task-b"] if task_names is None else task_names,
         "task_timeout_sec": 1200.0,
     }
@@ -29,9 +25,8 @@ def regression_veto_panel(task_names: list[str] | None = None) -> dict[str, obje
 
 def minimal_config_payload(**updates) -> dict[str, object]:
     payload: dict[str, object] = {
-        "schema_version": 2,
-        "experiment_id": "exp-1",
-        "panels": [promotion_panel()],
+        "schema_version": 3,
+        "train": train_panel(),
         "llm_provider_config": {
             "provider": "openrouter",
             "model_name": "openrouter/openai/gpt-oss-20b",
@@ -42,19 +37,15 @@ def minimal_config_payload(**updates) -> dict[str, object]:
 
 
 def test_train_and_test_tasks_derive_from_the_panels():
-    # The redesign train/test vocabulary (§5/§12) is a derivation off the
-    # promotion/regression_veto panels -- no schema change, additive to panels[].
     config = HarnessConfig.model_validate(
         minimal_config_payload(
-            panels=[
-                promotion_panel(["task-a", "task-b"]),
-                regression_veto_panel(["task-c"]),
-            ]
+            train=train_panel(["task-a", "task-b"]),
+            test=held_out_panel(["task-c"]),
         )
     )
     assert config.train_tasks == frozenset({"task-a", "task-b"})
     assert config.test_tasks == frozenset({"task-c"})
-    # Disjoint by construction (panel_contract_is_valid enforces it).
+    # Disjoint by construction (task_groups_are_disjoint enforces it).
     assert config.train_tasks.isdisjoint(config.test_tasks)
 
 
@@ -68,7 +59,7 @@ def test_test_tasks_is_empty_without_a_veto_panel():
 
 def test_harness_config_accepts_literal_narrow_loop_shape():
     payload = minimal_config_payload(
-        panels=[promotion_panel(task_timeout_sec=30.0)],
+        train=train_panel(task_timeout_sec=30.0),
         max_steps=20,
         max_trial_concurrency=3,
         max_output_retries=4,
@@ -76,12 +67,11 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
 
     config = HarnessConfig.model_validate(payload)
 
-    assert config.experiment_id == "exp-1"
-    assert config.promotion_panel.task_names == ["task-a"]
-    assert config.regression_veto_panel is None
+    assert config.train.task_names == ["task-a"]
+    assert config.test is None
     assert config.max_steps == 20
     assert config.max_trial_concurrency == 3
-    assert config.promotion_panel.task_timeout_sec == 30.0
+    assert config.train.task_timeout_sec == 30.0
     assert config.env_setup_timeout_sec == 600.0  # default applied when omitted
     assert config.max_output_retries == 4
     assert config.llm_provider_config.service_tier is None
@@ -89,34 +79,33 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
 
 def test_default_harness_config_matches_baseline_run_profile():
     config = HarnessConfig.model_validate_json(DEFAULT_HARNESS_CONFIG_PATH.read_text())
-    test_panel = config.regression_veto_panel
+    held_out = config.test
     ignored_group = config.excluded_task_groups["ignored"]
     slow_group = config.excluded_task_groups["slow"]
     contamination_group = config.excluded_task_groups["contamination_risk"]
     cyber_group = config.excluded_task_groups["cyber_risk_unactionable"]
 
-    assert [panel.id for panel in config.panels] == ["train", "test"]
-    assert len(config.promotion_panel.task_names) == 59
-    assert test_panel is not None
-    assert len(test_panel.task_names) == 10
+    assert len(config.train.task_names) == 59
+    assert held_out is not None
+    assert len(held_out.task_names) == 10
     assert len(ignored_group.task_names) == 2
     assert len(slow_group.task_names) == 15
     assert len(cyber_group.task_names) == 2
     assert contamination_group.task_names == ["reshard-c4-data"]
-    assert set(config.promotion_panel.task_names).isdisjoint(test_panel.task_names)
-    assert set(config.promotion_panel.task_names).isdisjoint(ignored_group.task_names)
-    assert set(config.promotion_panel.task_names).isdisjoint(slow_group.task_names)
-    assert set(test_panel.task_names).isdisjoint(ignored_group.task_names)
-    assert set(test_panel.task_names).isdisjoint(slow_group.task_names)
+    assert set(config.train.task_names).isdisjoint(held_out.task_names)
+    assert set(config.train.task_names).isdisjoint(ignored_group.task_names)
+    assert set(config.train.task_names).isdisjoint(slow_group.task_names)
+    assert set(held_out.task_names).isdisjoint(ignored_group.task_names)
+    assert set(held_out.task_names).isdisjoint(slow_group.task_names)
     assert set(ignored_group.task_names).isdisjoint(slow_group.task_names)
-    assert set(cyber_group.task_names).isdisjoint(config.promotion_panel.task_names)
-    assert set(cyber_group.task_names).isdisjoint(test_panel.task_names)
+    assert set(cyber_group.task_names).isdisjoint(config.train.task_names)
+    assert set(cyber_group.task_names).isdisjoint(held_out.task_names)
     assert set(cyber_group.task_names).isdisjoint(ignored_group.task_names)
     assert set(cyber_group.task_names).isdisjoint(slow_group.task_names)
     assert (
         len(
-            set(config.promotion_panel.task_names)
-            | set(test_panel.task_names)
+            set(config.train.task_names)
+            | set(held_out.task_names)
             | set(ignored_group.task_names)
             | set(slow_group.task_names)
             | set(contamination_group.task_names)
@@ -124,19 +113,19 @@ def test_default_harness_config_matches_baseline_run_profile():
         )
         == 89
     )
-    assert "gpt2-codegolf" in test_panel.task_names
-    assert "configure-git-webserver" in test_panel.task_names
+    assert "gpt2-codegolf" in held_out.task_names
+    assert "configure-git-webserver" in held_out.task_names
     assert "break-filter-js-from-html" in ignored_group.task_names
     assert "pytorch-model-cli" in ignored_group.task_names
     assert "vulnerable-secret" in cyber_group.task_names
     assert "model-extraction-relu-logits" in cyber_group.task_names
     assert "qemu-startup" in slow_group.task_names
-    assert "financial-document-processor" in config.promotion_panel.task_names
-    assert "dna-assembly" in config.promotion_panel.task_names
+    assert "financial-document-processor" in config.train.task_names
+    assert "dna-assembly" in config.train.task_names
     assert config.max_trial_concurrency == 30
     assert config.max_heavy_action_concurrency == 10
-    assert config.promotion_panel.task_timeout_sec == 1200.0
-    assert test_panel.task_timeout_sec == 1800.0
+    assert config.train.task_timeout_sec == 1200.0
+    assert held_out.task_timeout_sec == 1800.0
     assert config.env_setup_timeout_sec == 600.0
     assert config.task_trials == 5
     assert config.llm_provider_config.provider == "chatgpt_codex"
@@ -160,6 +149,24 @@ def test_harness_config_rejects_v1_payload():
     message = str(exc.value)
     assert "schema_version" in message
     assert "train_task_names" in message
+
+
+def test_harness_config_rejects_v2_panels_payload():
+    # The v2 shape (panels[] + experiment_id) is not accepted: schema_version is
+    # a strict Literal[3] and the retired fields are extra-forbidden.
+    payload = minimal_config_payload(
+        schema_version=2,
+        experiment_id="exp-1",
+        panels=[{"id": "train", "purpose": "promotion", "task_names": ["task-a"]}],
+    )
+
+    with pytest.raises(ValueError) as exc:
+        HarnessConfig.model_validate(payload)
+
+    message = str(exc.value)
+    assert "schema_version" in message
+    assert "panels" in message
+    assert "experiment_id" in message
 
 
 def test_harness_config_accepts_provider_require_parameters():
@@ -192,35 +199,14 @@ def test_harness_config_defaults_missing_provider_to_openrouter():
 
 def test_harness_config_rejects_overlapping_task_groups():
     payload = minimal_config_payload(
-        panels=[
-            promotion_panel(["task-a"]),
-            regression_veto_panel(["task-a"]),
-        ]
+        train=train_panel(["task-a"]),
+        test=held_out_panel(["task-a"]),
     )
 
     with pytest.raises(ValueError) as exc:
         HarnessConfig.model_validate(payload)
 
-    assert "panels.train.task_names and panels.test.task_names must be disjoint" in str(
-        exc.value
-    )
-
-
-def test_harness_config_rejects_duplicate_panel_ids():
-    payload = minimal_config_payload(
-        panels=[
-            promotion_panel(["task-a"]),
-            {
-                **regression_veto_panel(["task-b"]),
-                "id": "train",
-            },
-        ]
-    )
-
-    with pytest.raises(ValueError) as exc:
-        HarnessConfig.model_validate(payload)
-
-    assert "panel ids must be unique: train" in str(exc.value)
+    assert "train.task_names and test.task_names must be disjoint" in str(exc.value)
 
 
 def test_harness_config_rejects_missing_schema_version():

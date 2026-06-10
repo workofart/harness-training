@@ -13,7 +13,7 @@ operation runs in a *fresh* worktree that is removed on exit:
   executes (the orchestrator needs all code).
 
 No long-lived synced workspace, no primary hard-reset, no ``experiments/`` symlink
-(``exp`` is handed ``EXP_EXPERIMENTS_DIR`` absolute, §12). The primary repo is
+(``exp`` is handed ``--experiments-dir`` absolute, §12). The primary repo is
 read-only except the single fast-forward on keep. This module owns only the git
 worktree/ref lifecycle + the ``test_core`` gate; the pure rules it enforces live
 in ``policy`` (``validate_candidate``/``VISIBLE_PATHS``/``EDITABLE_PATHS``).

@@ -4,8 +4,7 @@ Bottom of the experiment layer (depends only on ``contracts``). The hierarchy is
 **trial -> task -> experiment**: ``TrialResult`` is one trial's outcome,
 ``TaskResult`` aggregates a task's trials, ``ExperimentResult`` is the whole run
 keyed by task. Every roll-up (``solved_count``, ``majority_solved``,
-``representative``, ``is_finished``) is a ``@property`` derivation -- never
-stored. Owns no lifecycle transitions, no gate logic, no decisions, and no write
+``is_finished``) is a ``@property`` derivation -- never stored. Owns no lifecycle transitions, no gate logic, no decisions, and no write
 I/O: the ``writer`` persists ``experiment.json``; ``scan``/``policy`` derive all
 control state. Telemetry (``TaskMetrics``) is referenced by ``metrics_path``,
 never embedded, so ``experiment.json`` carries run-level triage on its own and
@@ -111,19 +110,6 @@ class TaskResult(BaseModel):
         # expands back to the full budget if that single trial fails.
         valid = self.valid_trials
         return bool(valid) and all(trial.solved for trial in valid)
-
-    @property
-    def representative(self) -> TrialResult | None:
-        # Prefer a valid trial matching the majority outcome (evidence). With no
-        # valid trial, surface the most recent (a crash) so its error is visible.
-        valid = self.valid_trials
-        if not valid:
-            return self.trials[-1] if self.trials else None
-        majority = self.majority_solved
-        for trial in reversed(valid):
-            if trial.solved is majority:
-                return trial
-        return valid[-1]
 
     @property
     def is_finished(self) -> bool:

@@ -1058,7 +1058,7 @@ def test_propose_and_launch_budgets_train_from_the_baseline(
 ) -> None:
     # The per-task train budget crosses the run_exp seam: a train task the baseline
     # solved on every trial starts at 1 confirming trial; an unsolved one at full
-    # (budget_from_baseline, §9 #7). This is the consume side of EXP_TRIAL_BUDGET.
+    # (budget_from_baseline, §9 #7). This is the produce side of --trial-budget.
     _green_test_core(monkeypatch)
 
     def edit_and_focus(worktree: Path) -> None:
@@ -1099,18 +1099,18 @@ def test_run_veto_runs_the_test_panel_at_the_candidate_ref(
     assert worktree != repo_root
 
 
-def test_run_exp_serializes_the_trial_budget_to_the_env(
+def test_run_exp_serializes_the_seam_to_the_command_line(
     repo_root: Path, experiments_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The real _run_exp (not the fake) hands the per-task budget across the
-    # subprocess boundary as the EXP_TRIAL_BUDGET JSON map, beside EXP_TASK_IDS /
-    # EXP_EXPERIMENT_ID / EXP_EXPERIMENTS_DIR. cli._selected_trial_budget reads it.
+    # The real _run_exp (not the fake) hands the run selection across the
+    # subprocess boundary as argv flags: --experiment-id / --tasks /
+    # --experiments-dir / --trial-budget (JSON). cli._parse_exp_args reads them.
     import json
 
-    captured: dict[str, str] = {}
+    captured: dict[str, list[str]] = {}
 
     def fake_tty(args, *, cwd, env):
-        captured.update(env)
+        captured["args"] = args
         # the orchestrator would write the record; stub it so the existence check passes
         write_experiment_result(
             _result("exp-x", commit="c0", solved_by_task={"a": True}),
@@ -1128,9 +1128,13 @@ def test_run_exp_serializes_the_trial_budget_to_the_env(
         experiments_dir=experiments_dir,
         trial_budget={"a": 1, "b": 3},
     )
-    assert json.loads(captured["EXP_TRIAL_BUDGET"]) == {"a": 1, "b": 3}
-    assert captured["EXP_TASK_IDS"] == "a,b"
-    assert captured["EXP_EXPERIMENT_ID"] == "exp-x"
+    args = captured["args"]
+    assert args[:3] == ["uv", "run", "exp"]
+    flags = dict(zip(args[3::2], args[4::2]))
+    assert flags["--experiment-id"] == "exp-x"
+    assert flags["--tasks"] == "a,b"
+    assert flags["--experiments-dir"] == str(experiments_dir.resolve())
+    assert json.loads(flags["--trial-budget"]) == {"a": 1, "b": 3}
 
 
 # --- Diagnose ---------------------------------------------------------------

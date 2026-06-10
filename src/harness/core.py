@@ -18,9 +18,9 @@ This module defines the loop-local design:
 - prompt replay from `(Action, RawState)` trajectory into chat messages
 - bounded observation rendering for stdout/stderr
 - `act()`: one model completion attempt plus configurable repair retries
-- `run_task_loop()`: execute emitted actions in order until env `done` or
-  `max_steps`, updating optional trace/metrics recorders and the caller-owned
-  `TaskLoopState`
+- `run_task_loop()`: execute emitted actions in order until a verify action
+  (the terminal judgment) or `max_steps`, updating the optional trace/metrics
+  recorder and the caller-owned `TaskLoopState`
 
 Boundary contracts:
 - Environment adapters implement `src.contracts.HarnessEnv`.
@@ -39,12 +39,7 @@ from typing import Any, ClassVar, Literal, TypeAlias, get_args, get_type_hints
 
 from src.llm.base import BaseLlm
 from src.contracts import EnvExecWorkload, HarnessEnv, RawState
-from src.trace import (
-    NOOP_HARNESS_RECORDER,
-    NOOP_STEP_RECORDER,
-    HarnessRecorder,
-    StepRecorder,
-)
+from src.trace import NOOP_RECORDER, Recorder
 
 
 # ============================================================================
@@ -518,7 +513,8 @@ async def act(
     working_dir: str | None,
     trajectory: Trajectory,
     max_output_retries: int,
-    recorder: StepRecorder = NOOP_STEP_RECORDER,
+    recorder: Recorder = NOOP_RECORDER,
+    step_index: int | None = None,
 ) -> tuple[Action, ...]:
     """One LLM round-trip. Returns the typed Actions parsed from its tool calls.
 
@@ -538,6 +534,7 @@ async def act(
             tools=tools,
         )
         recorder.completion_received(
+            step_index=step_index,
             attempt_index=attempt_index,
             request_messages=[*base_messages, *repair_messages],
             request_tools=tools,
@@ -545,6 +542,7 @@ async def act(
         )
         if not completion.tool_calls:
             recorder.action_parse_failed(
+                step_index=step_index,
                 error="MissingToolCall",
                 detail="model response omitted required tool call",
             )
@@ -564,6 +562,7 @@ async def act(
             return tuple(actions)
         except Exception as exc:
             recorder.action_parse_failed(
+                step_index=step_index,
                 error=type(exc).__name__,
                 detail=str(exc),
             )
@@ -598,7 +597,7 @@ async def run_task_loop(
     reset_state: RawState,
     max_steps: int,
     max_output_retries: int = 2,
-    recorder: HarnessRecorder = NOOP_HARNESS_RECORDER,
+    recorder: Recorder = NOOP_RECORDER,
     state: TaskLoopState,
 ) -> None:
     """Run the agent loop after environment reset, recording into `state`.
@@ -607,7 +606,8 @@ async def run_task_loop(
     caller can read the last observed outcome even when an outer
     `asyncio.timeout` cancels this coroutine mid-flight. Lifecycle concerns
     (reset, timeout, artifacts, cleanup, timestamps) live outside the harness;
-    this core loop only decides and executes actions.
+    this core loop only decides and executes actions. A verify action is the
+    terminal judgment, so it ends the loop.
     """
     trajectory: Trajectory = ()
     done = False
@@ -616,36 +616,35 @@ async def run_task_loop(
         nonlocal done, trajectory
 
         step_index = state.steps_used + 1
-        step_recorder = recorder.for_step(step_index)
-        action_summary = summarize_action(action)
-        step_recorder.action_chosen(
+        recorder.action_chosen(
+            step_index=step_index,
             action_name=action.NAME,
-            action_summary=action_summary,
+            action_summary=summarize_action(action),
         )
         raw_state = await execute_action(env, action)
-        step_recorder.env_step_completed(
+        recorder.env_step_completed(
+            step_index=step_index,
             action_name=action.NAME,
-            action_summary=action_summary,
             raw_state=raw_state,
         )
         trajectory = (*trajectory, (action, raw_state))
         state.steps_used += 1
-        done = raw_state.done
         if raw_state.reward is not None:
             state.reward = raw_state.reward
-        if raw_state.done and raw_state.passed is not None:
-            state.final_passed = raw_state.passed
+        if isinstance(action, VerifyAction):
+            done = True
+            if raw_state.passed is not None:
+                state.final_passed = raw_state.passed
 
     while state.steps_used < max_steps and not done:
-        step_index = state.steps_used + 1
-        step_recorder = recorder.for_step(step_index)
         actions = await act(
             llm=llm,
             instruction=reset_state.instruction,
             working_dir=reset_state.working_dir,
             trajectory=trajectory,
             max_output_retries=max_output_retries,
-            recorder=step_recorder,
+            recorder=recorder,
+            step_index=state.steps_used + 1,
         )
         for action in actions:
             if done or state.steps_used >= max_steps:

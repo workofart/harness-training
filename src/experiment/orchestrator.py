@@ -9,12 +9,12 @@ scheduling can be tested with a scripted stub; the real wiring (env/llm/Harbor +
 
 Scheduling is all here. Its pure decisions -- LPT launch order, the admission
 arithmetic, the confirm-on-fail predicate -- are module-level helpers unit-tested
-without the async loop. Its one stateful piece, priority admission with
-speculative slot reservation, lives in the loop because it reasons about live
-free slots. Two concurrency levels are decoupled (plan.md opt #1): the trial cap
-(``_PriorityTrialGate``) admits whole trials; the run-scoped heavy-action
-semaphore (opt #10), threaded to every trial, bounds container CPU work beneath
-it so trials idling on the LLM overlap without oversubscribing cores.
+without the async loop. Its one stateful piece is priority admission: the trial
+gate hands freed slots to the highest-priority queued waiter. Two concurrency
+levels are decoupled (plan.md opt #1): the trial cap (``_PriorityTrialGate``)
+admits whole trials; the run-scoped heavy-action semaphore (opt #10), threaded
+to every trial, bounds container CPU work beneath it so trials idling on the
+LLM overlap without oversubscribing cores.
 """
 
 from __future__ import annotations
@@ -115,10 +115,9 @@ def _wants_confirmation_expand(
 ) -> bool:
     # A task on the single-trial deterministic budget whose one trial just
     # failed: expand back to the full trial count to confirm the suspected
-    # regression. Single definition of the rule -- the admission loop commits the
-    # expand to the record, the priority gate reads it speculatively to decide
-    # whether a higher-priority task still wants a slot. One copy keeps the two
-    # consumers from drifting apart.
+    # regression. The admission loop commits the expand to the record before it
+    # plans any further admissions, so the pending-expand state never reaches
+    # `_planned_admission_count`.
     return (
         task_result.expected_trial_count == 1
         and full_trial_count > 1
@@ -127,33 +126,10 @@ def _wants_confirmation_expand(
     )
 
 
-def _effective_expected_count(
-    task_result: TaskResult,
-    *,
-    full_trial_count: int,
-) -> int:
-    # The budget a task is actually working toward: its committed
-    # expected_trial_count, or full_trial_count when a failed single
-    # deterministic trial is pending a confirmation expand the admission loop has
-    # not committed yet. Folding the pending expand into one rule lets every
-    # caller pass only config (full_trial_count).
-    if _wants_confirmation_expand(task_result, full_trial_count=full_trial_count):
-        return full_trial_count
-    return task_result.expected_trial_count
-
-
-def _planned_admission_count(
-    task_result: TaskResult,
-    *,
-    full_trial_count: int,
-) -> int:
-    # How many trials to admit toward the effective budget right now: the
-    # remaining budget, capped by the majority-threshold rule. Shared by the
-    # admission loop and the priority gate so the admission arithmetic lives in
-    # one place.
-    expected_total = _effective_expected_count(
-        task_result, full_trial_count=full_trial_count
-    )
+def _planned_admission_count(task_result: TaskResult) -> int:
+    # How many trials to admit toward the committed budget right now: the
+    # remaining budget, capped by the majority-threshold rule.
+    expected_total = task_result.expected_trial_count
     remaining = expected_total - len(task_result.trials)
     if remaining <= 0:
         return 0
@@ -180,88 +156,53 @@ def _set_trial_budget(task_result: TaskResult, *, expected_trial_count: int) -> 
 
 
 class _PriorityTrialGate:
-    """Trial-concurrency cap (opt #1 outer) with priority slot reservation (opt
-    #5): when a higher-priority task still wants a slot, a free slot is reserved
-    for it rather than handed to a lower-priority waiter that arrived first.
-    Priority is the LPT launch index (0 = longest task)."""
+    """Trial-concurrency cap (opt #1 outer) with LPT-priority admission (opt
+    #5): a freed slot goes to the queued waiter whose task has the best
+    (lowest) LPT launch index, not the waiter that arrived first, so a long
+    task's next admission wave overtakes earlier-queued short-task trials.
 
-    def __init__(
-        self,
-        *,
-        capacity: int,
-        priority_by_task: Mapping[str, int],
-        planned_admission_count_by_task: Callable[[str], int],
-    ) -> None:
+    Free slots are never held back for higher-priority demand that has not
+    queued yet: simulation over the duration priors (the real `_run_panel`
+    with prior-length trials on a virtual clock) showed that speculative
+    reservation idled slots during teardown/wave turnaround (~6% slower
+    all-solve panels) while buying nothing once waiters are priority-ordered
+    (within 0.5% across failure-mix scenarios)."""
+
+    def __init__(self, *, capacity: int, priority_by_task: Mapping[str, int]) -> None:
         self._available = capacity
         self._priority_by_task = priority_by_task
-        self._task_by_priority = {
-            priority: task_id for task_id, priority in priority_by_task.items()
-        }
-        self._planned_admission_count_by_task = planned_admission_count_by_task
         self._next_sequence = 0
-        self._admitted_by_task = {task_id: 0 for task_id in priority_by_task}
-        self._waiters: list[tuple[int, int, str, asyncio.Future[None]]] = []
-        self._grant_scheduled = False
+        self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
 
     async def acquire(self, task_id: str) -> None:
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self._admitted_by_task[task_id] += 1
+        future = asyncio.get_running_loop().create_future()
         heapq.heappush(
             self._waiters,
-            (self._priority_by_task[task_id], self._next_sequence, task_id, future),
+            (self._priority_by_task[task_id], self._next_sequence, future),
         )
         self._next_sequence += 1
-        self._schedule_grant()
+        self._grant_waiters()
         try:
             await future
         except BaseException:
             if future.done() and not future.cancelled():
-                self.release(task_id)
+                self.release()
             else:
                 future.cancel()
-                self._admitted_by_task[task_id] -= 1
-                self._schedule_grant()
             raise
 
-    def release(self, task_id: str) -> None:
-        self._admitted_by_task[task_id] -= 1
+    def release(self) -> None:
         self._available += 1
-        self._schedule_grant()
-
-    def schedule_grant(self) -> None:
-        # Public alias: a record mutation that is not itself a capacity event
-        # (a trial result, an expected-count change) can unblock a waiter the
-        # gate reserved a slot for, so the loop re-runs admission after every
-        # change.
-        self._schedule_grant()
-
-    def _schedule_grant(self) -> None:
-        if self._grant_scheduled:
-            return
-        self._grant_scheduled = True
-        asyncio.get_running_loop().call_soon(self._grant_waiters)
+        self._grant_waiters()
 
     def _grant_waiters(self) -> None:
-        self._grant_scheduled = False
         while self._available > 0 and self._waiters:
-            priority, _, _, future = self._waiters[0]
+            _, _, future = heapq.heappop(self._waiters)
             if future.done():
-                heapq.heappop(self._waiters)
+                # A cancelled waiter abandoned its queue spot.
                 continue
-            if self._has_unmet_higher_priority_admission(priority):
-                break
-            heapq.heappop(self._waiters)
             self._available -= 1
             future.set_result(None)
-
-    def _has_unmet_higher_priority_admission(self, priority: int) -> bool:
-        for higher_priority in range(priority):
-            task_id = self._task_by_priority[higher_priority]
-            desired = self._planned_admission_count_by_task(task_id)
-            if desired > self._admitted_by_task[task_id]:
-                return True
-        return False
 
 
 # --- the concurrency loop ---------------------------------------------------
@@ -281,27 +222,14 @@ async def _run_panel(
     ``TaskResult``s in ``task_results`` in place. ``persist`` writes the
     enclosing ``ExperimentResult`` after each change."""
 
-    def planned_admission_count_by_task(task_id: str) -> int:
-        return _planned_admission_count(
-            task_results[task_id], full_trial_count=full_trial_count
-        )
-
     trial_gate = _PriorityTrialGate(
         capacity=max_trial_concurrency,
         priority_by_task={task_id: index for index, task_id in enumerate(task_order)},
-        planned_admission_count_by_task=planned_admission_count_by_task,
     )
     # One run-scoped heavy-action gate, shared across every trial's env (opt
     # #1 inner / #10): the trial cap can run ahead of host-CPU capacity because
     # this bounds the concurrent heavyweight container work beneath it.
     heavy_action_semaphore = asyncio.Semaphore(max_heavy_action_concurrency)
-
-    def commit_record_change() -> None:
-        # Persist and re-run admission together: no capacity event is guaranteed
-        # to follow a record change, so every mutation must re-run admission via
-        # the gate, else a waiter unblocked purely by the change is never woken.
-        persist()
-        trial_gate.schedule_grant()
 
     async def run_one_trial(task_id: str, run_id: str) -> None:
         # Manual acquire/release (not `async with`) so the executor can hand the
@@ -317,14 +245,14 @@ async def _run_panel(
             nonlocal slot_released
             if not slot_released:
                 slot_released = True
-                trial_gate.release(task_id)
+                trial_gate.release()
 
         try:
             trial_result = await trial_runner(
                 task_id, run_id, heavy_action_semaphore, release_slot
             )
             task_results[task_id].append(trial_result)
-            commit_record_change()
+            persist()
         finally:
             release_slot()
 
@@ -342,9 +270,7 @@ async def _run_panel(
                 admission_count = remaining_budget
                 admit_all_remaining = False
             else:
-                admission_count = _planned_admission_count(
-                    task_result, full_trial_count=full_trial_count
-                )
+                admission_count = _planned_admission_count(task_result)
             if admission_count <= 0:
                 break
 
@@ -371,7 +297,7 @@ async def _run_panel(
                             task_result, expected_trial_count=full_trial_count
                         )
                         admit_all_remaining = True
-                        commit_record_change()
+                        persist()
                         break
                     decided = is_majority_decided(
                         solved=task_result.solved_count,
@@ -390,7 +316,7 @@ async def _run_panel(
                             task_result,
                             expected_trial_count=len(task_result.trials),
                         )
-                        commit_record_change()
+                        persist()
             except BaseException:
                 for pending in in_flight:
                     pending.cancel()

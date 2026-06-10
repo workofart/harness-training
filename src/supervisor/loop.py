@@ -22,15 +22,10 @@ runner.
 
 from __future__ import annotations
 
-import errno
 import json
-import locale
 import os
-import pty
-import selectors
 import subprocess
 import sys
-import tty
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,7 +35,7 @@ from typing import TYPE_CHECKING
 from src import repo
 from src.experiment.record import ExperimentResult
 from src.experiment.writer import write_json_atomic
-from src.supervisor import agent, workspace
+from src.supervisor import agent, subproc, workspace
 from src.supervisor.policy import (
     Command,
     Conclude,
@@ -369,66 +364,14 @@ def _run_with_live_tty_output(
 ) -> subprocess.CompletedProcess[str]:
     """Run ``args`` under PTYs so the child's tty-buffered progress streams to our
     stdout/stderr live while also being captured for the post-mortem on failure."""
-    encoding = locale.getencoding()
-    stdout_master, stdout_slave = pty.openpty()
-    stderr_master, stderr_slave = pty.openpty()
-    tty.setraw(stdout_slave)
-    tty.setraw(stderr_slave)
-    process = subprocess.Popen(
-        args,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=stdout_slave,
-        stderr=stderr_slave,
-        close_fds=True,
-    )
-    os.close(stdout_slave)
-    os.close(stderr_slave)
-    output_by_fd = {
-        stdout_master: (sys.stdout, []),
-        stderr_master: (sys.stderr, []),
-    }
-    selector = selectors.DefaultSelector()
-    selector.register(stdout_master, selectors.EVENT_READ)
-    selector.register(stderr_master, selectors.EVENT_READ)
-    try:
-        while selector.get_map():
-            for key, _events in selector.select():
-                try:
-                    chunk = os.read(key.fd, 8192)
-                except OSError as exc:
-                    if exc.errno != errno.EIO:
-                        raise
-                    chunk = b""
-                if not chunk:
-                    selector.unregister(key.fd)
-                    os.close(key.fd)
-                    continue
-                stream, chunks = output_by_fd[key.fd]
-                chunks.append(chunk)
-                stream.write(chunk.decode(encoding, errors="replace"))
-                stream.flush()
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=process.wait(),
-            stdout=b"".join(output_by_fd[stdout_master][1]).decode(
-                encoding, errors="replace"
-            ),
-            stderr=b"".join(output_by_fd[stderr_master][1]).decode(
-                encoding, errors="replace"
-            ),
-        )
-    finally:
-        selector.close()
-        for fd in (stdout_master, stderr_master):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+    streams = {"stdout": sys.stdout, "stderr": sys.stderr}
+
+    def on_chunk(stream_name: str, chunk: str) -> None:
+        stream = streams[stream_name]
+        stream.write(chunk)
+        stream.flush()
+
+    return subproc.run_streamed(args, cwd=cwd, env=env, use_pty=True, on_chunk=on_chunk)
 
 
 def _run_exp(
@@ -441,13 +384,12 @@ def _run_exp(
 ) -> None:
     """Launch ``uv run exp`` in ``worktree`` over ``task_ids``, appending into the
     one ``experiment_id`` dir under the absolute ``experiments_dir`` (§12 path
-    anchoring -- ``EXP_EXPERIMENTS_DIR`` keeps a worktree run byte-equivalent to a
+    anchoring -- ``--experiments-dir`` keeps a worktree run byte-equivalent to a
     primary run). ``trial_budget`` (the per-task ``budget_from_baseline`` count,
-    §9) crosses the subprocess boundary as the ``EXP_TRIAL_BUDGET`` JSON map so a
-    candidate train/veto run gets the deterministic-baseline single-trial shortcut;
-    ``cli`` honors it like ``EXP_EXPERIMENTS_DIR``. Raises
-    ``ChatGptCodexCredentialsExpiredError`` on the dead-creds halt (exit 42, needs
-    ``codex login``), a ``RuntimeError`` on any other failure, and a
+    §9) crosses the subprocess boundary as the ``--trial-budget`` JSON map so a
+    candidate train/veto run gets the deterministic-baseline single-trial shortcut.
+    Raises ``ChatGptCodexCredentialsExpiredError`` on the dead-creds halt (exit 42,
+    needs ``codex login``), a ``RuntimeError`` on any other failure, and a
     ``RuntimeError`` if the run produced no ``experiment.json``."""
     from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
@@ -455,14 +397,23 @@ def _run_exp(
         ChatGptCodexCredentialsExpiredError,
     )
 
-    env = {
-        **os.environ,
-        "EXP_EXPERIMENT_ID": experiment_id,
-        "EXP_TASK_IDS": ",".join(sorted(task_ids)),
-        "EXP_EXPERIMENTS_DIR": str(experiments_dir.resolve()),
-        "EXP_TRIAL_BUDGET": json.dumps(dict(trial_budget)),
-    }
-    completed = _run_with_live_tty_output(["uv", "run", "exp"], cwd=worktree, env=env)
+    completed = _run_with_live_tty_output(
+        [
+            "uv",
+            "run",
+            "exp",
+            "--experiment-id",
+            experiment_id,
+            "--tasks",
+            ",".join(sorted(task_ids)),
+            "--experiments-dir",
+            str(experiments_dir.resolve()),
+            "--trial-budget",
+            json.dumps(dict(trial_budget)),
+        ],
+        cwd=worktree,
+        env=dict(os.environ),
+    )
     if completed.returncode == CODEX_CREDENTIALS_EXPIRED_EXIT_CODE:
         # Dead credentials need a human; halt rather than finalizing a crash record
         # the loop would treat like a discard and re-launch into the same auth wall.

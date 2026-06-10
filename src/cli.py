@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -42,33 +43,36 @@ def _load_llm_provider_secret(
     return None
 
 
-def load_runtime_config() -> tuple[HarborConfig, HarnessConfig, str | None]:
+def load_runtime_config(
+    *, experiments_dir: str | None = None
+) -> tuple[HarborConfig, HarnessConfig, str | None]:
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
 
     harbor_config, harness_config = load_strict_runtime_config(
         harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
         harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
     )
-    harbor_config = _apply_experiments_dir_override(harbor_config)
+    harbor_config = _apply_experiments_dir_override(harbor_config, experiments_dir)
     api_key = _load_llm_provider_secret(harness_config=harness_config)
     return harbor_config, harness_config, api_key
 
 
-def _apply_experiments_dir_override(harbor_config: HarborConfig) -> HarborConfig:
-    """Honor `EXP_EXPERIMENTS_DIR` (plan.md §12 path anchoring): when `auto` runs
+def _apply_experiments_dir_override(
+    harbor_config: HarborConfig, override: str | None
+) -> HarborConfig:
+    """Honor `--experiments-dir` (plan.md §12 path anchoring): when `auto` runs
     `exp` inside a throwaway candidate worktree it passes the absolute
     `<main_repo>/experiments` so trial artifacts, `experiment.json`, and the shared
     verifier-context cache land in the one canonical dir -- never relative to the
     worktree cwd. Re-validates so the cache dir re-derives under the new root.
-    A no-op (returns the same config) when the var is unset, e.g. a standalone
+    A no-op (returns the same config) when not given, e.g. a standalone
     `uv run exp` in the primary repo."""
-    override = os.getenv("EXP_EXPERIMENTS_DIR")
     if not override:
         return harbor_config
     experiments_dir = Path(override)
     if not experiments_dir.is_absolute():  # §12: never relative to cwd
         raise ValueError(
-            f"EXP_EXPERIMENTS_DIR must be an absolute path, got: {override!r}"
+            f"--experiments-dir must be an absolute path, got: {override!r}"
         )
     payload = harbor_config.model_dump()
     payload["experiments_dir"] = experiments_dir
@@ -84,45 +88,80 @@ def _require_clean_worktree_for_exp() -> bool:
     }
 
 
-def _selected_task_ids(harness_config) -> list[str]:
-    # exp runs a task SET (plan.md §2): `EXP_TASK_IDS` (comma-separated) selects a
+def _configured_panels(harness_config) -> list:
+    panels = [harness_config.train]
+    if harness_config.test is not None:
+        panels.append(harness_config.test)
+    return panels
+
+
+def _selected_task_ids(harness_config, tasks: str | None) -> list[str]:
+    # exp runs a task SET (plan.md §2): `--tasks` (comma-separated) selects a
     # subset -- how `auto` drives train, then test, as separate calls -- and the
     # default is every configured task. exp itself stays decision-free; the §12
     # asserts that `auto` only ever passes sanctioned shapes live in the loop.
-    raw = os.getenv("EXP_TASK_IDS")
-    if raw is not None and raw.strip():
-        selected = [task_id.strip() for task_id in raw.split(",") if task_id.strip()]
+    if tasks is not None and tasks.strip():
+        selected = [task_id.strip() for task_id in tasks.split(",") if task_id.strip()]
     else:
-        selected = [t for panel in harness_config.panels for t in panel.task_names]
+        selected = [
+            t for panel in _configured_panels(harness_config) for t in panel.task_names
+        ]
     return list(dict.fromkeys(selected))
 
 
-def _selected_experiment_id() -> str:
-    # `EXP_EXPERIMENT_ID` names an existing dir to append into (auto's shared id
+def _selected_experiment_id(experiment_id: str | None) -> str:
+    # `--experiment-id` names an existing dir to append into (auto's shared id
     # across its train and test calls); a standalone run gets a fresh id (§2).
-    existing = os.getenv("EXP_EXPERIMENT_ID")
-    if existing is not None and existing.strip():
-        return existing.strip()
+    if experiment_id is not None and experiment_id.strip():
+        return experiment_id.strip()
     return f"exp-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
 
 
-def _selected_trial_budget(*, task_ids, harness_config) -> dict[str, int]:
-    # `auto` sets `EXP_TRIAL_BUDGET` (a JSON task->count map from
+def _selected_trial_budget(
+    *, task_ids, harness_config, trial_budget: str | None
+) -> dict[str, int]:
+    # `auto` passes `--trial-budget` (a JSON task->count map from
     # `budget_from_baseline`, §9) so a candidate run gets the deterministic-baseline
     # single-trial shortcut across the subprocess seam; a standalone `uv run exp`
-    # leaves it unset -> uniform-full. The loop is the only writer, so a budget that
+    # omits it -> uniform-full. The loop is the only writer, so a budget that
     # does not cover the selected task set exactly is a bug -> fail fast (§12 strict
     # interfaces) rather than silently mis-budget.
-    raw = os.getenv("EXP_TRIAL_BUDGET")
-    if raw is None or not raw.strip():
+    if trial_budget is None or not trial_budget.strip():
         return {task_id: harness_config.task_trials for task_id in task_ids}
-    budget = json.loads(raw)
+    budget = json.loads(trial_budget)
     if set(budget) != set(task_ids):
         raise ValueError(
-            f"EXP_TRIAL_BUDGET keys {sorted(budget)} != selected task ids "
+            f"--trial-budget keys {sorted(budget)} != selected task ids "
             f"{sorted(task_ids)}"
         )
     return {task_id: int(budget[task_id]) for task_id in task_ids}
+
+
+def _parse_exp_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="exp",
+        description=(
+            "Run the configured task set once and write a raw experiment record. "
+            "All flags are optional; `auto` passes them to drive train/test runs."
+        ),
+    )
+    parser.add_argument(
+        "--tasks",
+        help="comma-separated task subset (default: every configured task)",
+    )
+    parser.add_argument(
+        "--experiment-id",
+        help="existing experiment dir to append into (default: fresh exp-<timestamp>)",
+    )
+    parser.add_argument(
+        "--experiments-dir",
+        help="absolute experiments dir to anchor artifacts to (plan.md §12)",
+    )
+    parser.add_argument(
+        "--trial-budget",
+        help="per-task trial-count JSON map, e.g. '{\"task-id\": 1}'",
+    )
+    return parser.parse_args(argv)
 
 
 def _task_timeout_by_task(harness_config) -> dict[str, float]:
@@ -130,7 +169,7 @@ def _task_timeout_by_task(harness_config) -> dict[str, float]:
     # panels (config §12), so this is unambiguous for any selected subset.
     return {
         task_id: panel.task_timeout_sec
-        for panel in harness_config.panels
+        for panel in _configured_panels(harness_config)
         for task_id in panel.task_names
     }
 
@@ -322,7 +361,7 @@ async def run_experiment(
 ):
     """Run the selected `task_ids` into `experiment_id` -> a raw `ExperimentResult`
     (plan.md §2). `budget` is the per-task trial count (the gate's
-    `budget_from_baseline` for an `auto` candidate, via `EXP_TRIAL_BUDGET`);
+    `budget_from_baseline` for an `auto` candidate, via `--trial-budget`);
     `None` defaults to uniform-full (a standalone `exp`/baseline). One `run_tasks`
     call per `uv run exp` invocation; an existing `experiment_id` is appended to
     (auto's train-then-test across two calls). No baseline, gate, decision, or
@@ -375,7 +414,7 @@ async def _run_exp_async(
     )
 
 
-def main_exp() -> int:
+def main_exp(argv: Sequence[str] | None = None) -> int:
     import asyncio
     import sys
 
@@ -386,10 +425,17 @@ def main_exp() -> int:
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
     from src.repo import get_head_commit, require_clean_worktree
 
-    harbor_config, harness_config, api_key = load_runtime_config()
-    task_ids = _selected_task_ids(harness_config)
-    experiment_id = _selected_experiment_id()
-    budget = _selected_trial_budget(task_ids=task_ids, harness_config=harness_config)
+    args = _parse_exp_args(argv)
+    harbor_config, harness_config, api_key = load_runtime_config(
+        experiments_dir=args.experiments_dir
+    )
+    task_ids = _selected_task_ids(harness_config, args.tasks)
+    experiment_id = _selected_experiment_id(args.experiment_id)
+    budget = _selected_trial_budget(
+        task_ids=task_ids,
+        harness_config=harness_config,
+        trial_budget=args.trial_budget,
+    )
     print(f"experiment: {experiment_id}")
     print(f"tasks ({len(task_ids)}): {', '.join(task_ids)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
@@ -458,7 +504,7 @@ def main_auto() -> int:
     ctx = LoopContext(
         repo_root=repo_root,
         # HarborConfig resolves experiments_dir to absolute (§12 path anchoring); the
-        # loop hands it to every `uv run exp` via EXP_EXPERIMENTS_DIR. Throwaway
+        # loop hands it to every `uv run exp` via --experiments-dir. Throwaway
         # candidate worktrees live in a sibling dir so they never dirty the primary.
         experiments_dir=harbor_config.experiments_dir,
         worktree_root=supervisor_root_for_repo(repo_root) / "worktrees",

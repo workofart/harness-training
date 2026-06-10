@@ -624,7 +624,6 @@ class Harbor:
                     return_code=124,
                     stdout=None,
                     stderr=str(exc),
-                    passed=False,
                 )
             except ValueError as exc:
                 # The agent can emit action arguments that cannot be marshalled
@@ -638,14 +637,12 @@ class Harbor:
                     return_code=1,
                     stdout=None,
                     stderr=f"invalid command (cannot execute): {exc}",
-                    passed=False,
                 )
             self._append_agent_log(command=command, result=result, cwd=cwd)
             return RawState(
                 return_code=result.return_code,
                 stdout=result.stdout,
                 stderr=result.stderr,
-                passed=result.return_code == 0,
             )
 
     def _separate_verifier_session_id(self) -> str:
@@ -958,7 +955,6 @@ class Harbor:
             stderr_path = self.session.trial_paths.test_stderr_path
             return RawState(
                 reward=reward,
-                done=True,
                 passed=reward > 0.0,
                 stdout=stdout_path.read_text() if stdout_path.exists() else None,
                 stderr=stderr_path.read_text() if stderr_path.exists() else None,

@@ -132,18 +132,6 @@ class BaselineComparison(BaseModel):
     baseline_total: int
     p_value: float | None
 
-    @property
-    def candidate_rate(self) -> float | None:
-        if self.candidate_total <= 0:
-            return None
-        return self.candidate_solved / self.candidate_total
-
-    @property
-    def baseline_rate(self) -> float | None:
-        if self.baseline_total <= 0:
-            return None
-        return self.baseline_solved / self.baseline_total
-
 
 def compare_candidate_against_baseline(
     *,
