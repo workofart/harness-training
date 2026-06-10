@@ -54,9 +54,7 @@ class _VerifyCeilingEnv:
     trace-free and `core.py`'s `VerifyAction` is a bare `env.verify()`.
     """
 
-    def __init__(
-        self, inner: HarnessEnv, recorder: trace_module.HarnessRecorder
-    ) -> None:
+    def __init__(self, inner: HarnessEnv, recorder: trace_module.Recorder) -> None:
         self._inner = inner
         self._recorder = recorder
 
@@ -96,9 +94,7 @@ class _VerifyCeilingEnv:
             if ceiling is None or not ceiling.expired():
                 raise
             self._recorder.rule_fired("verify_timeout")
-            return RawState(
-                reward=0.0, done=True, passed=False, stdout=VERIFY_TIMEOUT_NOTICE
-            )
+            return RawState(reward=0.0, passed=False, stdout=VERIFY_TIMEOUT_NOTICE)
 
     async def close(self) -> None:
         await self._inner.close()
@@ -148,7 +144,7 @@ async def _close_resources(
     *,
     llm: BaseLlm,
     env: HarnessEnv,
-    recorder: trace_module.HarnessRecorder,
+    recorder: trace_module.Recorder,
 ) -> None:
     cleanup = asyncio.gather(llm.close(), env.close(), return_exceptions=True)
     while not cleanup.done():
@@ -183,9 +179,13 @@ async def run_trial(
     trial_dir = env.trial_dir
     verifier_stdout_path = env.verifier_stdout_path
     metrics_path: str | None = None
-    recorder = trace_module.NOOP_HARNESS_RECORDER
+    recorder = trace_module.NOOP_RECORDER
     reset_completed = False
 
+    # Trial outcome, finalized by exactly one of the try/except branches and
+    # assembled into the single TrialResult after cleanup.
+    solved = False
+    verifier_passed: bool | None = None
     error: str | None = None
     failure_mode: FailureMode = "crash"
     state = TaskLoopState()
@@ -201,13 +201,9 @@ async def run_trial(
         if trial_dir is None:
             raise RuntimeError("environment reset must expose trial_dir")
         if trace_path is None:
-            trace_path_for_trial, metrics_path = trace_module.task_artifact_paths(
-                trial_dir
-            )
-        else:
-            trace_path_for_trial = trace_path
-        recorder = trace_module.HarnessRecorder.create(
-            trace_path=trace_path_for_trial,
+            trace_path, metrics_path = trace_module.task_artifact_paths(trial_dir)
+        recorder = trace_module.Recorder.create(
+            trace_path=trace_path,
             metrics_path=metrics_path,
         )
         recorder.task_started(
@@ -226,19 +222,14 @@ async def run_trial(
                 state=state,
             )
         solved = state.solved
-        final_passed = state.final_passed
+        verifier_passed = state.final_passed
         verifier_stdout_path = env.verifier_stdout_path
         failure_mode = _completed_failure_mode(
             solved=solved,
-            final_passed=final_passed,
+            final_passed=verifier_passed,
             steps_used=state.steps_used,
             max_steps=max_steps,
         )
-        recorder.set_trial_outcome(
-            verifier_passed=final_passed,
-            failure_mode=failure_mode,
-        )
-        recorder.write_metrics()
         finished_at = datetime.now(timezone.utc).isoformat()
         recorder.task_finished(
             task_name=task_id,
@@ -246,25 +237,14 @@ async def run_trial(
             solved=solved,
             error=None,
             steps_used=state.steps_used,
-            final_passed=final_passed,
-        )
-        return TrialResult(
-            run_id=run_id,
-            solved=solved,
-            failure_mode=failure_mode,
-            verifier_passed=final_passed,
-            error=None,
-            trial_dir=trial_dir,
-            trace_path=trace_path_for_trial,
-            metrics_path=metrics_path,
-            verifier_stdout_path=_existing_artifact_path(verifier_stdout_path),
-            started_at=started_at,
-            finished_at=finished_at,
+            final_passed=verifier_passed,
         )
     except Exception as exc:
         # Timeout and crash exits recover the same partial state, then classify.
         # `asyncio.timeout` cancels `run_task_loop` mid-flight so it never returns
         # normally; the env's dirs are re-read for the artifact paths.
+        solved = False
+        verifier_passed = None
         trial_dir, verifier_stdout_path = _recover_artifact_paths(
             env, trial_dir=trial_dir, verifier_stdout_path=verifier_stdout_path
         )
@@ -277,7 +257,7 @@ async def run_trial(
         if trace_path is None:
             trace_path, metrics_path = trace_module.task_artifact_paths(trial_dir)
         if recorder.trace is None:
-            recorder = trace_module.HarnessRecorder.create(
+            recorder = trace_module.Recorder.create(
                 trace_path=trace_path, metrics_path=metrics_path
             )
         # Classification stays explicit: the exits carry different result
@@ -323,21 +303,23 @@ async def run_trial(
         finished_at = datetime.now(timezone.utc).isoformat()
         recorder.task_failed(exc=exc, detail=detail)
     finally:
-        # The trial result is finalized here (happy path returned it; error paths
-        # captured state into locals). Free the concurrency slot *before* the
-        # docker teardown so the next trial's `compose up` overlaps this trial's
-        # `compose down` -- teardown still runs here, in this same task.
+        # The trial outcome is finalized by this point (both branches captured it
+        # into locals). Free the concurrency slot *before* the docker teardown so
+        # the next trial's `compose up` overlaps this trial's `compose down` --
+        # teardown still runs here, in this same task.
         if slot_release is not None:
             slot_release()
         await _close_resources(llm=llm, env=env, recorder=recorder)
 
-    recorder.set_trial_outcome(verifier_passed=None, failure_mode=failure_mode)
+    recorder.set_trial_outcome(
+        verifier_passed=verifier_passed, failure_mode=failure_mode
+    )
     recorder.write_metrics()
     return TrialResult(
         run_id=run_id,
-        solved=False,
+        solved=solved,
         failure_mode=failure_mode,
-        verifier_passed=None,
+        verifier_passed=verifier_passed,
         error=error,
         trial_dir=trial_dir,
         trace_path=trace_path,

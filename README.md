@@ -102,7 +102,7 @@ After you've ran `uv run auto` for a while to complete a couple of iterations, y
 - `experiments/learning.md`: the cumulative agent-generated human-readable diagnosis memo.
 - `experiments/<experiment_id>/experiment.json` for a run's outcome, and its `loop.json` for the keep/discard decision. The current baseline and any in-flight run are derived by scanning these files plus git.
 
-- `experiment.json` carries `run_status` (`running`, `completed`, or `crashed`); the keep/discard decision lives alongside it in `loop.json`. Evidence linking the verdict to representative task artifacts is derived at gate time.
+- `experiment.json` carries `run_status` (`running`, `completed`, or `crashed`); the keep/discard decision lives alongside it in `loop.json`, whose per-task verdicts carry the gate's evidence.
 - Per-trial artifacts live under `experiments/<experiment_id>/tasks/<task>/<run_id>/`.
 - Automation working dirs (`codex-home/`, per-repo `worktrees/`, agent thread cache) live under `../harness-experiment_supervisor/`.
 

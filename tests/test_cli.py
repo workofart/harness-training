@@ -15,12 +15,13 @@ async def _always_solve(task_id, run_id, heavy_action_semaphore, slot_release):
     )
 
 
-def _harness(panels=None, *, task_trials=1):
+def _harness(train=None, test=None, *, task_trials=1):
     return SimpleNamespace(
         task_trials=task_trials,
         max_trial_concurrency=4,
         max_heavy_action_concurrency=2,
-        panels=panels or [],
+        train=train,
+        test=test,
     )
 
 
@@ -51,7 +52,7 @@ def test_run_experiment_writes_section5_conformant_record(tmp_path):
 
 
 def test_run_experiment_appends_to_an_existing_experiment_id(tmp_path):
-    # auto's train-then-test: two `uv run exp` calls share one EXP_EXPERIMENT_ID,
+    # auto's train-then-test: two `uv run exp` calls share one --experiment-id,
     # so the second call appends to the first's record (plan.md §2/§7).
     common = dict(
         harness_config=_harness(),
@@ -90,92 +91,118 @@ def test_run_experiment_honors_an_explicit_per_task_budget(tmp_path):
     assert len(loaded.tasks["task-a"].trials) == 1
 
 
-def test_selected_task_ids_defaults_to_all_configured_tasks(monkeypatch):
-    monkeypatch.delenv("EXP_TASK_IDS", raising=False)
+def test_selected_task_ids_defaults_to_all_configured_tasks():
     harness = _harness(
-        [
-            SimpleNamespace(task_names=["a", "b"]),
-            SimpleNamespace(task_names=["c"]),
-        ]
+        train=SimpleNamespace(task_names=["a", "b"]),
+        test=SimpleNamespace(task_names=["c"]),
     )
-    assert cli._selected_task_ids(harness) == ["a", "b", "c"]
+    assert cli._selected_task_ids(harness, None) == ["a", "b", "c"]
 
 
-def test_selected_task_ids_honors_exp_task_ids_subset(monkeypatch):
-    monkeypatch.setenv("EXP_TASK_IDS", "b, c")
-    harness = _harness([SimpleNamespace(task_names=["a", "b", "c"])])
-    # The env subset wins over the configured set (auto's train/test selection).
-    assert cli._selected_task_ids(harness) == ["b", "c"]
+def test_selected_task_ids_honors_tasks_subset():
+    harness = _harness(train=SimpleNamespace(task_names=["a", "b", "c"]))
+    # The --tasks subset wins over the configured set (auto's train/test selection).
+    assert cli._selected_task_ids(harness, "b, c") == ["b", "c"]
 
 
-def test_selected_experiment_id_honors_exp_experiment_id(monkeypatch):
-    monkeypatch.setenv("EXP_EXPERIMENT_ID", "exp-existing")
-    assert cli._selected_experiment_id() == "exp-existing"
+def test_selected_experiment_id_honors_the_flag():
+    assert cli._selected_experiment_id("exp-existing") == "exp-existing"
 
 
-def test_selected_experiment_id_generates_fresh_id_by_default(monkeypatch):
-    monkeypatch.delenv("EXP_EXPERIMENT_ID", raising=False)
-    fresh = cli._selected_experiment_id()
+def test_selected_experiment_id_generates_fresh_id_by_default():
+    fresh = cli._selected_experiment_id(None)
     assert fresh.startswith("exp-") and len(fresh) > len("exp-")
 
 
-def test_selected_trial_budget_defaults_to_uniform_full_without_the_env(monkeypatch):
-    # A standalone exp/baseline run leaves EXP_TRIAL_BUDGET unset -> every selected
+def test_selected_trial_budget_defaults_to_uniform_full_without_the_flag():
+    # A standalone exp/baseline run omits --trial-budget -> every selected
     # task gets the uniform-full task_trials count.
-    monkeypatch.delenv("EXP_TRIAL_BUDGET", raising=False)
     budget = cli._selected_trial_budget(
-        task_ids=["a", "b"], harness_config=_harness(task_trials=3)
+        task_ids=["a", "b"], harness_config=_harness(task_trials=3), trial_budget=None
     )
     assert budget == {"a": 3, "b": 3}
 
 
-def test_selected_trial_budget_honors_exp_trial_budget(monkeypatch):
+def test_selected_trial_budget_honors_the_flag():
     # auto's candidate run sets the per-task budget_from_baseline map (§9 #7); the
     # deterministic-baseline single-trial shortcut crosses the seam as JSON.
-    monkeypatch.setenv("EXP_TRIAL_BUDGET", '{"a": 1, "b": 3}')
     budget = cli._selected_trial_budget(
-        task_ids=["a", "b"], harness_config=_harness(task_trials=3)
+        task_ids=["a", "b"],
+        harness_config=_harness(task_trials=3),
+        trial_budget='{"a": 1, "b": 3}',
     )
     assert budget == {"a": 1, "b": 3}
 
 
-def test_selected_trial_budget_rejects_a_task_set_mismatch(monkeypatch):
-    # The loop is the only writer of EXP_TRIAL_BUDGET, so a budget that does not
+def test_selected_trial_budget_rejects_a_task_set_mismatch():
+    # The loop is the only writer of --trial-budget, so a budget that does not
     # cover the selected tasks exactly is a bug -> fail fast (§12 strict interface).
-    monkeypatch.setenv("EXP_TRIAL_BUDGET", '{"a": 1}')
     with pytest.raises(ValueError, match="!="):
         cli._selected_trial_budget(
-            task_ids=["a", "b"], harness_config=_harness(task_trials=3)
+            task_ids=["a", "b"],
+            harness_config=_harness(task_trials=3),
+            trial_budget='{"a": 1}',
         )
 
 
-def test_experiments_dir_override_anchors_to_exp_experiments_dir(monkeypatch, tmp_path):
+def test_parse_exp_args_accepts_the_auto_seam_flags():
+    args = cli._parse_exp_args(
+        [
+            "--tasks",
+            "a,b",
+            "--experiment-id",
+            "exp-x",
+            "--experiments-dir",
+            "/abs/experiments",
+            "--trial-budget",
+            '{"a": 1, "b": 3}',
+        ]
+    )
+    assert args.tasks == "a,b"
+    assert args.experiment_id == "exp-x"
+    assert args.experiments_dir == "/abs/experiments"
+    assert args.trial_budget == '{"a": 1, "b": 3}'
+
+
+def test_parse_exp_args_defaults_every_flag_to_none():
+    args = cli._parse_exp_args([])
+    assert (
+        args.tasks,
+        args.experiment_id,
+        args.experiments_dir,
+        args.trial_budget,
+    ) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_experiments_dir_override_anchors_artifacts(tmp_path):
     # §12: auto runs exp in a candidate worktree but passes the absolute main-repo
     # experiments dir, so artifacts + the verifier-context cache stay canonical.
     from src.env.harbor import HarborConfig
 
     target = tmp_path / "main-experiments"
-    monkeypatch.setenv("EXP_EXPERIMENTS_DIR", str(target))
-    overridden = cli._apply_experiments_dir_override(HarborConfig())
+    overridden = cli._apply_experiments_dir_override(HarborConfig(), str(target))
     assert overridden.experiments_dir == target.resolve()
     # the shared verifier-context cache re-derives under the new root
     assert overridden.verifier_contexts_dir == (target / "_verifier_contexts").resolve()
 
 
-def test_experiments_dir_override_is_a_noop_without_the_env(monkeypatch):
+def test_experiments_dir_override_is_a_noop_without_the_flag():
     from src.env.harbor import HarborConfig
 
-    monkeypatch.delenv("EXP_EXPERIMENTS_DIR", raising=False)
     base = HarborConfig()
-    assert cli._apply_experiments_dir_override(base) is base  # standalone exp
+    assert cli._apply_experiments_dir_override(base, None) is base  # standalone exp
 
 
-def test_experiments_dir_override_rejects_a_relative_path(monkeypatch):
+def test_experiments_dir_override_rejects_a_relative_path():
     from src.env.harbor import HarborConfig
 
-    monkeypatch.setenv("EXP_EXPERIMENTS_DIR", "relative/experiments")
     with pytest.raises(ValueError, match="absolute"):
-        cli._apply_experiments_dir_override(HarborConfig())
+        cli._apply_experiments_dir_override(HarborConfig(), "relative/experiments")
 
 
 # --- auto entry point (Step 5: main_auto drives supervisor.loop.run_auto) ----
@@ -232,7 +259,7 @@ def test_main_auto_anchors_experiments_dir_to_the_repo_not_cwd(monkeypatch, tmp_
     # §12: experiments_dir must anchor to <main_repo>, not the process cwd. `uv run
     # auto` may be invoked from any directory, but HarborConfig resolves a relative
     # experiments_dir against cwd -- so main_auto must re-anchor it to repo_root
-    # (the loop then hands this absolute dir to every exp via EXP_EXPERIMENTS_DIR).
+    # (the loop then hands this absolute dir to every exp via --experiments-dir).
     from src.supervisor.policy import Halt
 
     captured: dict[str, object] = {}

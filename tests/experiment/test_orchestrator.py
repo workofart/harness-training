@@ -3,9 +3,9 @@
 One scripted stub-executor scenario proves the admission scheduler composes (LPT
 order, trial cap, shared heavy gate, confirm-on-fail, majority early-stop,
 idempotent slot release); a focused deterministic test pins the one stateful
-piece (priority slot reservation); the append test pins the train->veto contract;
-the rest are pure-helper unit tests. The executor is never touched -- a stub
-``trial_runner`` scripts outcomes directly (plan.md §8).
+piece (the LPT-priority slot grant); the append test pins the train->veto
+contract; the rest are pure-helper unit tests. The executor is never touched --
+a stub ``trial_runner`` scripts outcomes directly (plan.md §8).
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import pytest
 from src.experiment.orchestrator import (
     _next_trial_admission_count,
     _planned_admission_count,
+    _PriorityTrialGate,
     _schedule_order,
     _wants_confirmation_expand,
     run_tasks,
@@ -150,57 +151,42 @@ def test_run_tasks_composes_the_admission_scheduler(tmp_path: Path) -> None:
     assert result.finished_at is not None
 
 
-# --- priority slot reservation (the one stateful piece) ---------------------
+# --- the LPT-priority slot grant (the one stateful piece) --------------------
 
 
-def test_run_tasks_reserves_a_freed_slot_for_a_higher_priority_task(
-    tmp_path: Path,
-) -> None:
-    # cap=1. "high" (longest -> priority 0) passes once then fails, so it is not
-    # majority-decided until 3 fails of 5 and keeps wanting trials. Each time it
-    # frees the single slot the gate must RESERVE it for high's next trial over
-    # the waiting lower-priority "low" -- so high runs to its decision (4 trials)
-    # before low runs at all. Without speculative reservation, low would steal
-    # the slot the instant high releases it (before high re-admits).
-    priors = {"high": 100.0, "low": 1.0}
-    call_log: list[str] = []
-    high_outcomes = iter([True, False, False, False])
+def test_trial_gate_grants_a_freed_slot_by_lpt_priority_not_arrival_order() -> None:
+    # A high-priority (longest-task) waiter that queues AFTER two low-priority
+    # waiters still wins the next freed slot: that is what lets a long task's
+    # next admission wave overtake the short-task backlog. Free slots are never
+    # held back for demand that has not queued (no speculative reservation), so
+    # the first low waiter takes the slot while nothing better is queued.
+    async def scenario() -> list[str]:
+        gate = _PriorityTrialGate(capacity=1, priority_by_task={"high": 0, "low": 1})
+        order: list[str] = []
+        release_holder = asyncio.Event()
 
-    async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
-        await asyncio.sleep(0)  # yield so the gate's grant pass interleaves
-        call_log.append(task_id)
-        solved = next(high_outcomes) if task_id == "high" else True
-        return _trial(run_id, solved=solved)
+        async def holder() -> None:
+            await gate.acquire("low")
+            order.append("low-holder")
+            await release_holder.wait()
+            gate.release()
 
-    async def go():
-        # wait_for guards the wakeup path: a reserved slot is only re-granted to
-        # the parked lower-priority waiter when the higher-priority task's result
-        # is appended and re-runs admission (`commit_record_change`). If that
-        # post-append re-grant regressed, "low" would never wake -> deadlock; the
-        # timeout surfaces it as a failure instead of hanging the suite.
-        return await asyncio.wait_for(
-            run_tasks(
-                experiment_id="exp-reserve",
-                git_commit_hash="c0ffee",
-                task_ids=["high", "low"],
-                budget={"high": 5, "low": 5},
-                full_trial_count=5,
-                max_trial_concurrency=1,
-                max_heavy_action_concurrency=1,
-                trial_runner=trial_runner,
-                experiments_root=tmp_path,
-                started_at="2026-01-01T00:00:00+00:00",
-                duration_priors=priors,
-            ),
-            timeout=5,
-        )
+        async def waiter(task_id: str, label: str) -> None:
+            await gate.acquire(task_id)
+            order.append(label)
+            gate.release()
 
-    result = asyncio.run(go())
+        holding = asyncio.create_task(holder())
+        await asyncio.sleep(0)  # low-holder takes the slot (no better waiter)
+        low_waiter = asyncio.create_task(waiter("low", "low-waiter"))
+        await asyncio.sleep(0)  # low-waiter queues first...
+        high_waiter = asyncio.create_task(waiter("high", "high-waiter"))
+        await asyncio.sleep(0)  # ...high-waiter queues second
+        release_holder.set()
+        await asyncio.gather(holding, low_waiter, high_waiter)
+        return order
 
-    assert call_log[:4] == ["high"] * 4
-    high = result.tasks["high"]
-    assert len(high.trials) == 4
-    assert high.majority_solved is False
+    assert asyncio.run(scenario()) == ["low-holder", "high-waiter", "low-waiter"]
 
 
 # --- the append (train -> veto) contract ------------------------------------
@@ -341,17 +327,15 @@ def test_next_trial_admission_count(
     )
 
 
-def test_planned_admission_count_honors_pending_confirmation_expand() -> None:
-    # The record still reads expected_trial_count == 1, but the failed single
-    # deterministic trial pends an expand to full=3, so planned admission targets
-    # the larger budget (one more trial, toward the majority threshold).
-    fail_single = TaskResult(
-        expected_trial_count=1, trials=[_trial("r0", solved=False)]
-    )
-    assert _planned_admission_count(fail_single, full_trial_count=3) == 1
+def test_planned_admission_count_targets_the_committed_budget() -> None:
+    # A fresh budget-3 task plans up to the majority threshold (2), not the
+    # whole budget; an exhausted budget plans nothing. Pending confirmation
+    # expands are the admission loop's job (it commits the new budget before
+    # planning again), so this helper reads only the committed record.
+    fresh = TaskResult(expected_trial_count=3, trials=[])
+    assert _planned_admission_count(fresh) == 2
 
-    # A solved single deterministic trial is finished -> nothing more planned.
     solved_single = TaskResult(
         expected_trial_count=1, trials=[_trial("r0", solved=True)]
     )
-    assert _planned_admission_count(solved_single, full_trial_count=3) == 0
+    assert _planned_admission_count(solved_single) == 0

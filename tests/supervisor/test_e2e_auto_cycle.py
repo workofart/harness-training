@@ -122,10 +122,13 @@ def _make_run_exp(scenario, config):
         outcomes = pass_fail[phase]
 
         async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
-            # Yield before returning so a trial that completes a majority lets the
-            # watcher cancel the surplus expansion trial (still parked) before it
-            # appends -- reproducing the golden's "staggered completions" basis with
-            # max_trial_concurrency=1 instead of a manually-driven blocking stub.
+            # Yield (twice: the gate grants a freed slot synchronously, so the
+            # next trial starts one tick earlier than the watcher's wakeup) so a
+            # trial that completes a majority lets the watcher cancel the surplus
+            # expansion trial before it appends -- reproducing the golden's
+            # "staggered completions" basis with max_trial_concurrency=1 instead
+            # of a manually-driven blocking stub.
+            await asyncio.sleep(0)
             await asyncio.sleep(0)
             solved = outcomes[task_id][0] == "pass"  # homogeneous per task
             return TrialResult(

@@ -18,7 +18,7 @@ from src.experiment.executor import (
     _VerifyCeilingEnv,
     run_trial,
 )
-from src.trace import HarnessRecorder
+from src.trace import Recorder
 
 from conftest import _StubLlm, _StubEnv, _completion, _tool_call
 
@@ -48,30 +48,30 @@ def test_verify_ceiling_caps_a_hung_grader(monkeypatch) -> None:
         async def verify(self) -> RawState:
             self.verify_calls += 1
             await asyncio.sleep(30)  # never returns within the ceiling
-            return RawState(done=True, passed=True, reward=1.0)
+            return RawState(passed=True, reward=1.0)
 
     inner = _HangingVerifyEnv()
-    recorder = HarnessRecorder.create()
+    recorder = Recorder.create()
     wrapped = _VerifyCeilingEnv(inner, recorder)
 
     # wait_for turns a non-firing ceiling into a clear failure, not a hang.
     raw = asyncio.run(asyncio.wait_for(wrapped.verify(), timeout=2))
 
     assert inner.verify_calls == 1  # the verifier was invoked, then stopped
-    assert raw.done is True and raw.passed is False and raw.reward == 0.0
+    assert raw.passed is False and raw.reward == 0.0
     assert VERIFY_TIMEOUT_NOTICE in (raw.stdout or "")
-    assert recorder.build_metrics().rule_fires.get("verify_timeout") == 1
+    assert recorder.metrics.rule_fires.get("verify_timeout") == 1
 
 
 def test_verify_ceiling_passes_through_a_prompt_grader() -> None:
-    inner = _StubEnv(verify_state=RawState(done=True, passed=True, reward=1.0))
-    recorder = HarnessRecorder.create()
+    inner = _StubEnv(verify_state=RawState(passed=True, reward=1.0))
+    recorder = Recorder.create()
     wrapped = _VerifyCeilingEnv(inner, recorder)
 
     raw = asyncio.run(wrapped.verify())
 
     assert raw.passed is True and raw.reward == 1.0
-    assert recorder.build_metrics().rule_fires == {}
+    assert recorder.metrics.rule_fires == {}
 
 
 def test_verify_ceiling_propagates_inner_verifier_timeout() -> None:
@@ -84,12 +84,12 @@ def test_verify_ceiling_propagates_inner_verifier_timeout() -> None:
             raise TimeoutError("inner verifier timeout")
 
     inner = _InnerTimeoutEnv()
-    recorder = HarnessRecorder.create()
+    recorder = Recorder.create()
     wrapped = _VerifyCeilingEnv(inner, recorder)
 
     with pytest.raises(TimeoutError, match="inner verifier timeout"):
         asyncio.run(wrapped.verify())
-    assert recorder.build_metrics().rule_fires == {}  # the ceiling did not fire
+    assert recorder.metrics.rule_fires == {}  # the ceiling did not fire
 
 
 # --- terminal classification ------------------------------------------------
@@ -99,7 +99,7 @@ def test_run_trial_solved_happy_path(tmp_path: Path) -> None:
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _StubEnv(
         trial_dir=str(tmp_path / "trial"),
-        verify_state=RawState(done=True, passed=True, reward=1.0),
+        verify_state=RawState(passed=True, reward=1.0),
     )
 
     result = _run_one(llm=llm, env=env)
@@ -117,7 +117,7 @@ def test_run_trial_classifies_verified_rejected(tmp_path: Path) -> None:
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _StubEnv(
         trial_dir=str(tmp_path / "trial"),
-        verify_state=RawState(done=True, passed=False, reward=0.0),
+        verify_state=RawState(passed=False, reward=0.0),
     )
 
     result = _run_one(llm=llm, env=env)
@@ -140,7 +140,7 @@ def test_verify_timeout_within_run_trial_is_verified_rejected(
         async def verify(self) -> RawState:
             self.verify_calls += 1
             await asyncio.sleep(30)
-            return RawState(done=True, passed=True, reward=1.0)
+            return RawState(passed=True, reward=1.0)
 
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _HangingVerifyEnv(trial_dir=str(tmp_path / "trial"))
@@ -241,7 +241,7 @@ def test_slot_release_runs_before_env_teardown(tmp_path: Path) -> None:
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _OrderEnv(
         trial_dir=str(tmp_path / "trial"),
-        verify_state=RawState(done=True, passed=True, reward=1.0),
+        verify_state=RawState(passed=True, reward=1.0),
     )
 
     _run_one(

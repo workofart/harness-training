@@ -247,7 +247,7 @@ def test_harbor_exec_converts_timeout_runtime_error_to_failed_raw_state(
     result = asyncio.run(harbor.exec(command="apt update", timeout_sec=15))
 
     assert result.return_code == 124
-    assert result.passed is False
+    assert result.action_passed is False
     assert result.stderr is not None
     assert "timed out after 15 seconds" in result.stderr
 
@@ -264,7 +264,7 @@ def test_harbor_exec_converts_value_error_to_failed_raw_state(tmp_path: Path) ->
 
     result = asyncio.run(harbor.exec(command="printf %s 'x\x00y' > f"))
 
-    assert result.passed is False
+    assert result.action_passed is False
     assert result.return_code != 0
     assert result.stderr is not None
     assert "embedded null byte" in result.stderr

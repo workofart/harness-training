@@ -122,33 +122,6 @@ def test_is_deterministic_solved_requires_all_valid_passing() -> None:
     assert TaskResult(expected_trial_count=1).is_deterministic_solved is False
 
 
-def test_representative_prefers_majority_outcome() -> None:
-    task = TaskResult(
-        expected_trial_count=3,
-        trials=[
-            _trial("r1", solved=False),
-            _trial("r2", solved=True),
-            _trial("r3", solved=True),
-        ],
-    )
-    # majority is True -> the representative is a solved trial.
-    rep = task.representative
-    assert rep is not None and rep.solved is True
-
-
-def test_representative_falls_back_to_last_crash() -> None:
-    task = TaskResult(
-        expected_trial_count=1,
-        trials=[_trial("r1", solved=False, error="crash", failure_mode="crash")],
-    )
-    rep = task.representative
-    assert rep is not None and rep.run_id == "r1" and rep.error == "crash"
-
-
-def test_representative_none_when_empty() -> None:
-    assert TaskResult(expected_trial_count=2).representative is None
-
-
 def test_is_finished_counts_every_slot_including_crashes() -> None:
     task = TaskResult(expected_trial_count=2)
     assert task.is_finished is False

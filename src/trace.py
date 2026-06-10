@@ -161,25 +161,50 @@ def _completion_trace_fields(
 
 
 @dataclass(slots=True)
-class StepRecorder:
+class Recorder:
+    """Per-trial trace + metrics recorder.
+
+    One instance covers a whole trial; step-scoped events take an explicit
+    ``step_index``. A default-constructed instance (no trace, no metrics) is
+    a no-op -- use the shared ``NOOP_RECORDER``.
+    """
+
     trace: TraceWriter | None = None
     metrics: TaskMetrics | None = None
-    step_index: int | None = None
+    metrics_path: Path | None = None
 
-    def _write(self, event: str, **fields: Any) -> None:
+    @classmethod
+    def create(
+        cls,
+        *,
+        trace_path: str | Path | None = None,
+        metrics_path: str | Path | None = None,
+    ) -> "Recorder":
+        writer = None if trace_path is None else TraceWriter(Path(trace_path))
+        resolved_metrics_path = None
+        if metrics_path is not None:
+            resolved_metrics_path = Path(metrics_path)
+        return cls(
+            trace=writer,
+            metrics=TaskMetrics(),
+            metrics_path=resolved_metrics_path,
+        )
+
+    def _write(
+        self, event: str, *, step_index: int | None = None, **fields: Any
+    ) -> None:
         if self.trace is None:
             return
-        if self.step_index is not None:
-            fields = {**fields, "step_index": self.step_index}
+        if step_index is not None:
+            fields = {**fields, "step_index": step_index}
         self.trace.write(event, **fields)
 
-    def rule_fired(self, rule_name: str) -> None:
-        if self.metrics is not None:
-            self.metrics.record_rule_fire(rule_name)
+    # -- step-scoped events --
 
     def completion_received(
         self,
         *,
+        step_index: int | None,
         attempt_index: int,
         request_messages: list[dict[str, Any]],
         request_tools: list[dict[str, Any]] | None,
@@ -197,6 +222,7 @@ class StepRecorder:
             messages_delta = list(request_messages or [])
         self._write(
             "completion_received",
+            step_index=step_index,
             attempt_index=attempt_index,
             **_completion_trace_fields(
                 completion,
@@ -206,21 +232,27 @@ class StepRecorder:
             ),
         )
 
-    def action_parse_failed(self, *, error: str, detail: str) -> None:
+    def action_parse_failed(
+        self, *, step_index: int | None, error: str, detail: str
+    ) -> None:
         if self.metrics is not None:
             self.metrics.record_action_parse_failure()
-        self._write("action_parse_failed", error=error, detail=detail)
+        self._write(
+            "action_parse_failed", step_index=step_index, error=error, detail=detail
+        )
 
     def action_chosen(
         self,
         *,
+        step_index: int,
         action_name: str,
         action_summary: dict[str, Any],
     ) -> None:
-        if self.metrics is not None and self.step_index is not None:
-            self.metrics.record_action(self.step_index, action_name)
+        if self.metrics is not None:
+            self.metrics.record_action(step_index, action_name)
         self._write(
             "action_chosen",
+            step_index=step_index,
             action_name=action_name,
             action_summary=action_summary,
         )
@@ -228,51 +260,22 @@ class StepRecorder:
     def env_step_completed(
         self,
         *,
+        step_index: int,
         action_name: str,
-        action_summary: dict[str, Any],
         raw_state: RawState,
     ) -> None:
+        # Attribute the env outcome to the most recent agent-chosen action.
         if self.metrics is not None:
-            self.metrics.record_step_passed(raw_state)
+            self.metrics.final_action_passed = raw_state.action_passed
         self._write(
             "env_step_completed",
+            step_index=step_index,
             action_name=action_name,
             return_code=raw_state.return_code,
-            done=raw_state.done,
-            passed=raw_state.passed,
+            passed=raw_state.action_passed,
         )
 
-
-@dataclass(slots=True)
-class HarnessRecorder:
-    trace: TraceWriter | None = None
-    metrics: TaskMetrics | None = None
-    metrics_path: Path | None = None
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        trace_path: str | Path | None = None,
-        metrics_path: str | Path | None = None,
-    ) -> "HarnessRecorder":
-        writer = None if trace_path is None else TraceWriter(Path(trace_path))
-        resolved_metrics_path = None
-        if metrics_path is not None:
-            resolved_metrics_path = Path(metrics_path)
-        return cls(
-            trace=writer,
-            metrics=TaskMetrics(),
-            metrics_path=resolved_metrics_path,
-        )
-
-    def _write(self, event: str, **fields: Any) -> None:
-        if self.trace is None:
-            return
-        self.trace.write(event, **fields)
-
-    def for_step(self, step_index: int) -> StepRecorder:
-        return StepRecorder(self.trace, self.metrics, step_index)
+    # -- trial-scoped events --
 
     def task_started(
         self,
@@ -327,11 +330,6 @@ class HarnessRecorder:
             return
         self.metrics.write(resolved_path)
 
-    def build_metrics(self) -> TaskMetrics:
-        if self.metrics is None:
-            return TaskMetrics()
-        return self.metrics
-
     def set_trial_outcome(
         self,
         *,
@@ -352,5 +350,4 @@ class HarnessRecorder:
             self.metrics.record_rule_fire(rule_name)
 
 
-NOOP_STEP_RECORDER = StepRecorder()
-NOOP_HARNESS_RECORDER = HarnessRecorder()
+NOOP_RECORDER = Recorder()

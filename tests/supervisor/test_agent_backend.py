@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import src.supervisor.agent_backend as agent_backend_mod
 from src.supervisor.agent_backend import (
     ClaudeBackend,
     CodexBackend,
@@ -13,12 +14,34 @@ from src.supervisor.agent_backend import (
 )
 
 
-class FakeStream:
-    def __init__(self, lines: list[str]) -> None:
-        self._lines = lines
+def _fake_run_streamed(
+    stdout_lines: list[str],
+    stderr_lines: list[str] | None = None,
+    *,
+    calls: dict[str, object] | None = None,
+    returncode: int = 0,
+    on_call=None,
+):
+    """A stub for the shared engine: feeds the canned lines through on_chunk
+    (exactly how the real engine delivers them) and returns a CompletedProcess."""
 
-    def __iter__(self):
-        return iter(self._lines)
+    def fake(command, *, cwd=None, env=None, use_pty=False, timeout_sec=None, on_chunk):
+        if on_call is not None:
+            on_call()
+        if calls is not None:
+            calls.update(command=command, cwd=cwd, env=env, use_pty=use_pty)
+        for line in stdout_lines:
+            on_chunk("stdout", line)
+        for line in stderr_lines or []:
+            on_chunk("stderr", line)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=returncode,
+            stdout="".join(stdout_lines),
+            stderr="".join(stderr_lines or []),
+        )
+
+    return fake
 
 
 def test_supervisor_root_for_repo_uses_sibling_dir_named_after_repo(
@@ -34,35 +57,19 @@ def test_run_codex_turn_sets_supervisor_codex_home_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     codex_home = tmp_path / "research_supervisor" / "codex-home"
     codex_home.mkdir(parents=True)
     calls: dict[str, object] = {}
 
-    class FakeProcess:
-        def __init__(self, command, *, cwd, env) -> None:
-            calls["command"] = command
-            calls["cwd"] = cwd
-            calls["env"] = env
-            self.stdout = FakeStream(
-                ['{"type":"thread.started","thread_id":"thread-1"}\n']
-            )
-            self.stderr = FakeStream([])
-            self.returncode = 0
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
-        assert stdout == subprocess.PIPE
-        assert stderr == subprocess.PIPE
-        assert text is True
-        return FakeProcess(command, cwd=cwd, env=env)
-
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            ['{"type":"thread.started","thread_id":"thread-1"}\n'], calls=calls
+        ),
+    )
 
     backend = CodexBackend(binary="codex", codex_home=codex_home)
     result = backend.run_turn(
@@ -73,14 +80,13 @@ def test_run_codex_turn_sets_supervisor_codex_home_env(
     assert result.thread_id == "thread-1"
     assert calls["cwd"] == repo_root
     assert calls["env"]["CODEX_HOME"] == str(codex_home.resolve())
+    assert calls["use_pty"] is False
 
 
 def test_run_codex_turn_provisions_missing_supervisor_codex_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     user_home = tmp_path / "home"
@@ -91,26 +97,22 @@ def test_run_codex_turn_provisions_missing_supervisor_codex_home(
     monkeypatch.setenv("HOME", str(user_home))
     codex_home = tmp_path / "repo_supervisor" / "codex-home"
 
-    class FakeProcess:
-        def __init__(self) -> None:
-            self.stdout = FakeStream(
-                ['{"type":"thread.started","thread_id":"thread-1"}\n']
-            )
-            self.stderr = FakeStream([])
-            self.returncode = 0
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
+    def assert_provisioned() -> None:
+        # Provisioning happened before the engine launches the turn.
         assert codex_home.is_dir()
         assert (codex_home / "auth.json").resolve() == (user_codex_home / "auth.json")
         assert (codex_home / "config.toml").resolve() == (
             user_codex_home / "config.toml"
         )
-        return FakeProcess()
 
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            ['{"type":"thread.started","thread_id":"thread-1"}\n'],
+            on_call=assert_provisioned,
+        ),
+    )
 
     backend = CodexBackend(binary="codex", codex_home=codex_home)
     result = backend.run_turn(
@@ -125,8 +127,6 @@ def test_run_codex_turn_relinks_stale_supervisor_codex_home_entries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     user_home = tmp_path / "home"
@@ -145,25 +145,20 @@ def test_run_codex_turn_relinks_stale_supervisor_codex_home_entries(
     (codex_home / "auth.json").symlink_to(stale_auth)
     (codex_home / "config.toml").symlink_to(broken_config)
 
-    class FakeProcess:
-        def __init__(self) -> None:
-            self.stdout = FakeStream(
-                ['{"type":"thread.started","thread_id":"thread-1"}\n']
-            )
-            self.stderr = FakeStream([])
-            self.returncode = 0
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
+    def assert_relinked() -> None:
         assert (codex_home / "auth.json").resolve() == (user_codex_home / "auth.json")
         assert (codex_home / "config.toml").resolve() == (
             user_codex_home / "config.toml"
         )
-        return FakeProcess()
 
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            ['{"type":"thread.started","thread_id":"thread-1"}\n'],
+            on_call=assert_relinked,
+        ),
+    )
 
     backend = CodexBackend(binary="codex", codex_home=codex_home)
     result = backend.run_turn(
@@ -179,35 +174,23 @@ def test_run_codex_turn_prints_agent_and_toolcall_logs_to_terminal(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     codex_home = tmp_path / "research_supervisor" / "codex-home"
     codex_home.mkdir(parents=True)
 
-    class FakeProcess:
-        def __init__(self) -> None:
-            self.stdout = FakeStream(
-                [
-                    '{"type":"thread.started","thread_id":"thread-1"}\n',
-                    '{"type":"item.started","item":{"type":"command_execution","command":"echo hello"}}\n',
-                    '{"type":"item.completed","item":{"type":"agent_message","text":"done now"}}\n',
-                ]
-            )
-            self.stderr = FakeStream(["stderr line\n"])
-            self.returncode = 0
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
-        assert stdout == subprocess.PIPE
-        assert stderr == subprocess.PIPE
-        assert text is True
-        return FakeProcess()
-
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            [
+                '{"type":"thread.started","thread_id":"thread-1"}\n',
+                '{"type":"item.started","item":{"type":"command_execution","command":"echo hello"}}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"done now"}}\n',
+            ],
+            ["stderr line\n"],
+        ),
+    )
 
     backend = CodexBackend(binary="codex", codex_home=codex_home)
     result = backend.run_turn(
@@ -231,35 +214,22 @@ def test_run_claude_turn_prints_agent_and_toolcall_logs_to_terminal(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     settings_path = tmp_path / "claude-settings.json"
 
-    class FakeProcess:
-        def __init__(self) -> None:
-            self.stdout = FakeStream(
-                [
-                    '{"type":"system","subtype":"init","session_id":"session-1"}\n',
-                    '{"type":"assistant","message":{"content":[{"type":"text","text":"thinking now"}]}}\n',
-                    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pwd"}}]}}\n',
-                    '{"type":"result","subtype":"success","session_id":"session-1"}\n',
-                ]
-            )
-            self.stderr = FakeStream([])
-            self.returncode = 0
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
-        assert stdout == subprocess.PIPE
-        assert stderr == subprocess.PIPE
-        assert text is True
-        return FakeProcess()
-
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            [
+                '{"type":"system","subtype":"init","session_id":"session-1"}\n',
+                '{"type":"assistant","message":{"content":[{"type":"text","text":"thinking now"}]}}\n',
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pwd"}}]}}\n',
+                '{"type":"result","subtype":"success","session_id":"session-1"}\n',
+            ]
+        ),
+    )
 
     backend = ClaudeBackend(binary="claude", settings_path=settings_path)
     result = backend.run_turn(
@@ -278,35 +248,25 @@ def test_run_codex_turn_reports_missing_resume_thread(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     codex_home = tmp_path / "research_supervisor" / "codex-home"
     codex_home.mkdir(parents=True)
+    calls: dict[str, object] = {}
 
-    class FakeProcess:
-        def __init__(self) -> None:
-            self.stdout = FakeStream([])
-            self.stderr = FakeStream(
-                [
-                    "Error: thread/resume: thread/resume failed: "
-                    "no rollout found for thread id missing-thread (code -32600)\n"
-                ]
-            )
-            self.returncode = 1
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
-        assert command[:4] == ["codex", "exec", "resume", "missing-thread"]
-        assert stdout == subprocess.PIPE
-        assert stderr == subprocess.PIPE
-        assert text is True
-        return FakeProcess()
-
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            [],
+            [
+                "Error: thread/resume: thread/resume failed: "
+                "no rollout found for thread id missing-thread (code -32600)\n"
+            ],
+            calls=calls,
+            returncode=1,
+        ),
+    )
 
     backend = CodexBackend(binary="codex", codex_home=codex_home)
     with pytest.raises(MissingThreadRollout, match="missing-thread"):
@@ -315,38 +275,28 @@ def test_run_codex_turn_reports_missing_resume_thread(
             repo_root=repo_root,
             thread_id="missing-thread",
         )
+    assert calls["command"][:4] == ["codex", "exec", "resume", "missing-thread"]
 
 
 def test_run_claude_turn_reports_missing_resume_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import src.supervisor.agent_backend as agent_backend_mod
-
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     settings_path = tmp_path / "claude-settings.json"
+    calls: dict[str, object] = {}
 
-    class FakeProcess:
-        def __init__(self) -> None:
-            self.stdout = FakeStream([])
-            self.stderr = FakeStream(
-                ["Error: No conversation found with session ID missing-session\n"]
-            )
-            self.returncode = 1
-
-        def wait(self) -> int:
-            return self.returncode
-
-    def fake_popen(command, *, stdout, stderr, text, cwd, env):
-        assert "--resume" in command
-        assert command[command.index("--resume") + 1] == "missing-session"
-        assert stdout == subprocess.PIPE
-        assert stderr == subprocess.PIPE
-        assert text is True
-        return FakeProcess()
-
-    monkeypatch.setattr(agent_backend_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_backend_mod,
+        "run_streamed",
+        _fake_run_streamed(
+            [],
+            ["Error: No conversation found with session ID missing-session\n"],
+            calls=calls,
+            returncode=1,
+        ),
+    )
 
     backend = ClaudeBackend(binary="claude", settings_path=settings_path)
     with pytest.raises(MissingThreadRollout, match="missing-session"):
@@ -355,3 +305,6 @@ def test_run_claude_turn_reports_missing_resume_session(
             repo_root=repo_root,
             thread_id="missing-session",
         )
+    command = calls["command"]
+    assert "--resume" in command
+    assert command[command.index("--resume") + 1] == "missing-session"

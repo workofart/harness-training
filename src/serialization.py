@@ -32,12 +32,6 @@ def json_safe(value: Any, *, depth: int = 0) -> Any:
         except TypeError:
             dumped = value.model_dump()
         return json_safe(dumped, depth=depth + 1)
-    if hasattr(value, "dict"):
-        try:
-            dumped = value.dict()
-        except TypeError:
-            dumped = value.dict
-        return json_safe(dumped, depth=depth + 1)
     if hasattr(value, "__dict__"):
         return json_safe(vars(value), depth=depth + 1)
     return repr(value)

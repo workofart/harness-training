@@ -78,55 +78,17 @@ def _added_lines(diff_stdout: str) -> list[str]:
     ]
 
 
-def git_diff_added_lines_between(
-    *,
-    cwd: Path | None = None,
-    base_ref: str,
-    head_ref: str,
-    paths: tuple[str, ...],
-) -> list[str]:
-    if not git_ref_exists(cwd=cwd, ref=base_ref):
-        return []
-    if not git_ref_exists(cwd=cwd, ref=head_ref):
-        return []
-    completed = _git_run(
-        "diff", "--unified=0", base_ref, head_ref, "--", *paths, cwd=cwd, check=False
-    )
-    if completed.returncode != 0:
-        return []
-    return _added_lines(completed.stdout)
-
-
 def git_diff_added_lines_worktree(
     *,
     cwd: Path | None = None,
     paths: tuple[str, ...],
 ) -> list[str]:
-    """Added (`+`) lines in the uncommitted working-tree diff for `paths`.
-
-    The working-tree sibling of `git_diff_added_lines_between` (which diffs two
-    commits): used to scan a candidate's not-yet-committed edits.
-    """
+    """Added (`+`) lines in the uncommitted working-tree diff for `paths`:
+    used to scan a candidate's not-yet-committed edits."""
     completed = _git_run("diff", "--unified=0", "--", *paths, cwd=cwd, check=False)
     if completed.returncode != 0:
         return []
     return _added_lines(completed.stdout)
-
-
-def git_show_at_head(path: str, *, cwd: Path | None = None) -> str:
-    """Return the contents of `path` as of HEAD (`git show HEAD:<path>`).
-
-    Uses `check=False` so a missing/unreadable blob raises a RuntimeError that
-    carries the captured stdout+stderr, rather than an opaque CalledProcessError.
-    """
-    completed = _git_run("show", f"HEAD:{path}", cwd=cwd, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"failed to read HEAD {path}:\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
-    return completed.stdout
 
 
 def get_head_commit(*, cwd: Path | None = None) -> str:
@@ -165,10 +127,6 @@ def commit_all(message: str, *, cwd: Path | None = None) -> str:
     _git_run("add", "-A", "--", *paths, cwd=cwd)
     _git_run("commit", "-m", message, cwd=cwd)
     return get_head_commit(cwd=cwd)
-
-
-def hard_reset(commit_hash: str, *, cwd: Path | None = None) -> None:
-    _git_run("reset", "--hard", commit_hash, cwd=cwd)
 
 
 def update_ref(ref_name: str, commit_hash: str, *, cwd: Path | None = None) -> None:
@@ -249,8 +207,3 @@ def ensure_info_exclude_entry(pattern: str, *, cwd: Path | None = None) -> None:
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
     with exclude_path.open("a", encoding="utf-8") as handle:
         handle.write(f"{pattern}\n")
-
-
-def clean_untracked(*, cwd: Path | None = None, exclude: tuple[str, ...] = ()) -> None:
-    args = ["clean", "-fd", *[f"--exclude={pattern}" for pattern in exclude]]
-    _git_run(*args, cwd=cwd)
