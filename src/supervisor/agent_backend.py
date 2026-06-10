@@ -165,6 +165,67 @@ def _format_agent_message(text: str, *, role: str, enabled: bool) -> list[str]:
     return rendered
 
 
+# ── normalized stream events ──────────────────────────────────────
+#
+# Both backends emit the same three rendered shapes from different JSON
+# vocabularies. Each backend parses its own wire format into this small
+# union; one shared renderer turns it into terminal lines, so the rendering
+# contract lives in exactly one place.
+
+
+@dataclass(frozen=True, slots=True)
+class RoleLine:
+    """One `[role] <action-label> [text]` status line (thread/tokens/done/...)."""
+
+    action: str
+    text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AgentMessage:
+    """The agent's own prose, rendered with indented continuation lines."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolLine:
+    """One indented `[toolcall] <action-label> [detail]` line."""
+
+    action: str
+    detail: str = ""
+
+
+NormalizedEvent = RoleLine | AgentMessage | ToolLine
+
+
+def _render_event(event: NormalizedEvent, *, role: str, enabled: bool) -> list[str]:
+    match event:
+        case AgentMessage(text=text):
+            return _format_agent_message(text, role=role, enabled=enabled)
+        case ToolLine(action=action, detail=detail):
+            label = _action_label(action, enabled=enabled)
+            if detail:
+                label = f"{label} {detail}"
+            return [f"  {format_line('toolcall', label, enabled=enabled)}"]
+        case RoleLine(action=action, text=text):
+            label = _action_label(action, enabled=enabled)
+            if text:
+                label = f"{label} {text}"
+            return [format_line(role, label, enabled=enabled)]
+
+
+def _token_usage_text(
+    usage: dict[str, Any], aliases: tuple[tuple[str, str], ...]
+) -> str:
+    parts = [
+        f"{alias}={value}"
+        for key, alias in aliases
+        if isinstance(value := usage.get(key), int)
+    ]
+    return " ".join(parts)
+
+
 def _parse_json_line(raw_line: str) -> dict[str, Any] | None:
     line = raw_line.strip()
     if not line:
@@ -184,7 +245,7 @@ def _run_streamed_process(
     role: str,
     timeout_sec: float,
     parse_event: Any,
-    format_event: Any,
+    normalize_event: Any,
     extract_id: Any,
     initial_id: str | None,
 ) -> tuple[str | None, list[str], list[str]]:
@@ -260,9 +321,11 @@ def _run_streamed_process(
                     use_stderr=False,
                 )
             continue
-        rendered = format_event(payload, enabled=enabled)
-        if rendered is not None:
-            print_terminal_lines(rendered, use_stderr=False)
+        event = normalize_event(payload)
+        if event is not None:
+            print_terminal_lines(
+                _render_event(event, role=role, enabled=enabled), use_stderr=False
+            )
         extracted = extract_id(payload)
         if extracted is not None:
             resolved_id = extracted
@@ -310,7 +373,7 @@ class CodexBackend:
             role="codex",
             timeout_sec=timeout_sec,
             parse_event=_parse_json_line,
-            format_event=self._format_event,
+            normalize_event=self._normalize_event,
             extract_id=self._extract_thread_id,
             initial_id=thread_id,
         )
@@ -379,112 +442,86 @@ class CodexBackend:
             return truncate(argv[2], limit=120)
         return truncate(stripped, limit=120)
 
+    _TOKEN_ALIASES = (
+        ("input_tokens", "in"),
+        ("cached_input_tokens", "cache"),
+        ("output_tokens", "out"),
+        ("reasoning_output_tokens", "reason"),
+    )
+
     @classmethod
-    def _format_event(
-        cls, payload: dict[str, Any], *, enabled: bool
-    ) -> list[str] | None:
-        event_type = payload.get("type")
-        match event_type:
+    def _normalize_event(cls, payload: dict[str, Any]) -> NormalizedEvent | None:
+        match payload.get("type"):
             case "thread.started":
-                tid = payload.get("thread_id")
-                message = _action_label("thread", enabled=enabled)
-                if isinstance(tid, str) and tid:
-                    message = f"{message} {tid}"
-                return [format_line("codex", message, enabled=enabled)]
+                thread_id = payload.get("thread_id")
+                return RoleLine(
+                    "thread", thread_id if isinstance(thread_id, str) else ""
+                )
             case "turn.completed":
-                return [
-                    format_line(
-                        "codex",
-                        _action_label("turn+", enabled=enabled),
-                        enabled=enabled,
-                    )
-                ]
+                return RoleLine("turn+")
             case "token_count":
-                info = payload.get("info")
-                if isinstance(info, dict):
-                    last = info.get("last_token_usage")
-                    if isinstance(last, dict):
-                        parts: list[str] = []
-                        aliases = {
-                            "input_tokens": "in",
-                            "cached_input_tokens": "cache",
-                            "output_tokens": "out",
-                            "reasoning_output_tokens": "reason",
-                        }
-                        for key, alias in aliases.items():
-                            value = last.get(key)
-                            if isinstance(value, int):
-                                parts.append(f"{alias}={value}")
-                        remaining = cls._context_window_remaining_percent(info)
-                        if remaining is not None:
-                            parts.append(f"left={remaining}%")
-                        if parts:
-                            return [
-                                format_line(
-                                    "codex",
-                                    f"{_action_label('tokens', enabled=enabled)} {' '.join(parts)}",
-                                    enabled=enabled,
-                                )
-                            ]
-                return [
-                    format_line(
-                        "codex",
-                        _action_label("tokens", enabled=enabled),
-                        enabled=enabled,
-                    )
-                ]
-            case _:
-                pass
+                return cls._normalize_token_count(payload.get("info"))
         item = payload.get("item")
         if not isinstance(item, dict):
             return None
-        item_type = item.get("type")
-        match (event_type, item_type):
-            case ("item.completed", "agent_message"):
+        return cls._normalize_item(payload.get("type"), item)
+
+    @classmethod
+    def _normalize_token_count(cls, info: Any) -> RoleLine:
+        if not isinstance(info, dict):
+            return RoleLine("tokens")
+        last = info.get("last_token_usage")
+        if not isinstance(last, dict):
+            return RoleLine("tokens")
+        text = _token_usage_text(last, cls._TOKEN_ALIASES)
+        remaining = cls._context_window_remaining_percent(info)
+        if remaining is not None:
+            text = f"{text} left={remaining}%" if text else f"left={remaining}%"
+        return RoleLine("tokens", text)
+
+    @classmethod
+    def _normalize_item(
+        cls, event_type: Any, item: dict[str, Any]
+    ) -> NormalizedEvent | None:
+        match item.get("type"):
+            case "agent_message" if event_type == "item.completed":
                 text = item.get("text")
                 if isinstance(text, str) and text.strip():
-                    return _format_agent_message(text, role="codex", enabled=enabled)
+                    return AgentMessage(text)
                 return None
-            case (_, "command_execution"):
-                cmd = item.get("command")
+            case "command_execution":
+                action = "cmd>"
                 exit_code = item.get("exit_code")
                 status = item.get("status")
-                if event_type == "item.started":
-                    action = "cmd>"
-                elif status == "failed" or exit_code not in {None, 0}:
-                    action = "cmd!"
-                else:
-                    action = "cmd+"
-                line_parts = [_action_label(action, enabled=enabled)]
+                if event_type != "item.started":
+                    failed = status == "failed" or exit_code not in {None, 0}
+                    action = "cmd!" if failed else "cmd+"
+                detail_parts: list[str] = []
+                cmd = item.get("command")
                 if isinstance(cmd, str) and cmd:
-                    line_parts.append(cls._compact_command(cmd))
+                    detail_parts.append(cls._compact_command(cmd))
                 if isinstance(exit_code, int):
-                    line_parts.append(f"rc={exit_code}")
+                    detail_parts.append(f"rc={exit_code}")
                 elif isinstance(status, str) and status not in {
                     "in_progress",
                     "completed",
                 }:
-                    line_parts.append(status)
-                return [
-                    f"  {format_line('toolcall', ' '.join(line_parts), enabled=enabled)}"
-                ]
-            case (_, "file_change"):
+                    detail_parts.append(status)
+                return ToolLine(action, " ".join(detail_parts))
+            case "file_change":
                 action = "edit>" if event_type == "item.started" else "edit+"
                 changes = item.get("changes")
-                if isinstance(changes, list):
-                    paths = [
-                        change.get("path")
+                paths = (
+                    [
+                        path
                         for change in changes
                         if isinstance(change, dict)
-                        and isinstance(change.get("path"), str)
+                        and isinstance(path := change.get("path"), str)
                     ]
-                    if paths:
-                        return [
-                            f"  {format_line('toolcall', f'{_action_label(action, enabled=enabled)} {compact_paths(paths)}', enabled=enabled)}"
-                        ]
-                return [
-                    f"  {format_line('toolcall', _action_label(action, enabled=enabled), enabled=enabled)}"
-                ]
+                    if isinstance(changes, list)
+                    else []
+                )
+                return ToolLine(action, compact_paths(paths) if paths else "")
             case _:
                 return None
 
@@ -532,7 +569,7 @@ class ClaudeBackend:
             role="claude",
             timeout_sec=timeout_sec,
             parse_event=_parse_json_line,
-            format_event=self._format_event,
+            normalize_event=self._normalize_event,
             extract_id=self._extract_session_id,
             initial_id=thread_id,
         )
@@ -584,79 +621,65 @@ class ClaudeBackend:
                 return compact_path(fp)
         return ""
 
+    _TOKEN_ALIASES = (
+        ("input_tokens", "in"),
+        ("cache_read_input_tokens", "cache"),
+        ("output_tokens", "out"),
+    )
+
     @classmethod
-    def _format_event(
-        cls, payload: dict[str, Any], *, enabled: bool
-    ) -> list[str] | None:
-        event_type = payload.get("type")
+    def _normalize_event(cls, payload: dict[str, Any]) -> NormalizedEvent | None:
+        match payload.get("type"):
+            case "system" if payload.get("subtype") == "init":
+                session_id = payload.get("session_id")
+                return RoleLine(
+                    "thread", session_id if isinstance(session_id, str) else ""
+                )
+            case "assistant":
+                return cls._normalize_assistant(payload.get("message"))
+            case "result":
+                return cls._normalize_result(payload)
+            case _:
+                return None
 
-        if event_type == "system" and payload.get("subtype") == "init":
-            session_id = payload.get("session_id")
-            message = _action_label("thread", enabled=enabled)
-            if isinstance(session_id, str) and session_id:
-                message = f"{message} {session_id}"
-            return [format_line("claude", message, enabled=enabled)]
-
-        if event_type == "assistant":
-            msg = payload.get("message")
-            if isinstance(msg, dict):
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") == "text":
-                            text = block.get("text")
-                            if isinstance(text, str) and text.strip():
-                                return _format_agent_message(
-                                    text, role="claude", enabled=enabled
-                                )
-                        if block.get("type") == "tool_use":
-                            tool_name = block.get("name", "")
-                            tool_input = block.get("input", {})
-                            action, _fallback = cls._tool_action(tool_name)
-                            detail = cls._tool_detail(
-                                tool_name,
-                                tool_input if isinstance(tool_input, dict) else {},
-                            )
-                            label = _action_label(action, enabled=enabled)
-                            if detail:
-                                label = f"{label} {detail}"
-                            elif _fallback:
-                                label = f"{label} {_fallback}"
-                            return [
-                                f"  {format_line('toolcall', label, enabled=enabled)}"
-                            ]
+    @classmethod
+    def _normalize_assistant(cls, message: Any) -> NormalizedEvent | None:
+        if not isinstance(message, dict):
             return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    return AgentMessage(text)
+            if block.get("type") == "tool_use":
+                tool_name = block.get("name", "")
+                tool_input = block.get("input", {})
+                action, fallback = cls._tool_action(tool_name)
+                detail = cls._tool_detail(
+                    tool_name,
+                    tool_input if isinstance(tool_input, dict) else {},
+                )
+                return ToolLine(action, detail or fallback)
+        return None
 
-        if event_type == "result":
-            subtype = payload.get("subtype")
+    @classmethod
+    def _normalize_result(cls, payload: dict[str, Any]) -> NormalizedEvent | None:
+        subtype = payload.get("subtype")
+        if subtype == "success":
             usage = payload.get("usage")
-            if subtype == "success":
-                parts: list[str] = []
-                if isinstance(usage, dict):
-                    for key, alias in (
-                        ("input_tokens", "in"),
-                        ("cache_read_input_tokens", "cache"),
-                        ("output_tokens", "out"),
-                    ):
-                        value = usage.get(key)
-                        if isinstance(value, int):
-                            parts.append(f"{alias}={value}")
-                label = _action_label("done", enabled=enabled)
-                if parts:
-                    label = f"{label} {' '.join(parts)}"
-                return [format_line("claude", label, enabled=enabled)]
-            if subtype == "error" or payload.get("is_error"):
-                return [
-                    format_line(
-                        "claude",
-                        _action_label("error", enabled=enabled),
-                        enabled=enabled,
-                    )
-                ]
-            return None
-
+            text = (
+                _token_usage_text(usage, cls._TOKEN_ALIASES)
+                if isinstance(usage, dict)
+                else ""
+            )
+            return RoleLine("done", text)
+        if subtype == "error" or payload.get("is_error"):
+            return RoleLine("error")
         return None
 
 

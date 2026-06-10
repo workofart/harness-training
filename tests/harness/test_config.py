@@ -15,8 +15,6 @@ def promotion_panel(
         "purpose": "promotion",
         "task_names": ["task-a"] if task_names is None else task_names,
         "task_timeout_sec": task_timeout_sec,
-        "run": {"when": "always"},
-        "baseline": {"required": False},
     }
 
 
@@ -26,8 +24,6 @@ def regression_veto_panel(task_names: list[str] | None = None) -> dict[str, obje
         "purpose": "regression_veto",
         "task_names": ["task-b"] if task_names is None else task_names,
         "task_timeout_sec": 1200.0,
-        "run": {"after_panel": "train", "when_status": "keep"},
-        "baseline": {"required": True},
     }
 
 
@@ -35,7 +31,6 @@ def minimal_config_payload(**updates) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": 2,
         "experiment_id": "exp-1",
-        "focus_name": "action-set",
         "panels": [promotion_panel()],
         "llm_provider_config": {
             "provider": "openrouter",
@@ -82,7 +77,6 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
     config = HarnessConfig.model_validate(payload)
 
     assert config.experiment_id == "exp-1"
-    assert config.focus_name == "action-set"
     assert config.promotion_panel.task_names == ["task-a"]
     assert config.regression_veto_panel is None
     assert config.max_steps == 20
@@ -227,36 +221,6 @@ def test_harness_config_rejects_duplicate_panel_ids():
         HarnessConfig.model_validate(payload)
 
     assert "panel ids must be unique: train" in str(exc.value)
-
-
-@pytest.mark.parametrize(
-    "panels",
-    [
-        pytest.param(
-            [regression_veto_panel(["task-b"]), promotion_panel(["task-a"])],
-            id="regression-veto-before-promotion",
-        ),
-        pytest.param(
-            [
-                promotion_panel(["task-a"]),
-                {
-                    **regression_veto_panel(["task-b"]),
-                    "run": {"after_panel": "test", "when_status": "keep"},
-                },
-            ],
-            id="regression-veto-self-reference",
-        ),
-    ],
-)
-def test_harness_config_rejects_regression_veto_not_after_promotion(panels):
-    payload = minimal_config_payload(panels=panels)
-
-    with pytest.raises(ValueError) as exc:
-        HarnessConfig.model_validate(payload)
-
-    assert "regression_veto panel must run after the promotion panel (train)" in str(
-        exc.value
-    )
 
 
 def test_harness_config_rejects_missing_schema_version():

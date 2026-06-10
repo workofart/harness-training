@@ -204,7 +204,8 @@ The supervisor never auto-recovers, resumes, or re-runs *broken* work. A run tha
 - `max_trial_concurrency`, `max_heavy_action_concurrency`: live trial bound and reset/run/verify bound.
 - `env_setup_timeout_sec`, `max_output_retries`: reset/bootstrap timeout and invalid-output repair budget.
 - `llm_provider_config`: harness model provider.
-- `focus_name` exists in the schema but `auto` does not read it — the live mechanism label is `LoopResult.focus_name`, captured from the proposal turn.
+
+Panels carry only membership (`purpose`, `task_names`) and a per-trial wall budget (`task_timeout_sec`); the promotion→veto sequencing is hardcoded in `supervisor/policy.decide()`, not configured. The mechanism label is `LoopResult.focus_name`, captured from the proposal turn — it is not a config field.
 
 Panel contract (validated at load): exactly one `purpose: "promotion"` panel and at most one `purpose: "regression_veto"`; both panel task sets non-empty and disjoint (a task cannot sit in both); panel task sets and excluded task groups disjoint.
 

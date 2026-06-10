@@ -60,7 +60,7 @@ def test_verify_ceiling_caps_a_hung_grader(monkeypatch) -> None:
     assert inner.verify_calls == 1  # the verifier was invoked, then stopped
     assert raw.done is True and raw.passed is False and raw.reward == 0.0
     assert VERIFY_TIMEOUT_NOTICE in (raw.stdout or "")
-    assert recorder.build_metrics().rule_fires.get("verify_timeout") == 1
+    assert recorder.metrics.rule_fires.get("verify_timeout") == 1
 
 
 def test_verify_ceiling_passes_through_a_prompt_grader() -> None:
@@ -71,7 +71,7 @@ def test_verify_ceiling_passes_through_a_prompt_grader() -> None:
     raw = asyncio.run(wrapped.verify())
 
     assert raw.passed is True and raw.reward == 1.0
-    assert recorder.build_metrics().rule_fires == {}
+    assert recorder.metrics.rule_fires == {}
 
 
 def test_verify_ceiling_propagates_inner_verifier_timeout() -> None:
@@ -89,7 +89,7 @@ def test_verify_ceiling_propagates_inner_verifier_timeout() -> None:
 
     with pytest.raises(TimeoutError, match="inner verifier timeout"):
         asyncio.run(wrapped.verify())
-    assert recorder.build_metrics().rule_fires == {}  # the ceiling did not fire
+    assert recorder.metrics.rule_fires == {}  # the ceiling did not fire
 
 
 # --- terminal classification ------------------------------------------------

@@ -12,8 +12,6 @@ ReasoningEffort = Literal["none", "low", "medium", "high"]
 OpenRouterServiceTier = Literal["auto", "default", "flex"]
 ChatGptCodexServiceTier = Literal["auto", "default", "flex", "priority", "standard"]
 PanelPurpose = Literal["promotion", "regression_veto"]
-PanelRunStatus = Literal["keep", "discard", "crash"]
-PanelLifecycle = Literal["pending", "active", "finished", "skipped"]
 
 
 class OpenRouterProviderRouting(BaseModel):
@@ -118,63 +116,18 @@ class ChatGptCodexConfig(BaseModel):
 LlmProviderConfig = OpenRouterConfig | ChatGptCodexConfig
 
 
-class PanelRunConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    when: Literal["always"] | None = None
-    after_panel: str | None = None
-    when_status: PanelRunStatus | None = None
-
-    @model_validator(mode="after")
-    def exactly_one_run_mode(self) -> Self:
-        is_always = self.when == "always"
-        is_gated = self.after_panel is not None or self.when_status is not None
-        if is_always == is_gated:
-            raise ValueError(
-                "panel run config must be either {'when': 'always'} or "
-                "{'after_panel': ..., 'when_status': ...}"
-            )
-        if is_gated and (self.after_panel is None or self.when_status is None):
-            raise ValueError(
-                "gated panel run config requires after_panel and when_status"
-            )
-        return self
-
-
-class PanelBaselineConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    required: bool = False
-
-
 class PanelConfig(BaseModel):
+    """A task panel: membership and per-trial wall budget only. The panel's role
+    comes from ``purpose``; the sequencing (promotion runs first, the veto runs
+    only after a train keep) is hardcoded in ``supervisor/policy.decide()``, not
+    configured here."""
+
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
     purpose: PanelPurpose
     task_names: list[str] = Field(min_length=1)
     task_timeout_sec: float = Field(default=600.0, gt=0)
-    run: PanelRunConfig = Field(default_factory=lambda: PanelRunConfig(when="always"))
-    baseline: PanelBaselineConfig = Field(default_factory=PanelBaselineConfig)
-
-    # Runtime policy derived from run/baseline so the runner consumes PanelConfig
-    # directly with no separate compiled mirror. Declared as @property (not Fields)
-    # so the persisted config schema is unaffected.
-    @property
-    def initial_lifecycle(self) -> PanelLifecycle:
-        return "active" if self.run.when == "always" else "pending"
-
-    @property
-    def after_panel(self) -> str | None:
-        return None if self.run.when == "always" else self.run.after_panel
-
-    @property
-    def when_status(self) -> PanelRunStatus | None:
-        return None if self.run.when == "always" else self.run.when_status
-
-    @property
-    def requires_baseline(self) -> bool:
-        return self.baseline.required
 
 
 class ExcludedTaskGroup(BaseModel):
@@ -193,10 +146,6 @@ class HarnessConfig(BaseModel):
     experiment_id: str = Field(
         min_length=1,
         description="Stable identifier written into experiment records.",
-    )
-    focus_name: str = Field(
-        default="",
-        description="Short label for the mechanism family being studied.",
     )
     panels: list[PanelConfig] = Field(
         min_length=1,
@@ -276,29 +225,6 @@ class HarnessConfig(BaseModel):
         ]
         if len(regression_veto_panels) > 1:
             raise ValueError("at most one regression_veto panel is supported")
-
-        panel_index_by_id = {panel.id: index for index, panel in enumerate(self.panels)}
-        promotion_panel = promotion_panels[0]
-        promotion_index = panel_index_by_id[promotion_panel.id]
-        for panel in promotion_panels:
-            if panel.run.when != "always" or panel.baseline.required:
-                raise ValueError(
-                    "promotion panel must run always and must not require a baseline"
-                )
-        for panel in regression_veto_panels:
-            if (
-                panel.run.after_panel != promotion_panel.id
-                or panel_index_by_id[panel.id] <= promotion_index
-            ):
-                raise ValueError(
-                    "regression_veto panel must run after the promotion panel "
-                    f"({promotion_panel.id}) and appear later in configured panels"
-                )
-            if panel.run.when_status != "keep" or not panel.baseline.required:
-                raise ValueError(
-                    "regression_veto panel must require baseline and run after "
-                    "an existing panel reaches keep"
-                )
 
         task_groups: list[tuple[str, set[str]]] = [
             (f"panels.{panel.id}.task_names", set(panel.task_names))

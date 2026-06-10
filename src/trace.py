@@ -327,11 +327,6 @@ class HarnessRecorder:
             return
         self.metrics.write(resolved_path)
 
-    def build_metrics(self) -> TaskMetrics:
-        if self.metrics is None:
-            return TaskMetrics()
-        return self.metrics
-
     def set_trial_outcome(
         self,
         *,

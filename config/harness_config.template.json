@@ -8,9 +8,6 @@
   // `uv run auto` overwrites this for supervisor-launched candidates.
   "experiment_id": "exp-example",
 
-  // Short label for the hypothesis or mechanism being tested.
-  "focus_name": "short-mechanism-label",
-
   // Terminal-Bench 2 task ids:
   // https://www.tbench.ai/benchmarks/terminal-bench-2
   // Local task_overrides/<task_id> directories take precedence over the Harbor registry.
@@ -24,12 +21,11 @@
       ],
 
       // Wall-clock timeout for one train task trial.
-      "task_timeout_sec": 300.0,
-      "run": { "when": "always" },
-      "baseline": { "required": false }
+      "task_timeout_sec": 300.0
     }
 
-    // Held-out tasks run only after the train panel passes promotion criteria.
+    // Held-out tasks run only after the train panel passes promotion criteria
+    // (the sequencing is built into the supervisor, not configured here).
     // They can block promotion on regression but cannot create promotion alone.
     // Add a comma after the train panel and uncomment this block to enable one.
     // ,
@@ -37,9 +33,7 @@
     //   "id": "test",
     //   "purpose": "regression_veto",
     //   "task_names": ["held-out-task-id"],
-    //   "task_timeout_sec": 600.0,
-    //   "run": { "after_panel": "train", "when_status": "keep" },
-    //   "baseline": { "required": true }
+    //   "task_timeout_sec": 600.0
     // }
   ],
 

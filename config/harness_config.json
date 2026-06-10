@@ -1,7 +1,6 @@
 {
   "schema_version": 2,
   "experiment_id": "exp-gpt-5-5-high-speed-up-0531",
-  "focus_name": "increase-exp-speed",
   "panels": [
     {
       "id": "train",
@@ -67,13 +66,7 @@
         "dna-assembly",
         "qemu-alpine-ssh"
       ],
-      "task_timeout_sec": 1200.0,
-      "run": {
-        "when": "always"
-      },
-      "baseline": {
-        "required": false
-      }
+      "task_timeout_sec": 1200.0
     },
     {
       "id": "test",
@@ -90,14 +83,7 @@
         "db-wal-recovery",
         "configure-git-webserver"
       ],
-      "task_timeout_sec": 1800.0,
-      "run": {
-        "after_panel": "train",
-        "when_status": "keep"
-      },
-      "baseline": {
-        "required": true
-      }
+      "task_timeout_sec": 1800.0
     }
   ],
   "excluded_task_groups": {
