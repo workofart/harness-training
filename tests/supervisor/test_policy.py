@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from src.experiment.record import ExperimentResult, TaskResult, TrialResult
+from src.supervisor import workspace
 from src.supervisor.policy import (
     BaselineComparison,
     CandidateDiff,
@@ -689,10 +690,74 @@ def test_decide_halts_on_dirty_primary_worktree() -> None:
     assert isinstance(decide(_world(primary_dirty=True)), Halt)
 
 
+def test_decide_halts_on_an_all_crash_pending_candidate() -> None:
+    # Every trial crashed (e.g. provider quota death): no evidence about the
+    # candidate, so the gate must not run -- Halt with the recovery runbook
+    # instead of recording a fake discard and relaunching into the dead API.
+    baseline = _exp(experiment_id="base", commit="head", tasks={"a": _task(True, True)})
+    candidate = _exp(
+        experiment_id="cand",
+        tasks={
+            "a": TaskResult(expected_trial_count=2, trials=[_crash("r0"), _crash("r1")])
+        },
+    )
+    pending = PendingRun(loop=_loop(), result=candidate)
+    command = decide(_world(pending=pending, active_baseline=baseline))
+    assert isinstance(command, Halt)
+    assert "pending candidate cand" in command.reason
+    assert "0/2 valid trials" in command.reason
+    assert "first error: boom" in command.reason
+    assert "mv experiments/cand archived_experiments/" in command.reason
+    # The runbook's ref path must match the one workspace actually creates.
+    assert workspace.candidate_ref("cand") in command.reason
+    assert "uv run auto" in command.reason
+
+
+def test_decide_halts_on_an_all_crash_pending_baseline() -> None:
+    # An all-crash baseline must not be adopted as the active baseline (every
+    # future gate would compare against a 0-trial frontier) -- Halt instead.
+    seed = _exp(
+        experiment_id="seed",
+        tasks={
+            "a": TaskResult(expected_trial_count=1, trials=[_crash("r0")]),
+            "b": TaskResult(expected_trial_count=1, trials=[_crash("r1")]),
+        },
+    )
+    pending = PendingRun(loop=_loop(kind="baseline", experiment_id="seed"), result=seed)
+    command = decide(_world(pending=pending))
+    assert isinstance(command, Halt)
+    assert "pending baseline seed" in command.reason
+    assert "0/2 valid trials" in command.reason
+    assert "candidate ref" not in command.reason  # baselines have no ref to drop
+    assert "re-run the baseline at HEAD" in command.reason
+
+
+def test_decide_gates_normally_when_only_some_trials_crashed() -> None:
+    # Surviving valid trials still carry evidence: crashes are excluded from
+    # scoring but the run gates normally rather than halting.
+    baseline = _exp(experiment_id="base", commit="head", tasks={"a": _task(True, True)})
+    candidate = _exp(
+        experiment_id="cand",
+        tasks={
+            "a": TaskResult(
+                expected_trial_count=3,
+                trials=[
+                    _crash("r0"),
+                    _trial("r1", solved=False),
+                    _trial("r2", solved=False),
+                ],
+            )
+        },
+    )
+    pending = PendingRun(loop=_loop(), result=candidate)
+    command = decide(_world(pending=pending, active_baseline=baseline))
+    assert command == Conclude("cand")
+
+
 def test_decide_concludes_a_completed_baseline_run() -> None:
     pending = PendingRun(
         loop=_loop(kind="baseline", experiment_id="seed"),
-        result=_exp(experiment_id="seed"),
+        result=_exp(experiment_id="seed", tasks={"a": _task(True)}),
     )
     command = decide(_world(pending=pending))
     assert command == Conclude("seed")

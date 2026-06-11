@@ -124,7 +124,7 @@
     }
   },
   "max_steps": 1000,
-  "max_trial_concurrency": 20,
+  "max_trial_concurrency": 25,
   "max_heavy_action_concurrency": 10,
   "env_setup_timeout_sec": 600.0,
   "max_output_retries": 2,

@@ -680,13 +680,67 @@ class Diagnose:
 Command = Halt | RefreshBaseline | ProposeAndLaunch | RunVeto | Conclude | Diagnose
 
 
+def _evidence_free_halt(pending: PendingRun) -> Halt:
+    """The recovery runbook for a completed pending run with zero valid trials
+    (every trial crashed -- provider/infra death, e.g. quota exhaustion). Such a
+    run carries no evidence about the code it ran: gating it would record a fake
+    discard (or adopt an empty baseline) and relaunch the next run into the same
+    dead provider, so the loop stops for a human instead. The trial slots are
+    consumed (a crash slot is never re-run), so recovery is archival, not
+    resumption; the ref path mirrors ``workspace.candidate_ref`` (pinned by
+    test) rather than importing the effectful layer into this pure module."""
+    result = pending.result
+    assert result is not None
+    total = sum(len(task.trials) for task in result.tasks.values())
+    first_error = next(
+        (
+            trial.error.splitlines()[0][:120]
+            for task in result.tasks.values()
+            for trial in task.trials
+            if trial.error
+        ),
+        None,
+    )
+    evidence = f"0/{total} valid trials -- every trial crashed"
+    if first_error is not None:
+        evidence += f" (first error: {first_error})"
+    experiment_id = result.experiment_id
+    if pending.loop.kind == "candidate":
+        return Halt(
+            f"pending candidate {experiment_id} has {evidence}. This is an "
+            "infra/provider failure, not evidence about the candidate, so the "
+            "gate was not run. To recover:\n"
+            "  1. fix the provider issue (e.g. wait for the usage-limit window "
+            "to reset)\n"
+            f"  2. archive the dead run:   mv experiments/{experiment_id} "
+            "archived_experiments/\n"
+            "  3. drop its candidate ref: git update-ref -d "
+            f"refs/experiments/candidate/{experiment_id}\n"
+            "  4. restart: uv run auto    (the proposer will generate a fresh "
+            "candidate)"
+        )
+    return Halt(
+        f"pending baseline {experiment_id} has {evidence}. This is an "
+        "infra/provider failure, not baseline evidence, so it was not adopted. "
+        "To recover:\n"
+        "  1. fix the provider issue (e.g. wait for the usage-limit window "
+        "to reset)\n"
+        f"  2. archive the dead run: mv experiments/{experiment_id} "
+        "archived_experiments/\n"
+        "  3. restart: uv run auto  (the loop will re-run the baseline at HEAD)"
+    )
+
+
 def decide(w: World) -> Command:
     """The outer-loop truth table, executable (§6). First match wins; the order
     is the table. No stored phase -- every command is derived from ``World``.
     A dead pending run (crashed, killed mid-run leaving run_status "running", or
     launched-but-never-recorded) is filtered out of ``World.pending`` by ``scan()``
     (§11), so the pending here is always a completed run a manual rerun can act on
-    -- a prior crash never blocks the loop. HEAD-drift safety beyond rule 6's
+    -- a prior crash never blocks the loop. A completed pending whose every trial
+    crashed (zero valid trials -- provider death, e.g. quota exhaustion) Halts
+    with a recovery runbook before any gating: an evidence-free run is an infra
+    fact, never a verdict. HEAD-drift safety beyond rule 6's
     ``commit == HEAD`` lives at the one HEAD-moving op (``Conclude``'s
     ``--ff-only``)."""
     if w.primary_dirty:
@@ -695,6 +749,8 @@ def decide(w: World) -> Command:
     if p:  # a completed pending run (scan() filtered out any dead pending)
         result = p.result
         assert result is not None and result.run_status == "completed"
+        if not any(task.valid_trials for task in result.tasks.values()):
+            return _evidence_free_halt(p)
         if p.loop.kind == "baseline":
             return Conclude(result.experiment_id)
         baseline = w.active_baseline

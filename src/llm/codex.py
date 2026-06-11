@@ -450,7 +450,12 @@ def _function_call_item(
 def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
     final_response: dict[str, Any] | None = None
     calls: dict[str, dict[str, Any]] = {}
-    content_parts: list[str] = []
+    # Assistant text keyed by output-item id. The same message arrives twice --
+    # as incremental `output_text.delta` chunks and as the complete terminal
+    # `output_item.done` item -- so keying (rather than a flat list) lets the
+    # done item REPLACE its streamed chunks instead of doubling them. Deltas
+    # alone survive a truncated stream where no done item is emitted.
+    text_by_item: dict[str, str] = {}
     finish_reason: str | None = None
 
     for event in events:
@@ -469,10 +474,11 @@ def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
             if item_id in calls and isinstance(event.get("arguments"), str):
                 calls[item_id]["arguments"] = event["arguments"]
         elif event_type == "response.output_text.delta":
+            item_id = str(event.get("item_id"))
             if isinstance(event.get("delta"), str):
-                content_parts.append(event["delta"])
+                text_by_item[item_id] = text_by_item.get(item_id, "") + event["delta"]
         elif event_type == "response.output_item.done":
-            _merge_done_item(event.get("item"), calls, content_parts)
+            _merge_done_item(event.get("item"), calls, text_by_item)
         elif event_type == "response.completed":
             response = event.get("response")
             if isinstance(response, dict):
@@ -480,11 +486,11 @@ def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
                 finish_reason = "completed"
 
     if final_response is not None:
-        final_calls, final_content = _extract_final_output(final_response)
+        final_calls, final_text = _extract_final_output(final_response)
         if final_calls:
             calls = final_calls
-        if final_content:
-            content_parts = [final_content]
+        if final_text:
+            text_by_item = final_text
 
     tool_calls = tuple(
         LlmToolCall(
@@ -494,7 +500,7 @@ def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
         for call in calls.values()
         if isinstance(call.get("name"), str)
     )
-    content = "".join(content_parts) or None
+    content = "".join(text_by_item.values()) or None
     return LlmCompletion(
         tool_calls=tool_calls,
         content=content,
@@ -508,7 +514,7 @@ def _completion_from_events(events: list[dict[str, Any]]) -> LlmCompletion:
 def _merge_done_item(
     item: Any,
     calls: dict[str, dict[str, Any]],
-    content_parts: list[str],
+    text_by_item: dict[str, str],
 ) -> None:
     if not isinstance(item, dict):
         return
@@ -518,17 +524,17 @@ def _merge_done_item(
     elif item.get("type") == "message":
         text = _text_from_content(item.get("content"))
         if text:
-            content_parts.append(text)
+            text_by_item[str(item.get("id"))] = text
 
 
 def _extract_final_output(
     response: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], str | None]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     calls: dict[str, dict[str, Any]] = {}
-    content_parts: list[str] = []
+    text_by_item: dict[str, str] = {}
     output = response.get("output")
     if not isinstance(output, list):
-        return calls, None
+        return calls, text_by_item
     for item in output:
         if not isinstance(item, dict):
             continue
@@ -538,8 +544,8 @@ def _extract_final_output(
         elif item.get("type") == "message":
             text = _text_from_content(item.get("content"))
             if text:
-                content_parts.append(text)
-    return calls, "\n".join(content_parts) or None
+                text_by_item[str(item.get("id"))] = text
+    return calls, text_by_item
 
 
 def _text_from_content(content: Any) -> str:

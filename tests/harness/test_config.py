@@ -122,7 +122,7 @@ def test_default_harness_config_matches_baseline_run_profile():
     assert "qemu-startup" in slow_group.task_names
     assert "financial-document-processor" in config.train.task_names
     assert "dna-assembly" in config.train.task_names
-    assert config.max_trial_concurrency == 20
+    assert config.max_trial_concurrency == 25
     assert config.max_heavy_action_concurrency == 10
     assert config.train.task_timeout_sec == 1200.0
     assert held_out.task_timeout_sec == 1800.0
