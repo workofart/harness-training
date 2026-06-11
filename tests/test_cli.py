@@ -352,3 +352,38 @@ def test_exp_progress_bar_renders_and_scopes_to_its_own_task_ids():
     assert "1/1 tasks (100%)" in stream.writes[-1]
     bar.close()
     assert stream.writes[-1] == "\n"  # close caps the dangling line
+
+
+def test_exp_progress_bar_solved_counts_majority_solved_tasks_not_trials():
+    # Regression: `solved` is a task count (majority-solved tasks) matching the
+    # `decided` task denominator. Summing per-trial solves instead let the
+    # numerator outrun the denominator ("solved 4/2") on any multi-trial task.
+    def _solved(run_id: str) -> TrialResult:
+        return TrialResult(
+            run_id=run_id, solved=True, failure_mode="solved", verifier_passed=True
+        )
+
+    def _unsolved(run_id: str) -> TrialResult:
+        return TrialResult(
+            run_id=run_id,
+            solved=False,
+            failure_mode="verified_rejected",
+            verifier_passed=False,
+        )
+
+    stream = _FakeStream(tty=True)
+    bar = cli._ExpProgressBar(
+        task_ids=["maj", "min"], max_trial_concurrency=4, stream=stream
+    )
+    majority = TaskResult(
+        expected_trial_count=3, trials=[_solved("m0"), _solved("m1"), _solved("m2")]
+    )
+    # One solve of three valid trials: decided, but not majority-solved.
+    minority = TaskResult(
+        expected_trial_count=3,
+        trials=[_solved("n0"), _unsolved("n1"), _unsolved("n2")],
+    )
+    bar.render({"maj": majority, "min": minority})
+    # Both tasks decided; only `maj` is majority-solved -> 1/2, not the 4/2 a
+    # per-trial sum (3 + 1 solved trials) would print.
+    assert "solved 1/2" in stream.writes[-1]

@@ -276,8 +276,9 @@ def format_exp_progress(
     Anchored on task completion (`tasks_done/total_tasks`): that denominator is
     fixed so the bar never moves backward, whereas `trials_planned` shifts as the
     majority decides early or a candidate confirms-on-fail, so trials are detail
-    text. `solved/decided` mirror the live record (`decided` = tasks with at least
-    one valid trial). ETA divides remaining tasks by the observed completion rate.
+    text. `solved/decided` are task counts off the live record (`solved` = tasks
+    the majority verdict has solved, `decided` = tasks with at least one valid
+    trial). ETA divides remaining tasks by the observed completion rate.
     """
     frac = tasks_done / total_tasks if total_tasks else 0.0
     filled = int(frac * _PROGRESS_BAR_WIDTH)
@@ -332,7 +333,7 @@ class _ExpProgressBar:
             total_tasks=len(self._task_ids),
             trials_done=trials_done,
             trials_planned=trials_planned,
-            solved=sum(t.solved_count for t in scoped),
+            solved=sum(1 for t in scoped if t.majority_solved is True),
             decided=sum(1 for t in scoped if t.majority_solved is not None),
             error_trials=trials_done - valid_done,
             in_flight=max(
