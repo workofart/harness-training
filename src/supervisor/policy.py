@@ -2,7 +2,8 @@
 
 Every pure function and data type the supervisor needs, with zero I/O: the
 ``decide(world) -> Command`` transition, the promotion/veto ``gate`` and its
-Fisher statistics, ``combine``, the per-task trial ``budget_from_baseline``, the
+statistics (per-task Fisher exact diagnostics + the stratified CMH promotion
+test), ``combine``, the per-task trial ``budget_from_baseline``, the
 ``validate_candidate`` diff check, and the agent's view constants
 (``VISIBLE_PATHS``/``EDITABLE_PATHS``). ``loop.py`` does the reading (builds
 ``World`` via ``scan()``) and the writing (the command executors); this module
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -38,11 +40,14 @@ from src.experiment.record import ExperimentResult
 # being strongly conservative at small per-task trial counts (n~3-5).
 PER_TASK_VERDICT_P_VALUE_ALPHA = 0.05
 
-# Two-sided alpha for the aggregate panel test, where each unit is a whole task
-# (majority-solved), not a trial. Relaxed relative to the per-task alpha: a
-# single test over the panel (no multiplicity to guard) and a panel-wide
-# solved-task gain is a weaker per-comparison signal than a per-task rate jump.
-AGGREGATE_PROMOTION_P_VALUE_ALPHA = 0.20
+# One-sided alpha for the promotion test: a Cochran-Mantel-Haenszel test over
+# pooled per-trial solves, stratified by task. Permissive on purpose --
+# identical-code panel noise is ~+-1.8 majority-solved tasks while a real
+# single-mechanism effect is ~+1 task, so a strict aggregate bar is unpassable
+# by any real candidate. The direction requirement plus the CMH's conservatism
+# at these trial counts keep the measured null false-keep at ~0.03 (see
+# tests/supervisor/test_gate_acceptance.py).
+PROMOTION_P_VALUE_ALPHA = 0.10
 
 Purpose = Literal["promotion", "regression_veto"]
 VerdictKind = Literal["improvement", "regression", "unchanged", "uncompared"]
@@ -101,6 +106,78 @@ def compute_fisher_exact_p_value(
         if (prob := _table_prob(k)) <= p_observed * (1.0 + 1e-9)
     )
     return min(1.0, total)
+
+
+# One stratum of the promotion test: one task's per-trial 2x2 table as
+# (candidate_solved, candidate_total, baseline_solved, baseline_total).
+Stratum = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class StratifiedSolveTest:
+    """One-sided Cochran-Mantel-Haenszel test that the candidate's per-trial
+    solve odds exceed the baseline's, stratified by task. Built from the
+    per-task strata in one pass by ``from_strata``; the promotion branch of
+    ``_panel_decision`` reads ``delta`` (direction), ``p_value``
+    (significance), and ``counts`` (the reason-string evidence).
+
+    Pure-Python normal approximation (no continuity correction), golden-tested
+    against statsmodels/scipy offline. ``delta`` is the CMH numerator -- the
+    sum over strata of (observed candidate solves - expected under the task's
+    own pooled rate, both margins fixed), positive iff the candidate
+    out-solves the baseline after conditioning on per-task margins.
+    ``p_value`` is 1 - Phi(delta / sqrt(sum of per-stratum hypergeometric
+    variances)). Unequal arm sizes per stratum are fine. Strata missing
+    either arm, and degenerate strata (all trials solved or none solved
+    across both arms), carry zero information and drop out; with zero total
+    variance there is no evidence at all -> p_value = 1.0.
+    """
+
+    delta: float
+    p_value: float
+    candidate_solved: int
+    candidate_total: int
+    baseline_solved: int
+    baseline_total: int
+
+    @classmethod
+    def from_strata(cls, strata: Iterable[Stratum]) -> StratifiedSolveTest:
+        numerator = 0.0
+        variance = 0.0
+        pooled = [0, 0, 0, 0]
+        for stratum in strata:
+            candidate_solved, candidate_total, baseline_solved, baseline_total = stratum
+            if not 0 <= candidate_solved <= candidate_total:
+                raise ValueError("candidate_solved must be in [0, candidate_total]")
+            if not 0 <= baseline_solved <= baseline_total:
+                raise ValueError("baseline_solved must be in [0, baseline_total]")
+            for i, count in enumerate(stratum):
+                pooled[i] += count
+            if candidate_total == 0 or baseline_total == 0:
+                continue  # a stratum missing either arm carries no comparison
+            n = candidate_total + baseline_total  # >= 2 with both arms present
+            solved = candidate_solved + baseline_solved
+            numerator += candidate_solved - candidate_total * solved / n
+            variance += (
+                candidate_total
+                * baseline_total
+                * solved
+                * (n - solved)
+                / (n * n * (n - 1))
+            )
+        if variance == 0.0:
+            p_value = 1.0
+        else:
+            z = numerator / math.sqrt(variance)
+            p_value = 0.5 * math.erfc(z / math.sqrt(2.0))
+        return cls(numerator, p_value, *pooled)
+
+    @property
+    def counts(self) -> str:
+        return (
+            f"pooled {self.candidate_solved}/{self.candidate_total} vs "
+            f"{self.baseline_solved}/{self.baseline_total} trial solves"
+        )
 
 
 class BaselineComparison(BaseModel):
@@ -329,36 +406,64 @@ def _panel_decision(
     verdicts: dict[str, BaselineComparison],
     purpose: Purpose,
 ) -> tuple[DecisionKind, str]:
-    candidate_solved, candidate_total, baseline_solved, baseline_total = (
-        _aggregate_counts(verdicts)
-    )
-    counts = (
-        f"{candidate_solved}/{candidate_total} vs {baseline_solved}/{baseline_total}"
-    )
     if purpose == "regression_veto":
         # Veto can only block, never promote: discard iff the candidate solves
-        # strictly fewer tasks than the frozen baseline did.
+        # strictly fewer tasks (majority-solved) than the frozen baseline did.
+        candidate_solved, candidate_total, baseline_solved, baseline_total = (
+            _aggregate_counts(verdicts)
+        )
+        counts = (
+            f"{candidate_solved}/{candidate_total} "
+            f"vs {baseline_solved}/{baseline_total}"
+        )
         if candidate_solved < baseline_solved:
             return "discard", f"test aggregate regressed: {counts}"
         return "keep", f"test aggregate did not regress: {counts}"
-    if candidate_solved <= baseline_solved:
-        return "discard", f"train aggregate did not improve: {counts}"
-    if baseline_total == 0:
+
+    # Promotion: pooled per-trial solves, stratified by task. Only tasks with
+    # trials in BOTH arms enter the test -- a no-baseline frontier task has
+    # nothing to stratify against.
+    strata = [
+        (
+            verdict.candidate_solved,
+            verdict.candidate_total,
+            verdict.baseline_solved,
+            verdict.baseline_total,
+        )
+        for verdict in verdicts.values()
+        if verdict.candidate_total > 0 and verdict.baseline_total > 0
+    ]
+    if not strata:
+        # Pure frontier panel (the baseline never ran any of these tasks):
+        # majority-solved counts are the only evidence, as before.
+        candidate_solved, _, baseline_solved, _ = _aggregate_counts(verdicts)
+        counts = f"{candidate_solved} vs {baseline_solved} majority-solved tasks"
+        if candidate_solved <= baseline_solved:
+            return "discard", f"train aggregate did not improve: {counts}"
         return "keep", f"train aggregate improved: {counts}"
-    # Both guards above leave a positive denominator, so p_value is set here.
-    p_value = compute_fisher_exact_p_value(
-        candidate_solved=candidate_solved,
-        candidate_total=candidate_total,
-        baseline_solved=baseline_solved,
-        baseline_total=baseline_total,
-    )
-    passed = p_value <= AGGREGATE_PROMOTION_P_VALUE_ALPHA
-    verb = "improved" if passed else "improvement not significant"
-    op = "<=" if passed else ">"
+
+    # Direction must be checked stratified, not on raw pooled rates: the
+    # deterministic-tier single-trial budget weights candidate trials toward
+    # hard tasks, so the raw pooled candidate rate can sit below the baseline's
+    # by composition alone. The CMH numerator conditions on each task's own
+    # margins.
+    test = StratifiedSolveTest.from_strata(strata)
+    if test.delta <= 0:
+        return (
+            "discard",
+            f"train stratified solve delta did not improve: "
+            f"{test.delta:+.2f} ({test.counts})",
+        )
+    if test.p_value > PROMOTION_P_VALUE_ALPHA:
+        return (
+            "discard",
+            f"train improvement not significant: {test.counts} "
+            f"(one-sided CMH p={test.p_value:.3g} > {PROMOTION_P_VALUE_ALPHA})",
+        )
     return (
-        "keep" if passed else "discard",
-        f"train aggregate {verb}: {counts} "
-        f"(p={p_value:.3g} {op} {AGGREGATE_PROMOTION_P_VALUE_ALPHA})",
+        "keep",
+        f"train pooled solve rate improved: {test.counts} "
+        f"(one-sided CMH p={test.p_value:.3g} <= {PROMOTION_P_VALUE_ALPHA})",
     )
 
 
@@ -371,9 +476,10 @@ def gate(
 ) -> Decision:
     """Judge ``candidate`` against the frozen ``baseline`` over ``task_ids``.
 
-    Promotion is aggregate (solved-task count must improve over the frozen
-    parent and pass the relaxed Fisher check); regression-veto can only block
-    (discard iff fewer tasks solved). Per-task verdicts stay diagnostic, carried
+    Promotion is stratified per-trial: the stratified solve delta must be
+    strictly positive and the one-sided CMH test significant at
+    ``PROMOTION_P_VALUE_ALPHA``. Regression-veto can only block (discard iff
+    fewer majority-solved tasks). Per-task verdicts stay diagnostic, carried
     on the returned ``Decision`` -- the single source of truth for the gate
     decision and the persisted evidence both.
     """
