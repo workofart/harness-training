@@ -164,11 +164,12 @@ def _parse_exp_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _task_timeout_by_task(harness_config) -> dict[str, float]:
-    # Each task carries its owning panel's wall budget; tasks are disjoint across
-    # panels (config §12), so this is unambiguous for any selected subset.
+def _panel_seconds_by_task(harness_config, field_name: str) -> dict[str, float]:
+    # Each task carries its owning panel's wall budgets (task_timeout_sec /
+    # verify_timeout_sec); tasks are disjoint across panels (config §12), so
+    # this is unambiguous for any selected subset.
     return {
-        task_id: panel.task_timeout_sec
+        task_id: getattr(panel, field_name)
         for panel in _configured_panels(harness_config)
         for task_id in panel.task_names
     }
@@ -214,7 +215,8 @@ async def _build_trial_runner(
     task_dirs = await _resolve_task_dirs(
         trial_harbor_config=trial_harbor_config, task_names=task_ids
     )
-    task_timeout_sec = _task_timeout_by_task(harness_config)
+    task_timeout_sec = _panel_seconds_by_task(harness_config, "task_timeout_sec")
+    verify_timeout_sec = _panel_seconds_by_task(harness_config, "verify_timeout_sec")
 
     async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
         env = Harbor(
@@ -234,6 +236,7 @@ async def _build_trial_runner(
             max_output_retries=harness_config.max_output_retries,
             task_timeout_sec=task_timeout_sec[task_id],
             env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
+            verify_timeout_sec=verify_timeout_sec[task_id],
             slot_release=slot_release,
         )
 

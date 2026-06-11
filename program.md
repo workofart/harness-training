@@ -74,6 +74,7 @@ Use:
 
 - task instructions
 - normal command stdout/stderr
+- the remaining wall-clock budget: every environment state carries `time_remaining_sec` (stamped by the executor; `None` means unbounded)
 - `agent/steps.jsonl`
 - `agent/metrics.json`
 - `agent/exec.log`

@@ -8,6 +8,10 @@
   the agent loop, so `core.py`'s `VerifyAction` stays a bare `env.verify()` and
   Harbor stays trace-free; a hung grader is cut to a terminal non-passing state
   plus a trial-level `verify_timeout` fire (#9);
+- budget visibility: a stamping `HarnessEnv` wrapper that writes the trial's
+  remaining wall budget (`RawState.time_remaining_sec`) onto every state the
+  harness sees. The clock anchors at agent-phase `asyncio.timeout` entry, so
+  env setup/bootstrap never counts against the agent;
 - terminal failure classification into the `failure_mode` buckets;
 - resource cleanup with the concurrency slot released *before* docker teardown,
   so the next trial's `compose up` overlaps this trial's `compose down` (#3).
@@ -18,7 +22,9 @@ Concurrency, scheduling, aggregation, and gating are the orchestrator's job.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,13 +34,15 @@ from src.experiment.record import TrialResult
 from src.harness.core import NoValidActionError, TaskLoopState, run_task_loop
 from src.llm.base import BaseLlm
 
-# Wall ceiling for a single graded verify (run in a separate build+test env). A
-# looping/deadlocked deliverable otherwise hangs the verifier until the whole-task
-# timeout (observed: 11-28 min hangs on tasks that normally verify in seconds); the
-# ceiling fails such a grader fast and terminally. Set above the longest verify seen
-# to complete, so only a hang is cut; keyed on wall time alone, not the task. Lives
-# here (off `harness/core`) so grading infra stays off the candidate-editable
-# surface (plan.md §13).
+# Default wall ceiling for a single graded verify (run in a separate build+test
+# env). A looping/deadlocked deliverable otherwise hangs the verifier until the
+# whole-task timeout (observed: 11-28 min hangs on tasks that normally verify in
+# seconds); the ceiling fails such a grader fast and terminally. Set above the
+# longest verify seen to complete, so only a hang is cut; keyed on wall time
+# alone, not the task. Per-panel overrides live in config
+# (`TaskPanel.verify_timeout_sec`) and reach `run_trial` via the cli wiring; the
+# constant stays here (off `harness/core`) so grading infra stays off the
+# candidate-editable surface (plan.md §13).
 VERIFY_TIMEOUT_SEC: float = 900.0
 VERIFY_TIMEOUT_NOTICE = (
     "Grading did not complete within the time limit and was stopped. A correct "
@@ -44,7 +52,7 @@ VERIFY_TIMEOUT_NOTICE = (
 
 
 class _VerifyCeilingEnv:
-    """Wraps a `HarnessEnv` to bound `verify()` by `VERIFY_TIMEOUT_SEC`.
+    """Wraps a `HarnessEnv` to bound `verify()` by `timeout_sec`.
 
     On expiry it records a trial-level `verify_timeout` fire and returns the
     terminal non-passing `RawState` -- the unsolved verdict the task timeout
@@ -54,9 +62,16 @@ class _VerifyCeilingEnv:
     trace-free and `core.py`'s `VerifyAction` is a bare `env.verify()`.
     """
 
-    def __init__(self, inner: HarnessEnv, recorder: trace_module.Recorder) -> None:
+    def __init__(
+        self,
+        inner: HarnessEnv,
+        recorder: trace_module.Recorder,
+        *,
+        timeout_sec: float = VERIFY_TIMEOUT_SEC,
+    ) -> None:
         self._inner = inner
         self._recorder = recorder
+        self._timeout_sec = timeout_sec
 
     @property
     def trial_dir(self) -> str | None:
@@ -84,7 +99,7 @@ class _VerifyCeilingEnv:
     async def verify(self) -> RawState:
         ceiling = None
         try:
-            async with asyncio.timeout(VERIFY_TIMEOUT_SEC) as ceiling:
+            async with asyncio.timeout(self._timeout_sec) as ceiling:
                 return await self._inner.verify()
         except TimeoutError:
             # Only the ceiling's own expiry is a graded-verify timeout. A
@@ -95,6 +110,71 @@ class _VerifyCeilingEnv:
                 raise
             self._recorder.rule_fired("verify_timeout")
             return RawState(reward=0.0, passed=False, stdout=VERIFY_TIMEOUT_NOTICE)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+class _BudgetStampingEnv:
+    """Wraps a `HarnessEnv` to stamp `RawState.time_remaining_sec` on every
+    state it returns (same wrapper pattern as `_VerifyCeilingEnv`).
+
+    The clock anchors at agent-phase `asyncio.timeout` entry (`start_clock`),
+    so env setup/bootstrap never counts against the agent's budget. With no
+    budget configured the stamp is a no-op and `time_remaining_sec` stays
+    `None` (unbounded). `clock` is injectable for tests; the default matches
+    `asyncio`'s event-loop time source semantics (monotonic).
+    """
+
+    def __init__(
+        self,
+        inner: HarnessEnv,
+        *,
+        budget_sec: float | None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._inner = inner
+        self._budget_sec = budget_sec
+        self._clock = clock
+        self._anchor: float | None = None
+
+    @property
+    def trial_dir(self) -> str | None:
+        return self._inner.trial_dir
+
+    @property
+    def verifier_stdout_path(self) -> str | None:
+        return self._inner.verifier_stdout_path
+
+    def start_clock(self) -> None:
+        self._anchor = self._clock()
+
+    def stamp(self, state: RawState) -> RawState:
+        if self._budget_sec is None:
+            return state
+        assert self._anchor is not None, "start_clock() must run before stamping"
+        remaining = max(0.0, self._budget_sec - (self._clock() - self._anchor))
+        return replace(state, time_remaining_sec=remaining)
+
+    async def reset(self) -> RawState:
+        return self.stamp(await self._inner.reset())
+
+    async def exec(
+        self,
+        *,
+        command: str,
+        cwd: str | None = None,
+        timeout_sec: int | None = None,
+        workload: EnvExecWorkload = "heavy",
+    ) -> RawState:
+        return self.stamp(
+            await self._inner.exec(
+                command=command, cwd=cwd, timeout_sec=timeout_sec, workload=workload
+            )
+        )
+
+    async def verify(self) -> RawState:
+        return self.stamp(await self._inner.verify())
 
     async def close(self) -> None:
         await self._inner.close()
@@ -169,8 +249,10 @@ async def run_trial(
     max_output_retries: int = 2,
     task_timeout_sec: float | None = None,
     env_setup_timeout_sec: float | None = None,
+    verify_timeout_sec: float = VERIFY_TIMEOUT_SEC,
     trace_path: str | None = None,
     slot_release: Callable[[], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> TrialResult:
     setup_timeout_ctx = None
     agent_timeout_ctx = None
@@ -211,11 +293,19 @@ async def run_trial(
             instruction=reset_state.instruction,
             working_dir=reset_state.working_dir,
         )
+        budget_env = _BudgetStampingEnv(
+            _VerifyCeilingEnv(env, recorder, timeout_sec=verify_timeout_sec),
+            budget_sec=task_timeout_sec,
+            clock=clock,
+        )
         async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
+            # The budget clock anchors here -- reset/bootstrap above never
+            # counts -- and the reset state carries the first (full) stamp.
+            budget_env.start_clock()
             await run_task_loop(
                 llm=llm,
-                env=_VerifyCeilingEnv(env, recorder),
-                reset_state=reset_state,
+                env=budget_env,
+                reset_state=budget_env.stamp(reset_state),
                 max_steps=max_steps,
                 max_output_retries=max_output_retries,
                 recorder=recorder,

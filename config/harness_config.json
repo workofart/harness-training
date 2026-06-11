@@ -62,7 +62,8 @@
       "dna-assembly",
       "qemu-alpine-ssh"
     ],
-    "task_timeout_sec": 1200.0
+    "task_timeout_sec": 1200.0,
+    "verify_timeout_sec": 600.0
   },
   "test": {
     "task_names": [
@@ -77,7 +78,8 @@
       "db-wal-recovery",
       "configure-git-webserver"
     ],
-    "task_timeout_sec": 1800.0
+    "task_timeout_sec": 1800.0,
+    "verify_timeout_sec": 900.0
   },
   "excluded_task_groups": {
     "contamination_risk": {

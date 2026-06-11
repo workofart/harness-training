@@ -126,6 +126,11 @@ class TaskPanel(BaseModel):
 
     task_names: list[str] = Field(min_length=1)
     task_timeout_sec: float = Field(default=600.0, gt=0)
+    # Wall ceiling for one graded verify on this panel's tasks (the executor's
+    # verify-ceiling wrapper). Sits next to task_timeout_sec so each panel can
+    # trade grader patience for wall time: a hung grader burns the full ceiling
+    # as a terminal failing verdict either way.
+    verify_timeout_sec: float = Field(default=900.0, gt=0)
 
 
 class ExcludedTaskGroup(BaseModel):

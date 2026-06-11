@@ -62,6 +62,9 @@ class RawState:
     - `verify()` returns the authoritative terminal judgment for the task
       (`passed` + `reward`). Loop termination is the harness's call (a verify
       action ends the trial), not an env-owned flag.
+    - `time_remaining_sec` is the trial's remaining wall-clock budget, stamped
+      by the executor on every reset/exec/verify return; `None` means the
+      trial is unbounded (no budget configured).
     """
 
     instruction: str = ""
@@ -71,6 +74,7 @@ class RawState:
     return_code: int | None = None
     stdout: str | None = None
     stderr: str | None = None
+    time_remaining_sec: float | None = None
 
     @property
     def action_passed(self) -> bool | None:

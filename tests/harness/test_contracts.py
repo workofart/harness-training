@@ -1,6 +1,31 @@
 from __future__ import annotations
 
-from src.contracts import TaskMetrics, is_majority_decided, is_majority_solved
+from dataclasses import asdict
+
+from src.contracts import (
+    RawState,
+    TaskMetrics,
+    is_majority_decided,
+    is_majority_solved,
+)
+
+
+def test_raw_state_round_trips_through_asdict():
+    # RawState crosses process boundaries as plain dicts (trace events); the
+    # field set -- including the budget stamp -- must survive a round trip.
+    state = RawState(
+        instruction="do",
+        working_dir="/w",
+        reward=1.0,
+        passed=True,
+        return_code=0,
+        stdout="out",
+        stderr="err",
+        time_remaining_sec=123.5,
+    )
+    assert RawState(**asdict(state)) == state
+    # Default: no budget configured -> unbounded.
+    assert RawState().time_remaining_sec is None
 
 
 def test_task_metrics_from_dict_coerces_counter_values():
