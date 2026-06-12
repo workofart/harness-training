@@ -51,11 +51,14 @@ task-declared step checks.
 
 ## Promotion
 
-A candidate is evaluated against the frozen active baseline at two levels. The promotion decision is panel-level: each task contributes its majority-solved result, and the panel compares candidate solved-task count against baseline solved-task count with a two-sided Fisher exact test at alpha = 0.20. Per-task two-sided Fisher exact verdicts at alpha = 0.05 are still computed as task-level evidence for diagnosis and self-improvement; they do not directly keep or discard a promotion panel.
+A candidate is evaluated against the frozen active baseline on pooled per-trial solves, stratified by task. Per-task two-sided Fisher exact verdicts at alpha = 0.05 are still computed as task-level evidence for diagnosis and self-improvement; they do not directly keep or discard a promotion panel.
 
 1. A per-trial infrastructure failure is retried within the trial on a bounded internal budget. If it still fails, the trial concludes as a terminal `crash`, excluded from all evidence, with no effect on the run status or other trials (and it is not re-run). Experiment-level failures still make the run `crash`: setup, task resolution, evaluation, or a run that produced zero valid trials across the whole panel. A baseline run that crashes is not installed; the next `uv run auto` reruns it.
 2. If there is no baseline at the current commit, `uv run auto` first runs all configured tasks as a kept baseline, then starts candidate search.
-3. Otherwise the promotion panel returns `keep` only if the candidate solves more train tasks than the baseline and, when the baseline has samples for the panel, the aggregate Fisher exact test is significant at alpha = 0.20. If the frozen baseline has no panel samples (a frontier task it never solved), a higher candidate solved-task count is enough. Else `discard`.
+3. Otherwise the promotion panel returns `keep` only if both hold; else `discard`:
+   - the stratified solve delta over the train panel is strictly positive (the candidate out-solves each task's own pooled expectation, summed over tasks with trials in both arms — raw pooled rates are confounded by the deterministic-tier single-trial budget);
+   - a one-sided Cochran-Mantel-Haenszel test, stratified by task, is significant at alpha = 0.10.
+   If the frozen baseline has no panel samples at all (a pure frontier), a higher majority-solved task count is the bar instead of the stratified test.
 4. Per-task verdicts (`improvement`, `regression`, `unchanged`, `uncompared`) label task-level evidence for the self-improving agent. They are diagnostic signal, not the promotion trigger. A candidate that still majority-solves a task is never labelled a regression on it (the still-solving floor).
 5. A regression-veto panel runs only after a promotion `keep`; it can only block. It discards iff the candidate's aggregate solved-task count drops below the baseline's.
 
@@ -74,6 +77,7 @@ Use:
 
 - task instructions
 - normal command stdout/stderr
+- the remaining wall-clock budget: every environment state carries `time_remaining_sec` (stamped by the executor; `None` means unbounded)
 - `agent/steps.jsonl`
 - `agent/metrics.json`
 - `agent/exec.log`

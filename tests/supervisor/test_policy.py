@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from src.experiment.record import ExperimentResult, TaskResult, TrialResult
+from src.supervisor import workspace
 from src.supervisor.policy import (
     BaselineComparison,
     CandidateDiff,
@@ -23,6 +24,7 @@ from src.supervisor.policy import (
     ProposeAndLaunch,
     RefreshBaseline,
     RunVeto,
+    StratifiedSolveTest,
     World,
     budget_from_baseline,
     combine,
@@ -142,6 +144,60 @@ def test_fisher_small_high_rate_baseline_is_not_significant() -> None:
         candidate_solved=1, candidate_total=4, baseline_solved=3, baseline_total=3
     )
     assert p_value > 0.05
+
+
+# --- CMH one-sided statistics (promotion gate) --------------------------------
+# Golden p-values computed offline with statsmodels.stats.contingency_tables
+# .StratifiedTable.test_null_odds(correction=False) (two-sided chi^2) and
+# scipy.stats.norm: one-sided p = 1 - Phi(z) with the same per-stratum
+# hypergeometric moments. Strata are (cand_solved, cand_total, base_solved,
+# base_total) per task.
+
+
+@pytest.mark.parametrize(
+    ("strata", "expected_p"),
+    [
+        # Three flaky strata, clear gain: z ~ 2.2204.
+        ([(5, 7, 2, 5), (4, 7, 1, 5), (6, 7, 2, 5)], 0.0131973727),
+        # Matched rates, slight deficit: z ~ -0.4665.
+        ([(2, 7, 2, 5), (1, 7, 1, 5)], 0.6795558994),
+        # A single stratum reduces to the unstratified z-test: z ~ 1.5856.
+        ([(6, 7, 2, 5)], 0.0564093711),
+        # Larger unequal arms: z ~ 2.3826.
+        ([(10, 20, 4, 16), (8, 14, 5, 20)], 0.0085952364),
+        # Mixed directions partially cancel: z ~ -0.7325.
+        ([(5, 7, 2, 5), (1, 7, 3, 5), (4, 7, 4, 5)], 0.7680582176),
+    ],
+)
+def test_cmh_one_sided_matches_offline_goldens(strata, expected_p) -> None:
+    test = StratifiedSolveTest.from_strata(strata)
+    assert test.p_value == pytest.approx(expected_p, abs=1e-9)
+
+
+def test_cmh_degenerate_strata_carry_no_evidence() -> None:
+    # All-solved and all-failed strata have zero variance; strata missing an
+    # arm have no comparison. With nothing informative left, p == 1.0.
+    assert StratifiedSolveTest.from_strata([(7, 7, 5, 5), (0, 7, 0, 5)]).p_value == 1.0
+    assert StratifiedSolveTest.from_strata([(3, 5, 0, 0), (0, 0, 2, 4)]).p_value == 1.0
+    assert StratifiedSolveTest.from_strata([]).p_value == 1.0
+
+
+def test_cmh_rejects_inconsistent_counts() -> None:
+    with pytest.raises(ValueError):
+        StratifiedSolveTest.from_strata([(8, 7, 2, 5)])
+    with pytest.raises(ValueError):
+        StratifiedSolveTest.from_strata([(2, 7, 6, 5)])
+
+
+def test_stratified_solve_delta_signs() -> None:
+    # The CMH numerator: positive iff the candidate out-solves each task's own
+    # pooled expectation. (4,7,1,5): expected 7*5/12 ~ 2.917 -> +1.083.
+    def delta(strata):
+        return StratifiedSolveTest.from_strata(strata).delta
+
+    assert delta([(4, 7, 1, 5)]) == pytest.approx(4 - 7 * 5 / 12)
+    assert delta([(2, 7, 2, 5)]) < 0  # rate 2/7 < 2/5
+    assert delta([(2, 5, 2, 5)]) == pytest.approx(0.0)
 
 
 # --- compare_candidate_against_baseline -------------------------------------
@@ -365,10 +421,11 @@ def test_gate_promotion_keeps_a_significant_aggregate_gain() -> None:
 
 
 def test_gate_promotion_discards_an_insignificant_gain() -> None:
-    # +1 task (1->2 of 2) is a real-direction gain but Fisher at this size is
-    # not significant at alpha=0.20 -> discard.
+    # The pooled rate is up (3/4 vs 2/4) but the one-sided CMH at these counts
+    # is not significant at alpha=0.10 (the informative stratum is 1/2 vs 0/2,
+    # z=1, p~0.159) -> discard.
     baseline = _exp(tasks={"a": _task(True, True), "b": _task(False, False)})
-    candidate = _exp(tasks={"a": _task(True, True), "b": _task(True, True)})
+    candidate = _exp(tasks={"a": _task(True, True), "b": _task(True, False)})
     decision = gate(
         candidate, baseline, task_ids=frozenset({"a", "b"}), purpose="promotion"
     )
@@ -633,10 +690,74 @@ def test_decide_halts_on_dirty_primary_worktree() -> None:
     assert isinstance(decide(_world(primary_dirty=True)), Halt)
 
 
+def test_decide_halts_on_an_all_crash_pending_candidate() -> None:
+    # Every trial crashed (e.g. provider quota death): no evidence about the
+    # candidate, so the gate must not run -- Halt with the recovery runbook
+    # instead of recording a fake discard and relaunching into the dead API.
+    baseline = _exp(experiment_id="base", commit="head", tasks={"a": _task(True, True)})
+    candidate = _exp(
+        experiment_id="cand",
+        tasks={
+            "a": TaskResult(expected_trial_count=2, trials=[_crash("r0"), _crash("r1")])
+        },
+    )
+    pending = PendingRun(loop=_loop(), result=candidate)
+    command = decide(_world(pending=pending, active_baseline=baseline))
+    assert isinstance(command, Halt)
+    assert "pending candidate cand" in command.reason
+    assert "0/2 valid trials" in command.reason
+    assert "first error: boom" in command.reason
+    assert "mv experiments/cand archived_experiments/" in command.reason
+    # The runbook's ref path must match the one workspace actually creates.
+    assert workspace.candidate_ref("cand") in command.reason
+    assert "uv run auto" in command.reason
+
+
+def test_decide_halts_on_an_all_crash_pending_baseline() -> None:
+    # An all-crash baseline must not be adopted as the active baseline (every
+    # future gate would compare against a 0-trial frontier) -- Halt instead.
+    seed = _exp(
+        experiment_id="seed",
+        tasks={
+            "a": TaskResult(expected_trial_count=1, trials=[_crash("r0")]),
+            "b": TaskResult(expected_trial_count=1, trials=[_crash("r1")]),
+        },
+    )
+    pending = PendingRun(loop=_loop(kind="baseline", experiment_id="seed"), result=seed)
+    command = decide(_world(pending=pending))
+    assert isinstance(command, Halt)
+    assert "pending baseline seed" in command.reason
+    assert "0/2 valid trials" in command.reason
+    assert "candidate ref" not in command.reason  # baselines have no ref to drop
+    assert "re-run the baseline at HEAD" in command.reason
+
+
+def test_decide_gates_normally_when_only_some_trials_crashed() -> None:
+    # Surviving valid trials still carry evidence: crashes are excluded from
+    # scoring but the run gates normally rather than halting.
+    baseline = _exp(experiment_id="base", commit="head", tasks={"a": _task(True, True)})
+    candidate = _exp(
+        experiment_id="cand",
+        tasks={
+            "a": TaskResult(
+                expected_trial_count=3,
+                trials=[
+                    _crash("r0"),
+                    _trial("r1", solved=False),
+                    _trial("r2", solved=False),
+                ],
+            )
+        },
+    )
+    pending = PendingRun(loop=_loop(), result=candidate)
+    command = decide(_world(pending=pending, active_baseline=baseline))
+    assert command == Conclude("cand")
+
+
 def test_decide_concludes_a_completed_baseline_run() -> None:
     pending = PendingRun(
         loop=_loop(kind="baseline", experiment_id="seed"),
-        result=_exp(experiment_id="seed"),
+        result=_exp(experiment_id="seed", tasks={"a": _task(True)}),
     )
     command = decide(_world(pending=pending))
     assert command == Conclude("seed")

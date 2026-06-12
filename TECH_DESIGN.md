@@ -119,13 +119,14 @@ Every auto run follows one lifecycle — **prewrite `loop{decision:null}` → ru
 | # | Condition | Command | Cost |
 |---|---|---|---|
 | 1 | `primary_dirty` | `Halt(reason)` | — |
-| 2 | live `pending` baseline, **or** candidate with `gate(train)==discard` **or** test already run | `Conclude(exp)` | cheap/pure |
-| 3 | live `pending` candidate, `gate(train)==keep`, test not yet run | `RunVeto(exp)` | expensive |
-| 4 | `undiagnosed_candidate` | `Diagnose(exp)` | cheap |
-| 5 | `not baseline_ok` | `RefreshBaseline()` | expensive |
-| 6 | else | `ProposeAndLaunch()` (run train) | expensive |
+| 2 | live `pending` with zero valid trials (every trial crashed — provider/infra death, e.g. quota exhaustion) | `Halt(recovery runbook)` | — |
+| 3 | live `pending` baseline, **or** candidate with `gate(train)==discard` **or** test already run | `Conclude(exp)` | cheap/pure |
+| 4 | live `pending` candidate, `gate(train)==keep`, test not yet run | `RunVeto(exp)` | expensive |
+| 5 | `undiagnosed_candidate` | `Diagnose(exp)` | cheap |
+| 6 | `not baseline_ok` | `RefreshBaseline()` | expensive |
+| 7 | else | `ProposeAndLaunch()` (run train) | expensive |
 
-First match wins. A dead pending is **not** a row — `scan()` excludes it before `decide()` runs, so a prior crash never blocks a manual rerun. `gate(train)` is pure, so `decide()` calls it freely to route Conclude-vs-RunVeto; `Conclude` recomputes it to write. `Halt` fires only on a dirty primary or a genuine `LoopCorruption` (an impossible disk state — `scan()` hard-fails on >1 live pending, a candidate whose parent isn't the active baseline, a baseline that didn't run all tasks, etc.); keep/discard are normal autonomous transitions.
+First match wins. A dead pending is **not** a row — `scan()` excludes it before `decide()` runs, so a prior crash never blocks a manual rerun. `gate(train)` is pure, so `decide()` calls it freely to route Conclude-vs-RunVeto; `Conclude` recomputes it to write. `Halt` fires only on a dirty primary, an evidence-free pending run (row 2: an all-crash run is an infra fact, never a verdict — gating it would record a fake discard, or adopt an empty baseline, and relaunch into the same dead provider; the reason printed is the manual recovery runbook, and the run stays pending so a restart before cleanup halts again rather than resuming the burn), or a genuine `LoopCorruption` (an impossible disk state — `scan()` hard-fails on >1 live pending, a candidate whose parent isn't the active baseline, a baseline that didn't run all tasks, etc.); keep/discard are normal autonomous transitions.
 
 Outer-agent backends (`supervisor/agent_backend.py`), selected by `--agent` (default `codex`):
 

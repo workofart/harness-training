@@ -273,6 +273,7 @@ class Recorder:
             action_name=action_name,
             return_code=raw_state.return_code,
             passed=raw_state.action_passed,
+            time_remaining_sec=raw_state.time_remaining_sec,
         )
 
     # -- trial-scoped events --

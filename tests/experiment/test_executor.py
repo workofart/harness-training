@@ -15,6 +15,7 @@ import pytest
 from src.contracts import RawState
 from src.experiment.executor import (
     VERIFY_TIMEOUT_NOTICE,
+    _BudgetStampingEnv,
     _VerifyCeilingEnv,
     run_trial,
 )
@@ -39,11 +40,9 @@ def _run_one(*, llm, env, **kwargs):
 # --- verify-ceiling env wrapper (#9) ----------------------------------------
 
 
-def test_verify_ceiling_caps_a_hung_grader(monkeypatch) -> None:
+def test_verify_ceiling_caps_a_hung_grader() -> None:
     # A graded verify exceeding the ceiling is stopped: the wrapper returns a
     # terminal non-passing state and records a trial-level `verify_timeout` fire.
-    monkeypatch.setattr("src.experiment.executor.VERIFY_TIMEOUT_SEC", 0.05)
-
     class _HangingVerifyEnv(_StubEnv):
         async def verify(self) -> RawState:
             self.verify_calls += 1
@@ -52,7 +51,7 @@ def test_verify_ceiling_caps_a_hung_grader(monkeypatch) -> None:
 
     inner = _HangingVerifyEnv()
     recorder = Recorder.create()
-    wrapped = _VerifyCeilingEnv(inner, recorder)
+    wrapped = _VerifyCeilingEnv(inner, recorder, timeout_sec=0.05)
 
     # wait_for turns a non-firing ceiling into a clear failure, not a hang.
     raw = asyncio.run(asyncio.wait_for(wrapped.verify(), timeout=2))
@@ -128,14 +127,10 @@ def test_run_trial_classifies_verified_rejected(tmp_path: Path) -> None:
     assert result.error is None  # a real verdict is a valid (scorable) trial
 
 
-def test_verify_timeout_within_run_trial_is_verified_rejected(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_verify_timeout_within_run_trial_is_verified_rejected(tmp_path: Path) -> None:
     # End-to-end #9: a hung grader is cut by the ceiling to a terminal
     # non-passing verdict (`verified_rejected`, NOT a new failure_mode), and the
     # `verify_timeout` fire is recorded at trial level in metrics.json.
-    monkeypatch.setattr("src.experiment.executor.VERIFY_TIMEOUT_SEC", 0.05)
-
     class _HangingVerifyEnv(_StubEnv):
         async def verify(self) -> RawState:
             self.verify_calls += 1
@@ -145,7 +140,7 @@ def test_verify_timeout_within_run_trial_is_verified_rejected(
     llm = _StubLlm([_completion(_tool_call("verify"))])
     env = _HangingVerifyEnv(trial_dir=str(tmp_path / "trial"))
 
-    result = _run_one(llm=llm, env=env)
+    result = _run_one(llm=llm, env=env, verify_timeout_sec=0.05)
 
     assert result.failure_mode == "verified_rejected"
     assert result.solved is False and result.verifier_passed is False
@@ -225,6 +220,76 @@ def test_agent_timeout_is_hit_timeout(tmp_path: Path) -> None:
     assert result.failure_mode == "hit_timeout"
     assert result.error is None
     assert result.solved is False
+
+
+# --- budget stamping (PR1: time_remaining_sec) -------------------------------
+
+
+class _FakeClock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_budget_stamping_env_first_stamp_is_full_budget() -> None:
+    clock = _FakeClock()
+    wrapped = _BudgetStampingEnv(_StubEnv(), budget_sec=60.0, clock=clock)
+    wrapped.start_clock()
+    state = asyncio.run(wrapped.reset())
+    assert state.time_remaining_sec == 60.0
+
+
+def test_budget_stamping_env_unbounded_leaves_states_unstamped() -> None:
+    # No budget configured (single-trial use, tests): time_remaining_sec stays
+    # None, and stamping needs no clock anchor.
+    wrapped = _BudgetStampingEnv(_StubEnv(), budget_sec=None, clock=_FakeClock())
+    state = asyncio.run(wrapped.exec(command="x"))
+    assert state.time_remaining_sec is None
+
+
+def test_budget_countdown_excludes_bootstrap_and_decreases(tmp_path: Path) -> None:
+    # End-to-end through run_trial with an injected clock: a slow bootstrap
+    # (500s before the agent phase) consumes none of the 100s budget; the
+    # stamps then strictly decrease as exec time accrues.
+    clock = _FakeClock()
+
+    class _SlowBootstrapEnv(_StubEnv):
+        async def reset(self) -> RawState:
+            clock.now += 500.0  # slow docker start + bootstrap
+            return await super().reset()
+
+        async def exec(self, **kwargs):
+            clock.now += 10.0
+            return await super().exec(**kwargs)
+
+    llm = _StubLlm(
+        [
+            _completion(_tool_call("run", command="a")),
+            _completion(_tool_call("run", command="b")),
+            _completion(_tool_call("verify")),
+        ]
+    )
+    env = _SlowBootstrapEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=True, reward=1.0),
+    )
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=100.0, clock=clock)
+
+    assert result.solved is True
+    events = [
+        json.loads(line) for line in Path(result.trace_path).read_text().splitlines()
+    ]
+    stamps = [
+        event["fields"]["time_remaining_sec"]
+        for event in events
+        if event["event"] == "env_step_completed"
+    ]
+    # Bootstrap's 500s never counted: the first exec stamp reflects only its
+    # own 10s. The verify stamp repeats the elapsed total (verify is instant).
+    assert stamps == [90.0, 80.0, 80.0]
 
 
 # --- cleanup ordering (#3) --------------------------------------------------

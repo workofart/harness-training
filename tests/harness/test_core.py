@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from typing import Any
 
 import pytest
@@ -277,9 +278,42 @@ def test_execute_action_edit_file_uses_python_script():
     )
     cmd = env.exec_calls[0]["command"]
     assert cmd.startswith("python3 -c ")
-    assert "p.read_text().replace" in cmd
+    assert "text.replace" in cmd
     assert cmd.endswith(" /x foo BAR")
     assert env.exec_calls[0]["workload"] == "light"
+
+
+def _run_edit_command(action: EditFileAction) -> "subprocess.CompletedProcess[str]":
+    # Capture the exact shell command execute_action emits, then run it for real:
+    # the edit semantics live in the generated script, not the stub env.
+    env = _StubEnv()
+    asyncio.run(execute_action(env, action))
+    return subprocess.run(
+        env.exec_calls[0]["command"], shell=True, capture_output=True, text=True
+    )
+
+
+def test_edit_file_no_match_fails_loudly(tmp_path):
+    # Regression: a non-matching old_text used to rewrite the file unchanged with
+    # rc=0 and no output, so the model believed the edit landed.
+    target = tmp_path / "f.txt"
+    target.write_text("hello world\n")
+    completed = _run_edit_command(
+        EditFileAction(path=str(target), old_text="absent", new_text="X")
+    )
+    assert completed.returncode != 0
+    assert "old_text not found" in completed.stderr
+    assert target.read_text() == "hello world\n"
+
+
+def test_edit_file_match_replaces_first_occurrence(tmp_path):
+    target = tmp_path / "f.txt"
+    target.write_text("foo bar foo\n")
+    completed = _run_edit_command(
+        EditFileAction(path=str(target), old_text="foo", new_text="BAR")
+    )
+    assert completed.returncode == 0
+    assert target.read_text() == "BAR bar foo\n"
 
 
 def test_execute_action_run_passes_through_command_cwd_timeout():
@@ -331,6 +365,19 @@ def test_render_tool_result_includes_rc_stdout_stderr():
 
 def test_render_tool_result_returns_no_output_when_state_is_empty():
     assert render_tool_result(RawState(), char_limit=100) == "(no output)"
+
+
+def test_render_tool_result_surfaces_time_remaining_budget():
+    # The stamped wall budget must reach the agent's observation, not just the
+    # trace: an integer-second `time_remaining` line, omitted when unbounded.
+    rendered = render_tool_result(
+        RawState(return_code=0, stdout="out", time_remaining_sec=42.7), char_limit=100
+    )
+    assert "time_remaining: 42s" in rendered
+    assert "rc=0" in rendered
+    assert "time_remaining" not in render_tool_result(
+        RawState(return_code=0, stdout="out"), char_limit=100
+    )
 
 
 def test_render_tool_result_truncates_long_output():

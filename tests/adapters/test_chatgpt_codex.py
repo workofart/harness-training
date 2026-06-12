@@ -224,6 +224,76 @@ def test_complete_posts_codex_sse_and_normalizes_tool_call():
     assert completion.usage.reasoning_tokens == 2
 
 
+def test_complete_does_not_double_count_streamed_message_text():
+    # Repro of the gpt-5.4-mini content-doubling bug: the assistant message text
+    # arrives BOTH as `output_text.delta` chunks AND as the terminal
+    # `output_item.done` message item, and `response.completed` ships an empty
+    # `output` array -- so the final-response replacement never collapses the
+    # duplicate. The streamed text must be counted once ("PONG"), not twice.
+    captured: dict[str, Any] = {}
+    lines = [
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","content":[]}}',
+        'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","content":[]}}',
+        'data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1","content":[]}}',
+        'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"P"}',
+        'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"ONG"}',
+        'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"PONG"}]}}',
+        'data: {"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{}}}',
+        "data: [DONE]",
+    ]
+
+    class _FakeResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for line in lines:
+                yield line
+
+    class _FakeStream:
+        async def __aenter__(self):
+            return _FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class _FakeClient:
+        def stream(self, method, url, *, json, headers):
+            captured["json"] = json
+            return _FakeStream()
+
+        async def aclose(self):
+            return None
+
+    class _FakeAuthStore:
+        def load(self):
+            return chatgpt_codex_module._CodexAuth(
+                access_token=_jwt({"exp": 4_102_444_800}),
+                id_token=_jwt({}),
+                refresh_token="refresh-token",
+                account_id="acct_123",
+            )
+
+        async def refresh(self, *, http_client):
+            raise AssertionError("fresh token should not refresh")
+
+    llm = chatgpt_codex_module.ChatGptCodex(
+        config=ChatGptCodexConfig(
+            model_name="gpt-5.4-mini",
+            max_context_length=200_000,
+            timeout_seconds=10.0,
+        ),
+        auth_store=_FakeAuthStore(),
+        http_client=_FakeClient(),
+    )
+
+    completion = asyncio.run(
+        llm.complete(messages=[{"role": "user", "content": "Reply with PONG"}])
+    )
+
+    assert completion.content == "PONG"
+    assert completion.tool_calls == ()
+
+
 # --- Transient-failure retry policy -----------------------------------------
 
 _GOOD_SSE_LINES = [
