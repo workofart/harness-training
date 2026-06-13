@@ -222,6 +222,99 @@ def test_agent_timeout_is_hit_timeout(tmp_path: Path) -> None:
     assert result.solved is False
 
 
+def test_agent_work_timeout_is_hit_timeout(tmp_path: Path) -> None:
+    # A non-verify WORK step (here an `exec`/run) that outruns the task deadline
+    # with NO verify in flight is still hard-cut to `hit_timeout`. The task
+    # timeout bounds the agent's work; only the terminal verify is exempt.
+    class _HangingExecEnv(_StubEnv):
+        async def exec(self, **kwargs):
+            await asyncio.sleep(30)  # the work step never returns in time
+            return await super().exec(**kwargs)
+
+    llm = _StubLlm([_completion(_tool_call("run", command="loop"))])
+    env = _HangingExecEnv(trial_dir=str(tmp_path / "trial"))
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05)
+
+    assert result.failure_mode == "hit_timeout"
+    assert result.error is None
+    assert result.solved is False
+
+
+def test_late_verify_runs_to_completion_not_hit_timeout(tmp_path: Path) -> None:
+    # Bug repro: the agent calls verify with little task budget left. The verify
+    # duration (0.3s) exceeds the remaining task budget (~0.05s) but is well
+    # under the verify ceiling (5s). The terminal verify must run to completion
+    # and yield a REAL verdict -- it is bounded by `verify_timeout_sec` ALONE,
+    # not by however much `task_timeout_sec` remains. On the buggy code the outer
+    # task timeout cancels the grade mid-flight -> `hit_timeout`/`passed=None`.
+    class _SlowVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(0.3)  # outlasts the task deadline, under ceiling
+            return self._verify_state
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _SlowVerifyEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=True, reward=1.0),
+    )
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05, verify_timeout_sec=5.0)
+
+    assert env.verify_calls == 1
+    assert result.failure_mode == "solved"
+    assert result.solved is True
+    assert result.verifier_passed is True
+    assert result.error is None
+
+
+def test_late_verify_rejected_runs_to_completion(tmp_path: Path) -> None:
+    # Same late-verify scoping, but the verifier returns a non-passing verdict:
+    # the trial must classify `verified_rejected` (a real, scorable verdict),
+    # NOT `hit_timeout`.
+    class _SlowVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(0.3)
+            return self._verify_state
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _SlowVerifyEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=False, reward=0.0),
+    )
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05, verify_timeout_sec=5.0)
+
+    assert result.failure_mode == "verified_rejected"
+    assert result.solved is False
+    assert result.verifier_passed is False
+    assert result.error is None
+
+
+def test_verify_ceiling_still_caps_a_late_hung_grader(tmp_path: Path) -> None:
+    # The verify exemption is bounded by `verify_timeout_sec` alone: a grader
+    # that hangs past its ceiling is still cut to a terminal non-passing verdict
+    # with a `verify_timeout` fire, even when the task deadline already passed.
+    class _HangingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(30)
+            return RawState(passed=True, reward=1.0)
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _HangingVerifyEnv(trial_dir=str(tmp_path / "trial"))
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05, verify_timeout_sec=0.1)
+
+    assert result.failure_mode == "verified_rejected"
+    assert result.solved is False and result.verifier_passed is False
+    assert result.error is None
+    metrics = json.loads(Path(result.metrics_path).read_text())
+    assert metrics["rule_fires"].get("verify_timeout") == 1
+
+
 # --- budget stamping (PR1: time_remaining_sec) -------------------------------
 
 
