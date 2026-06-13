@@ -474,6 +474,35 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _install_runner_teardown_signal_handler() -> None:
+    """On SIGINT (Ctrl-C) / SIGTERM, reap the in-flight ``uv run exp`` subtree
+    before exiting. The active child is blocked deep inside ``run_streamed``'s
+    select loop with no handle reachable from here, so we reap via the module-level
+    registry instead. CRITICAL: a second Ctrl-C during cleanup would otherwise raise
+    ``KeyboardInterrupt`` straight through and abort the reap, leaving ``exp``
+    orphaned -- so we mask SIGINT (``SIG_IGN``) for the duration of cleanup."""
+    import signal
+
+    from src.supervisor.subproc import terminate_live_children
+
+    def handler(signum, _frame):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        name = signal.Signals(signum).name
+        print(
+            f"\n{name} received -- shutting down runner, please wait, "
+            "do NOT press Ctrl-C again.",
+            file=sys.stderr,
+            flush=True,
+        )
+        terminate_live_children()
+        print("Runner shutdown complete.", file=sys.stderr, flush=True)
+        raise SystemExit(130)
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 def main_auto() -> int:
     import contextlib
     import sys
@@ -516,6 +545,7 @@ def main_auto() -> int:
         backend=create_backend(agent_type),
         program_md_path=repo_root / "program.md",
     )
+    _install_runner_teardown_signal_handler()
     try:
         halt = run_auto(ctx)
     except ChatGptCodexCredentialsExpiredError as exc:

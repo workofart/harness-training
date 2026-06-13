@@ -22,6 +22,7 @@ import locale
 import os
 import pty
 import selectors
+import signal
 import subprocess
 import time
 import tty
@@ -32,6 +33,54 @@ from pathlib import Path
 OnChunk = Callable[[str, str], None]
 
 _READ_CHUNK_BYTES = 8192
+
+# Grace between SIGTERM and SIGKILL when reaping a child's process group.
+_GROUP_TERM_GRACE_SEC = 3.0
+
+# PIDs of every live ``run_streamed`` child, each the leader of its own session
+# (``start_new_session=True``), so its pid is also its process-group id. The
+# supervisor spawns ``exp`` as a GRANDCHILD (``auto`` -> ``uv`` -> ``exp``);
+# ``uv`` cannot forward a kill, so signalling the direct child alone orphans
+# ``exp`` (reparented to PID 1). Reaping the whole group instead takes the
+# grandchild down too. The registry lets a SIGINT/SIGTERM handler in ``auto``
+# (which is blocked deep inside ``run_streamed``'s select loop, with no handle
+# on the ``Popen``) reap the active group from another stack frame.
+_LIVE_CHILD_PIDS: set[int] = set()
+
+
+def _killpg_quiet(pid: int, sig: int) -> bool:
+    """``os.killpg`` swallowing the two benign races: ``ProcessLookupError`` (group
+    already gone) and ``PermissionError`` (the leader exited and its pgid was reused
+    by an unrelated process we may not signal). Returns whether the signal landed."""
+    try:
+        os.killpg(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def terminate_process_group(
+    pid: int, *, grace_sec: float = _GROUP_TERM_GRACE_SEC
+) -> None:
+    """Reap the whole process group led by ``pid``: ``SIGTERM`` -> short grace ->
+    ``SIGKILL``. ``pid`` is a session leader (its child was spawned with
+    ``start_new_session=True``), so its pgid == pid and the group holds ``uv`` plus
+    its ``exp`` grandchild and any further descendants. A plain ``kill(pid)`` would
+    leave that grandchild orphaned; ``killpg`` takes the subtree with it. A
+    fixed grace (not a pgid probe loop -- the leader's pid can be reused once it
+    exits) lets the group drain on SIGTERM before the SIGKILL backstop. Missing
+    group (already exited) is a no-op."""
+    if not _killpg_quiet(pid, signal.SIGTERM):
+        return
+    time.sleep(grace_sec)
+    _killpg_quiet(pid, signal.SIGKILL)
+
+
+def terminate_live_children() -> None:
+    """Reap every registered live child group. Called by ``auto``'s signal handler
+    to take down an in-flight ``uv run exp`` subtree on Ctrl-C / SIGTERM."""
+    for pid in list(_LIVE_CHILD_PIDS):
+        terminate_process_group(pid)
 
 
 class StreamTimeout(RuntimeError):
@@ -88,7 +137,14 @@ def run_streamed(
     """
     encoding = locale.getencoding()
     popen_kwargs: dict = dict(
-        cwd=cwd, env=env, stdin=subprocess.DEVNULL, close_fds=True
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        # Put the child in its own session/process group so a teardown can reap
+        # the WHOLE subtree (``uv`` + its ``exp`` grandchild) via ``killpg``;
+        # otherwise ``uv`` is killed but cannot forward it and ``exp`` is orphaned.
+        start_new_session=True,
     )
     if use_pty:
         stdout_master, stdout_slave = pty.openpty()
@@ -110,6 +166,9 @@ def run_streamed(
             process.stdout.fileno(): "stdout",
             process.stderr.fileno(): "stderr",
         }
+    # Track the group for ``auto``'s signal handler (the child is a session leader,
+    # so its pid is its pgid). Deregistered in ``finally`` once the group is reaped.
+    _LIVE_CHILD_PIDS.add(process.pid)
     decoders = {
         fd: codecs.getincrementaldecoder(encoding)(errors="replace")
         for fd in fd_streams
@@ -169,5 +228,8 @@ def run_streamed(
             process.stdout.close()
             process.stderr.close()
         if process.poll() is None:
-            process.kill()
+            # Reap the whole group, not just ``uv``: a plain ``process.kill()``
+            # leaves the ``exp`` grandchild orphaned (reparented to PID 1).
+            terminate_process_group(process.pid)
             process.wait()
+        _LIVE_CHILD_PIDS.discard(process.pid)
