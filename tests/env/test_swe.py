@@ -6,6 +6,7 @@ arithmetic + the resolution rule (every F2P passes AND every P2P still passes,
 with at least one F2P actually present) against synthetic reports.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +20,15 @@ from swebench.harness.constants import (
 )
 from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
 
-from src.env.swe import VerifierCorruptError, _as_list, _grade_log, _score_report
+from src.env import swe as swe_module
+from src.env.swe import (
+    DOCKER_INFRA_RETRY_BUDGET,
+    SweEnv,
+    VerifierCorruptError,
+    _as_list,
+    _grade_log,
+    _score_report,
+)
 
 
 def _report(*, f2p_ok, f2p_bad, p2p_ok, p2p_bad) -> dict:
@@ -121,3 +130,111 @@ def test_markers_present_no_tests_is_scored_zero_not_raised(tmp_path):
     reward, resolved = _grade(output, tmp_path)
     assert reward == 0.0
     assert resolved is False
+
+
+# --- transient docker-daemon retry ------------------------------------------
+#
+# A momentary OrbStack/Docker socket reset ("error during connect ... EOF")
+# wiped 107 container starts in a single 3.6s window and was recorded as 107
+# crashes, silently dropping ~4 repos' worth of tasks from a characterization
+# (a crash slot is never re-run -- record.py). `reset()` and the verify
+# eval-script exec issue raw docker CLI calls; these pin that a docker-level
+# failure (non-zero WITH output on docker's own stderr) is now retried, while a
+# verdict from the inner command (non-zero, clean docker stderr) is NOT.
+
+
+def _no_sleep(monkeypatch) -> None:
+    async def _sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(swe_module.asyncio, "sleep", _sleep)
+
+
+def _fake_run_sequence(results):
+    """A drop-in for `swe._run_once` that returns queued (rc, out, err) tuples
+    and records how many times it was called (last tuple repeats once
+    exhausted)."""
+    calls = {"n": 0}
+
+    async def _run_once(*_args, **_kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        return results[min(i, len(results) - 1)]
+
+    return _run_once, calls
+
+
+def test_run_retries_a_docker_blip(monkeypatch):
+    # First attempt = docker-level failure (non-zero WITH output on docker's own
+    # stderr), second = success. retry=True must ride out the blip.
+    _no_sleep(monkeypatch)
+    blip = (1, "", 'error during connect: Get ".../_ping": EOF')
+    ok = (0, "started", "")
+    run_once, calls = _fake_run_sequence([blip, ok])
+    monkeypatch.setattr(swe_module, "_run_once", run_once)
+
+    rc, out, _err = asyncio.run(swe_module._run("docker", "run", retry=True))
+    assert (rc, out) == (0, "started")
+    assert calls["n"] == 2
+
+
+def test_run_does_not_retry_a_verdict(monkeypatch):
+    # A non-zero from the inner command (a failing test run) carries its output
+    # on stdout and leaves docker's stderr clean -- it is a verdict, returned
+    # as-is even under retry=True, never re-run.
+    _no_sleep(monkeypatch)
+    fail = (1, "3 failed, 5 passed", "")
+    run_once, calls = _fake_run_sequence([fail, (0, "should-not-reach", "")])
+    monkeypatch.setattr(swe_module, "_run_once", run_once)
+
+    rc, out, _err = asyncio.run(swe_module._run("docker", "exec", retry=True))
+    assert (rc, out) == (1, "3 failed, 5 passed")
+    assert calls["n"] == 1
+
+
+def test_run_without_retry_runs_once(monkeypatch):
+    # Default retry=False (the exec/close/cp path): a docker-level failure is NOT
+    # retried -- it returns as-is, so an agent command keeps raw semantics.
+    _no_sleep(monkeypatch)
+    blip = (1, "", "Cannot connect to the Docker daemon")
+    run_once, calls = _fake_run_sequence([blip, (0, "unreached", "")])
+    monkeypatch.setattr(swe_module, "_run_once", run_once)
+
+    rc, _out, _err = asyncio.run(swe_module._run("docker", "exec"))
+    assert rc == 1
+    assert calls["n"] == 1
+
+
+def test_run_gives_up_after_budget(monkeypatch):
+    # A daemon that stays unreachable exhausts the budget and re-raises, so the
+    # trial still records a crash (a real outage must fail, not hang forever).
+    _no_sleep(monkeypatch)
+    blip = (1, "", "Cannot connect to the Docker daemon")
+    run_once, calls = _fake_run_sequence([blip])
+    monkeypatch.setattr(swe_module, "_run_once", run_once)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(swe_module._run("docker", "run", retry=True))
+    assert calls["n"] == DOCKER_INFRA_RETRY_BUDGET + 1
+
+
+def test_reset_rides_out_a_daemon_blip(monkeypatch):
+    # End-to-end at the reset() seam: a transient `docker run` failure must not
+    # crash the trial -- reset() retries and returns a usable RawState.
+    _no_sleep(monkeypatch)
+    env = object.__new__(SweEnv)
+    env._row = {"problem_statement": "fix it"}
+    env._image = "sweb.eval.x86_64.demo:latest"
+    env._container = "swe_env_demo"
+    env._heavy_semaphore = None
+    env._started = False
+
+    blip = (1, "", 'error during connect: Get ".../_ping": EOF')
+    ok = (0, "deadbeef", "")
+    run_once, calls = _fake_run_sequence([blip, ok])
+    monkeypatch.setattr(swe_module, "_run_once", run_once)
+
+    state = asyncio.run(env.reset())
+    assert state.instruction == "fix it"
+    assert env._started is True
+    assert calls["n"] == 2

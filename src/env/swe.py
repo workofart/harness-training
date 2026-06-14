@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -31,7 +32,15 @@ from swebench.harness.grading import get_eval_tests_report, get_logs_eval
 from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
 
 from src.contracts import EnvExecWorkload, RawState
+from src.retry import retry_transient
 
+logger = logging.getLogger(__name__)
+
+DOCKER_INFRA_RETRY_BUDGET = 5
+
+
+class _TransientDockerError(RuntimeError):
+    pass
 
 class VerifierCorruptError(RuntimeError):
     """A verify() run swebench could not grade -- a failed held-out test-patch
@@ -106,8 +115,8 @@ def _grade_log(
     return _score_report(report)
 
 
-async def _run(*args: str, timeout: float | None = None) -> tuple[int, str, str]:
-    """Run a host subprocess (docker CLI) and capture decoded stdout/stderr."""
+async def _run_once(*args: str, timeout: float | None = None) -> tuple[int, str, str]:
+    """One host subprocess (docker CLI), decoded stdout/stderr."""
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -123,6 +132,33 @@ async def _run(*args: str, timeout: float | None = None) -> tuple[int, str, str]
         proc.returncode if proc.returncode is not None else -1,
         out.decode("utf-8", "replace"),
         err.decode("utf-8", "replace"),
+    )
+
+
+async def _run(
+    *args: str, timeout: float | None = None, retry: bool = False
+) -> tuple[int, str, str]:
+    """Run a docker CLI command. With `retry`, ride out a docker-level failure (a daemon blip)
+    """
+    if not retry:
+        return await _run_once(*args, timeout=timeout)
+
+    async def _attempt() -> tuple[int, str, str]:
+        rc, out, err = await _run_once(*args, timeout=timeout)
+        if rc != 0 and err.strip():
+            raise _TransientDockerError(f"{' '.join(args[:2])}: {err[:300]}")
+        return rc, out, err
+
+    return await retry_transient(
+        _attempt,
+        is_transient=lambda exc: isinstance(exc, _TransientDockerError),
+        on_retry=lambda n, exc: logger.warning(
+            "transient docker error; retrying (%d/%d): %s",
+            n,
+            DOCKER_INFRA_RETRY_BUDGET,
+            exc,
+        ),
+        budget=DOCKER_INFRA_RETRY_BUDGET,
     )
 
 
@@ -195,6 +231,8 @@ class SweEnv:
 
     async def reset(self) -> RawState:
         # `--network none`: airtight firewall + deterministic offline grading.
+        # A daemon blip fails the ping before the container exists, so a retried
+        # `docker run` safely re-uses the same --name.
         async with self._gate("heavy"):
             rc, _out, err = await _run(
                 "docker",
@@ -210,6 +248,7 @@ class SweEnv:
                 "sleep",
                 "infinity",
                 timeout=600,
+                retry=True,
             )
         if rc != 0:
             raise RuntimeError(f"container start failed ({rc}): {err[:500]}")
@@ -301,7 +340,9 @@ class SweEnv:
         await self._copy_in(self._spec.eval_script, "/eval.sh")
         # Merge streams IN ORDER inside the container: `set -x` echoes the
         # Start/End markers to stderr; separate capture reorders them and breaks
-        # marker extraction.
+        # marker extraction. Retried so a daemon blip here is not misread as a
+        # corrupt log -- its signature is on docker's own stderr channel, which a
+        # real non-zero test run leaves clean, so retry never masks a failure.
         _rc, out, _err = await _run(
             "docker",
             "exec",
@@ -310,5 +351,6 @@ class SweEnv:
             "-lc",
             "bash /eval.sh 2>&1",
             timeout=1800,
+            retry=True,
         )
         return out
