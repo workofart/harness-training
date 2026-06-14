@@ -329,12 +329,17 @@ def test_main_auto_honors_harness_config_path_env(monkeypatch):
     assert cli.main_auto() == 0
     config = captured["ctx"].config
     assert config.env_backend == "swe"
+    # Honored the path iff the loaded panel is the one named by the env var (not
+    # the TB default). Compare against the file directly so the guard tracks
+    # panel edits instead of pinning a brittle task count / repo set.
+    import json
+    from pathlib import Path
+
+    named = json.loads(Path("config/harness_config.swe.json").read_text())
+    expected = list(named["train"]["task_names"]) + list(named["test"]["task_names"])
     panel = list(config.train.task_names) + list(config.test.task_names)
-    assert len(panel) == 23
-    assert all(
-        name.split("__")[0] in {"sympy", "pytest-dev", "sphinx-doc", "pylint-dev"}
-        for name in panel
-    )
+    assert panel == expected
+    assert all("__" in name for name in panel)
 
 
 def test_main_auto_defaults_to_terminal_bench_panel_without_the_env(monkeypatch):
