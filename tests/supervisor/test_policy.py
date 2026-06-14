@@ -39,12 +39,13 @@ from src.supervisor.policy import (
 # --- builders ---------------------------------------------------------------
 
 
-def _trial(run_id: str, *, solved: bool) -> TrialResult:
+def _trial(run_id: str, *, solved: bool, reward: float | None = None) -> TrialResult:
     return TrialResult(
         run_id=run_id,
         solved=solved,
         failure_mode="solved" if solved else "verified_rejected",
         verifier_passed=solved,
+        reward=reward,
     )
 
 
@@ -59,6 +60,12 @@ def _task(*solveds: bool, budget: int | None = None) -> TaskResult:
         expected_trial_count=budget if budget is not None else len(trials),
         trials=trials,
     )
+
+
+def _graded_task(*rewards: float) -> TaskResult:
+    # A task whose trials carry partial-credit reward; solved iff reward == 1.0.
+    trials = [_trial(f"r{i}", solved=r == 1.0, reward=r) for i, r in enumerate(rewards)]
+    return TaskResult(expected_trial_count=len(trials), trials=trials)
 
 
 def _exp(
@@ -455,40 +462,33 @@ def test_gate_promotion_keeps_a_pure_frontier_panel() -> None:
     assert "improved" in decision.reason
 
 
-def test_promotion_carries_a_nondeciding_graded_shadow() -> None:
-    # The promotion reason records what the graded statistic would say, but the
-    # binary CMH still decides (Phase 1 step 2: additive, pre-cutover). Here both
-    # agree on keep (baseline 0/5 -> candidate 5/5 is a unanimous +1.0 delta).
-    tasks = {f"t{i}": _task(False, False) for i in range(5)}
-    baseline = _exp(tasks=tasks)
-    candidate = _exp(tasks={f"t{i}": _task(True, True) for i in range(5)})
+def test_gate_promotion_keeps_a_partial_credit_gain_the_binary_gate_missed() -> None:
+    # The cutover's whole point: a candidate that lifts graded reward WITHOUT
+    # crossing the solve threshold (no extra majority-solves) now promotes. The
+    # retired binary CMH saw 0 extra solves -> 0 stratified delta -> never
+    # significant. Every task moves +0.2 reward, none flips solved -> a unanimous
+    # positive per-task delta (p_value 0.0).
+    tasks = [f"t{i}" for i in range(6)]
+    baseline = _exp(tasks={t: _graded_task(0.6, 0.6) for t in tasks})
+    candidate = _exp(tasks={t: _graded_task(0.8, 0.8) for t in tasks})
     decision = gate(candidate, baseline, task_ids=frozenset(tasks), purpose="promotion")
     assert decision.kind == "keep"
-    assert "[graded-shadow, non-deciding]" in decision.reason
-    assert "would keep" in decision.reason
+    assert "graded reward improved" in decision.reason
+    # Not a single task is majority-solved in either arm -- pure partial credit
+    # the binary gate is structurally blind to.
+    assert all(v.candidate_solved == 0 for v in decision.verdicts.values())
+    assert all(v.baseline_solved == 0 for v in decision.verdicts.values())
 
 
-def test_graded_shadow_does_not_override_the_binary_decision() -> None:
-    # A pure frontier panel: the binary gate keeps (candidate majority-solves),
-    # but the graded shadow has no both-arms strata -> would discard. The shadow
-    # must NOT flip the decision -- it is diagnostic only until the cutover.
-    baseline = _exp(tasks={})
-    candidate = _exp(tasks={"a": _task(True, True), "b": _task(True, True)})
-    decision = gate(
-        candidate, baseline, task_ids=frozenset({"a", "b"}), purpose="promotion"
-    )
-    assert decision.kind == "keep"  # binary still decides
-    assert "would discard" in decision.reason  # graded disagrees, harmlessly
-
-
-def test_regression_veto_has_no_graded_shadow() -> None:
-    # The shadow annotates the promotion test only, not the veto.
-    baseline = _exp(tasks={"x": _task(True, True), "y": _task(True, True)})
-    candidate = _exp(tasks={"x": _task(True, True), "y": _task(True, True)})
-    decision = gate(
-        candidate, baseline, task_ids=frozenset({"x", "y"}), purpose="regression_veto"
-    )
-    assert "graded-shadow" not in decision.reason
+def test_gate_promotion_discards_a_partial_credit_regression() -> None:
+    # The mirror: every task LOSES reward (still no solve change) -> negative mean
+    # delta -> discard on direction, before any significance test.
+    tasks = [f"t{i}" for i in range(6)]
+    baseline = _exp(tasks={t: _graded_task(0.8, 0.8) for t in tasks})
+    candidate = _exp(tasks={t: _graded_task(0.6, 0.6) for t in tasks})
+    decision = gate(candidate, baseline, task_ids=frozenset(tasks), purpose="promotion")
+    assert decision.kind == "discard"
+    assert "did not improve" in decision.reason
 
 
 # --- gate: regression-veto (can only block) ---------------------------------

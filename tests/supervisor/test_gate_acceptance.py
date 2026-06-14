@@ -1,145 +1,122 @@
-"""Promotion gate acceptance: resampling simulation against real baseline rates.
+"""Promotion gate acceptance: resampling simulation against the real panel.
 
-Simulates whole candidate cycles against the frozen per-task solve rates of the
-last completed baseline (exp-20260609-025307, 59 train tasks: 28 deterministic /
-21 flaky / 10 never-solved) and runs each through the real promotion decision
-(``_panel_decision``). Two properties are pinned:
+Pins the live graded promotion gate's operating characteristics on the actual
+panel it runs on -- the finalized SWE headroom panel (39 rich+thin tasks). The
+per-task reward vectors are a snapshot of the characterization run
+exp-20260614-221243 (valid-trial graded rewards), baked here so the test is
+self-contained. Each simulated cycle resamples a candidate and a baseline arm
+(full=3 trials, with replacement) from each task's reward vector and runs the
+real ``GradedRewardTest`` at the production ``GRADED_PROMOTION_P_VALUE_ALPHA``.
 
-- **Null calibration**: an inert candidate (true per-task rates identical to
-  the baseline) false-keeps at most ~alpha over >= 1500 simulated cycles.
-- **Power**: a synthetic +5% per-task effect promotes at a materially higher
-  rate -- the prior aggregate gate (Fisher over majority-solved counts at
-  alpha 0.20, needing +7-8/59 tasks) promoted such an effect at ~0.
+Two properties are pinned:
 
-Candidate arms mirror the existing budgets (deterministic-solved 1 +
-confirm-on-fail expand to full, everything else full; the all-fail early-stop
-trim is immaterial -- a 0-solve stratum carries no CMH information either way).
+- **Null calibration**: an inert candidate (drawn from the same reward
+  population as the baseline) false-keeps at most the nominal alpha. This is the
+  calibration that justified cutting the gate over to graded-sole on this panel
+  (and tuning alpha to 0.08): the binary-CMH-era conjunction was needed only on
+  the old ceiling-heavy Terminal-Bench panel, whose zero-variance deltas ran the
+  one-sample test hot (~0.16). Cutting the ceiling tasks brings it to ~0.08.
+- **Power**: a small per-task reward lift -- the partial-credit movement the
+  retired binary gate was blind to -- promotes at a materially higher rate.
+
 The RNG is seeded, so the measured rates are deterministic.
 """
 
 from __future__ import annotations
 
 import random
+import statistics
 
-from src.supervisor.policy import BaselineComparison, _panel_decision
+from src.supervisor.policy import (
+    GRADED_PROMOTION_P_VALUE_ALPHA,
+    GradedRewardTest,
+)
 
-# Per-task (solved, valid_trials) over the train panel of the last completed
-# baseline record, exp-20260609-025307 (snapshot; the simulation's population).
-BASELINE_RATES: dict[str, tuple[int, int]] = {
-    "openssl-selfsigned-cert": (3, 3),
-    "regex-log": (3, 4),
-    "fix-git": (3, 3),
-    "count-dataset-tokens": (3, 3),
-    "log-summary-date-ranges": (3, 4),
-    "overfull-hbox": (3, 4),
-    "git-multibranch": (3, 5),
-    "nginx-request-logging": (3, 3),
-    "sqlite-db-truncate": (3, 3),
-    "multi-source-data-merger": (3, 3),
-    "headless-terminal": (3, 3),
-    "large-scale-text-editing": (3, 4),
-    "pypi-server": (3, 5),
-    "sparql-university": (3, 4),
-    "mteb-retrieve": (2, 5),
-    "hf-model-inference": (3, 3),
-    "code-from-image": (3, 5),
-    "cancel-async-tasks": (3, 3),
-    "extract-elf": (0, 3),
-    "modernize-scientific-stack": (3, 3),
-    "password-recovery": (3, 3),
-    "sanitize-git-repo": (3, 3),
-    "git-leak-recovery": (3, 3),
-    "build-pmars": (3, 3),
-    "build-pov-ray": (3, 3),
-    "sqlite-with-gcov": (3, 3),
-    "build-cython-ext": (3, 3),
-    "cobol-modernization": (3, 4),
-    "pytorch-model-recovery": (3, 4),
-    "bn-fit-modify": (3, 3),
-    "largest-eigenval": (3, 4),
-    "chess-best-move": (2, 5),
-    "kv-store-grpc": (3, 3),
-    "distribution-search": (3, 3),
-    "adaptive-rejection-sampler": (3, 3),
-    "portfolio-optimization": (3, 3),
-    "constraints-scheduling": (3, 5),
-    "merge-diff-arc-agi-task": (3, 3),
-    "llm-inference-batching-scheduler": (3, 4),
-    "dna-insert": (1, 4),
-    "sam-cell-seg": (0, 3),
-    "torch-tensor-parallelism": (2, 4),
-    "circuit-fibsqrt": (3, 3),
-    "prove-plus-comm": (3, 3),
-    "polyglot-c-py": (0, 3),
-    "polyglot-rust-c": (0, 3),
-    "write-compressor": (3, 4),
-    "feal-linear-cryptanalysis": (3, 3),
-    "custom-memory-heap-crash": (3, 5),
-    "financial-document-processor": (2, 5),
-    "fix-code-vulnerability": (3, 3),
-    "feal-differential-cryptanalysis": (3, 3),
-    "mteb-leaderboard": (0, 3),
-    "path-tracing": (0, 3),
-    "make-mips-interpreter": (3, 4),
-    "path-tracing-reverse": (0, 3),
-    "mcmc-sampling-stan": (0, 3),
-    "dna-assembly": (0, 3),
-    "qemu-alpine-ssh": (0, 3),
+# Per-task valid-trial graded rewards over the finalized headroom panel
+# (snapshot of exp-20260614-221243; the population each arm is resampled from).
+CHAR_REWARDS: dict[str, list[float]] = {
+    "django__django-10973": [0.8, 0.8],
+    "django__django-10999": [0.8333, 0.8333],
+    "django__django-11087": [0.9762, 0.9762],
+    "django__django-11477": [0.987, 0.987],
+    "django__django-11490": [0.9583, 1.0, 0.9583],
+    "django__django-11728": [0.9565, 0.9565],
+    "django__django-14017": [0.9933, 0.9933],
+    "django__django-14034": [0.9231, 0.9231],
+    "django__django-14155": [0.9674, 0.9674],
+    "django__django-14170": [0.8846, 0.8846],
+    "django__django-14315": [0.6364, 0.8182],
+    "django__django-14376": [0.6667, 0.6667],
+    "django__django-14534": [0.9917, 1.0, 1.0],
+    "django__django-14792": [0.92, 0.92],
+    "pylint-dev__pylint-4970": [0.9444, 0.9444],
+    "pylint-dev__pylint-6386": [0.875, 1.0, 0.875],
+    "pylint-dev__pylint-6528": [1.0, 0.9943, 1.0],
+    "pylint-dev__pylint-7080": [0.9917, 0.9917],
+    "pytest-dev__pytest-10051": [0.875, 1.0, 1.0],
+    "pytest-dev__pytest-10081": [1.0, 0.9844, 1.0],
+    "pytest-dev__pytest-5840": [0.9623, 0.9623],
+    "pytest-dev__pytest-7205": [1.0, 0.6538, 0.6538],
+    "pytest-dev__pytest-7490": [0.9875, 1.0, 0.9875],
+    "sphinx-doc__sphinx-10323": [0.9756, 0.9756],
+    "sphinx-doc__sphinx-10435": [0.9733, 0.9867],
+    "sphinx-doc__sphinx-10673": [0.9, 0.5],
+    "sphinx-doc__sphinx-7462": [0.9608, 0.9608],
+    "sphinx-doc__sphinx-7748": [0.7857, 0.0],
+    "sphinx-doc__sphinx-8056": [0.9756, 1.0, 0.9756],
+    "sphinx-doc__sphinx-9281": [1.0, 0.9744, 1.0],
+    "sphinx-doc__sphinx-9673": [0.92, 0.92],
+    "sympy__sympy-12419": [0.9615, 1.0, 1.0],
+    "sympy__sympy-13091": [0.989, 0.9451],
+    "sympy__sympy-13798": [0.9903, 0.9903],
+    "sympy__sympy-13974": [0.8, 0.8],
+    "sympy__sympy-17318": [0.9091, 0.9091],
+    "sympy__sympy-18763": [0.993, 0.993],
+    "sympy__sympy-23950": [0.8, 0.8],
+    "sympy__sympy-24443": [0.0, 1.0, 1.0],
 }
 
-FULL_TRIAL_COUNT = 5  # config task_trials at the snapshot
-CYCLES = 1500
-SEED = 20260610
+FULL_TRIAL_COUNT = 3  # config task_trials for the finalized panel
+CYCLES = 2000
+SEED = 20260614
+
+
+def _draw(rng: random.Random, rewards: list[float], effect: float) -> list[float]:
+    # full=3 trials sampled with replacement; a partial-credit effect lifts each
+    # drawn reward (capped at 1.0 -- a ceiling reward cannot move).
+    return [min(1.0, rng.choice(rewards) + effect) for _ in range(FULL_TRIAL_COUNT)]
 
 
 def _simulated_keep(rng: random.Random, effect: float) -> bool:
-    verdicts: dict[str, BaselineComparison] = {}
-    for task_id, (solved, total) in BASELINE_RATES.items():
-        true_rate = min(1.0, solved / total + effect)
-        if 0 < total == solved:  # deterministic-solved: 1 confirming trial
-            draws = 1
-            candidate_solved = int(rng.random() < true_rate)
-            if candidate_solved == 0:  # confirm-on-fail expands to full
-                draws = FULL_TRIAL_COUNT
-                candidate_solved += sum(
-                    rng.random() < true_rate for _ in range(FULL_TRIAL_COUNT - 1)
-                )
-        else:
-            draws = FULL_TRIAL_COUNT
-            candidate_solved = sum(rng.random() < true_rate for _ in range(draws))
-        verdicts[task_id] = BaselineComparison(
-            kind="unchanged",  # _panel_decision reads counts, not kinds
-            candidate_solved=candidate_solved,
-            candidate_total=draws,
-            baseline_solved=solved,
-            baseline_total=total,
-            p_value=None,
-        )
-    kind, _ = _panel_decision(verdicts=verdicts, purpose="promotion")
-    return kind == "keep"
+    deltas = [
+        statistics.fmean(_draw(rng, rewards, effect))
+        - statistics.fmean(_draw(rng, rewards, 0.0))
+        for rewards in CHAR_REWARDS.values()
+    ]
+    test = GradedRewardTest.from_task_deltas(deltas)
+    return test.mean_delta > 0 and test.p_value <= GRADED_PROMOTION_P_VALUE_ALPHA
 
 
 def _keep_rate(effect: float) -> float:
     rng = random.Random(SEED)
-    keeps = sum(_simulated_keep(rng, effect) for _ in range(CYCLES))
-    return keeps / CYCLES
+    return sum(_simulated_keep(rng, effect) for _ in range(CYCLES)) / CYCLES
 
 
 def test_null_false_keep_rate_is_at_most_alpha() -> None:
-    # Inert candidate: the chance the gate promotes panel noise stays within
-    # the one-sided alpha (measured ~0.03 at this seed; the stratified-delta
-    # direction requirement makes the test conservative).
+    # Inert candidate (same reward population both arms): the chance the gate
+    # promotes panel noise stays within the nominal alpha. Measured ~0.079 at
+    # this seed -- the calibration behind graded-sole + alpha 0.08 on this panel.
     null_rate = _keep_rate(0.0)
-    assert null_rate <= 0.10, f"null false-keep rate {null_rate:.3f} > alpha"
+    assert null_rate <= 0.10, f"null false-keep rate {null_rate:.3f} > 0.10"
 
 
-def test_synthetic_effect_promotes_at_a_material_rate() -> None:
-    # A +5% per-task effect must be promotable at a rate materially above both
-    # the null and the prior aggregate gate's ~0 (it needed +7-8/59 tasks).
-    # Measured ~0.36 at this seed.
+def test_small_partial_credit_effect_promotes_at_a_material_rate() -> None:
+    # A +0.05 per-task reward lift -- movement that mostly does NOT cross the
+    # binary solve threshold, so the retired CMH was near-blind to it -- promotes
+    # at a rate far above the null. Measured ~0.80 at this seed.
     null_rate = _keep_rate(0.0)
     effect_rate = _keep_rate(0.05)
-    assert effect_rate >= 0.20, f"+5% effect keep rate {effect_rate:.3f} < 0.20"
-    assert effect_rate > 5 * null_rate, (
+    assert effect_rate >= 0.50, f"+0.05 effect keep rate {effect_rate:.3f} < 0.50"
+    assert effect_rate > 3 * null_rate, (
         f"effect rate {effect_rate:.3f} not materially above null {null_rate:.3f}"
     )
