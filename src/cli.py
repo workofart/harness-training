@@ -18,6 +18,19 @@ if TYPE_CHECKING:
     from src.experiment.record import TaskResult
 
 
+def _quiet_http_request_logs() -> None:
+    """Pin the HTTP stack's loggers to WARNING. httpx logs one INFO line per LLM
+    call (a run makes thousands) and httpcore/huggingface_hub are similarly noisy
+    at dataset load -- together they bury the progress bar. A dependency sets the
+    root logger to INFO at import; a named logger's own level takes precedence, so
+    this silences the per-request chatter without touching our logs. Errors still
+    surface at WARNING+."""
+    import logging
+
+    for name in ("httpx", "httpcore", "huggingface_hub"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def load_strict_runtime_config(
     *,
     harbor_config_path: Path,
@@ -48,9 +61,14 @@ def load_runtime_config(
 ) -> tuple[HarborConfig, HarnessConfig, str | None]:
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
 
+    # HARNESS_CONFIG_PATH selects an alternate harness config (e.g. the SWE-bench
+    # panel) for both `exp` and the `auto` worktree runs it spawns, without
+    # clobbering the default Terminal Bench config.
+    override = os.environ.get("HARNESS_CONFIG_PATH")
+    harness_config_path = Path(override) if override else DEFAULT_HARNESS_CONFIG_PATH
     harbor_config, harness_config = load_strict_runtime_config(
         harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
-        harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
+        harness_config_path=harness_config_path,
     )
     harbor_config = _apply_experiments_dir_override(harbor_config, experiments_dir)
     api_key = _load_llm_provider_secret(harness_config=harness_config)
@@ -197,15 +215,43 @@ async def _resolve_task_dirs(*, trial_harbor_config, task_names):
     )
 
 
-async def _build_trial_runner(
+async def _run_trial_with_env(
+    *,
+    env,
+    task_id,
+    run_id,
+    harness_config,
+    api_key,
+    task_timeout_sec,
+    verify_timeout_sec,
+    slot_release,
+):
+    """Drive one prepared env through `executor.run_trial` with this task's panel
+    wall budget -- the call shared by every backend's trial_runner."""
+    from src.experiment.executor import run_trial
+
+    return await run_trial(
+        task_id=task_id,
+        run_id=run_id,
+        llm=_make_llm_for_config(
+            config=harness_config.llm_provider_config, api_key=api_key
+        ),
+        env=env,
+        max_steps=harness_config.max_steps,
+        max_output_retries=harness_config.max_output_retries,
+        task_timeout_sec=task_timeout_sec,
+        env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
+        verify_timeout_sec=verify_timeout_sec,
+        slot_release=slot_release,
+    )
+
+
+async def _build_harbor_trial_runner(
     *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
 ):
-    """Resolve the selected tasks' directories once, then return the `run_tasks`
-    trial_runner -- the seam the orchestrator schedules. It builds each trial's
-    Harbor (handed the run-scoped heavy gate) + llm and calls `executor.run_trial`
-    with that task's panel wall budget."""
+    """Terminal Bench backend: resolve each selected task's directory once, then
+    build a per-trial `Harbor` handed the run-scoped heavy gate."""
     from src.env.harbor import Harbor
-    from src.experiment.executor import run_trial
 
     trial_harbor_config = harbor_config.model_copy(
         update={
@@ -225,22 +271,72 @@ async def _build_trial_runner(
             task_dir=task_dirs[task_id],
             exec_semaphore=heavy_action_semaphore,
         )
-        return await run_trial(
+        return await _run_trial_with_env(
+            env=env,
             task_id=task_id,
             run_id=run_id,
-            llm=_make_llm_for_config(
-                config=harness_config.llm_provider_config, api_key=api_key
-            ),
-            env=env,
-            max_steps=harness_config.max_steps,
-            max_output_retries=harness_config.max_output_retries,
+            harness_config=harness_config,
+            api_key=api_key,
             task_timeout_sec=task_timeout_sec[task_id],
-            env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
             verify_timeout_sec=verify_timeout_sec[task_id],
             slot_release=slot_release,
         )
 
     return trial_runner
+
+
+async def _build_swe_trial_runner(
+    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
+):
+    """SWE-bench-Verified backend: resolve each instance id to a dataset row once,
+    then build a per-trial `SweEnv` (offline container, handed the run-scoped
+    heavy gate). Artifacts mirror Harbor's tasks/<task_id>/<run_id> layout."""
+    from src.env.swe import SweEnv, load_rows
+
+    rows = load_rows(list(task_ids))
+    tasks_root = harbor_config.experiments_dir / experiment_id / "tasks"
+    task_timeout_sec = _panel_seconds_by_task(harness_config, "task_timeout_sec")
+    verify_timeout_sec = _panel_seconds_by_task(harness_config, "verify_timeout_sec")
+
+    async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
+        env = SweEnv(
+            row=rows[task_id],
+            artifacts_dir=str(tasks_root / task_id / run_id),
+            heavy_semaphore=heavy_action_semaphore,
+        )
+        return await _run_trial_with_env(
+            env=env,
+            task_id=task_id,
+            run_id=run_id,
+            harness_config=harness_config,
+            api_key=api_key,
+            task_timeout_sec=task_timeout_sec[task_id],
+            verify_timeout_sec=verify_timeout_sec[task_id],
+            slot_release=slot_release,
+        )
+
+    return trial_runner
+
+
+async def _build_trial_runner(
+    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
+):
+    """Return the `run_tasks` trial_runner for the configured env backend -- the
+    seam the orchestrator schedules. Each builder resolves its task source once
+    and returns a `(task_id, run_id, heavy_action_semaphore, slot_release)`
+    closure that builds the per-trial env + llm and calls `executor.run_trial`."""
+    builder = (
+        _build_swe_trial_runner
+        if harness_config.env_backend == "swe"
+        else _build_harbor_trial_runner
+    )
+    return await builder(
+        harness_config=harness_config,
+        harbor_config=harbor_config,
+        api_key=api_key,
+        task_ids=task_ids,
+        experiment_id=experiment_id,
+    )
 
 
 # --- uv run exp live progress bar -------------------------------------------
@@ -429,6 +525,7 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
     from src.repo import get_head_commit, require_clean_worktree
 
+    _quiet_http_request_logs()
     args = _parse_exp_args(argv)
     harbor_config, harness_config, api_key = load_runtime_config(
         experiments_dir=args.experiments_dir
@@ -443,7 +540,9 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
     print(f"experiment: {experiment_id}")
     print(f"tasks ({len(task_ids)}): {', '.join(task_ids)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
-    print(f"harness config: {DEFAULT_HARNESS_CONFIG_PATH}")
+    print(
+        f"harness config: {os.environ.get('HARNESS_CONFIG_PATH', DEFAULT_HARNESS_CONFIG_PATH)}"
+    )
     if _require_clean_worktree_for_exp():
         require_clean_worktree()
     git_commit_hash = get_head_commit()
@@ -515,6 +614,7 @@ def main_auto() -> int:
     from src.supervisor.agent_backend import create_backend, supervisor_root_for_repo
     from src.supervisor.loop import LoopContext, run_auto
 
+    _quiet_http_request_logs()
     agent_type = "codex"
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg in ("--agent", "-a") and i < len(sys.argv) - 1:
@@ -529,10 +629,18 @@ def main_auto() -> int:
     # relative experiments_dir against cwd -- so load with cwd at repo_root, making
     # `uv run auto` cwd-independent (an absolute config path is unaffected; cwd is
     # restored on exit, and the loop's I/O all uses explicit paths, never cwd).
+    # HARNESS_CONFIG_PATH selects an alternate harness panel (e.g. SWE-bench) for
+    # the loop itself, matching the `exp` subprocesses it spawns (which inherit the
+    # env). Resolve a relative override against repo_root so it stays cwd-independent
+    # (an absolute override replaces it outright).
+    override = os.environ.get("HARNESS_CONFIG_PATH")
+    harness_config_path = (
+        repo_root / override if override else DEFAULT_HARNESS_CONFIG_PATH
+    )
     with contextlib.chdir(repo_root):
         harbor_config, harness_config = load_strict_runtime_config(
             harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
-            harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
+            harness_config_path=harness_config_path,
         )
     ctx = LoopContext(
         repo_root=repo_root,

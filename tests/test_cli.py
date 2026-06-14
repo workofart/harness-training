@@ -105,6 +105,38 @@ def test_selected_task_ids_honors_tasks_subset():
     assert cli._selected_task_ids(harness, "b, c") == ["b", "c"]
 
 
+def test_build_trial_runner_selects_backend_by_env_backend(monkeypatch):
+    # The dispatcher routes to the SWE builder iff env_backend == "swe", else the
+    # Harbor builder; both backend builders are stubbed (no docker/dataset).
+    calls: list[str] = []
+
+    async def fake_harbor(**kwargs):
+        calls.append("harbor")
+        return "harbor-runner"
+
+    async def fake_swe(**kwargs):
+        calls.append("swe")
+        return "swe-runner"
+
+    monkeypatch.setattr(cli, "_build_harbor_trial_runner", fake_harbor)
+    monkeypatch.setattr(cli, "_build_swe_trial_runner", fake_swe)
+
+    def build(backend: str):
+        return asyncio.run(
+            cli._build_trial_runner(
+                harness_config=SimpleNamespace(env_backend=backend),
+                harbor_config=None,
+                api_key=None,
+                task_ids=["t"],
+                experiment_id="exp",
+            )
+        )
+
+    assert build("swe") == "swe-runner"
+    assert build("harbor") == "harbor-runner"
+    assert calls == ["swe", "harbor"]
+
+
 def test_selected_experiment_id_honors_the_flag():
     assert cli._selected_experiment_id("exp-existing") == "exp-existing"
 
@@ -276,6 +308,50 @@ def test_main_auto_anchors_experiments_dir_to_the_repo_not_cwd(monkeypatch, tmp_
     experiments_dir = captured["ctx"].experiments_dir
     assert experiments_dir == (repo_root / "experiments").resolve()
     assert tmp_path.resolve() not in experiments_dir.parents
+
+
+def test_main_auto_honors_harness_config_path_env(monkeypatch):
+    # Regression: main_auto must select the alternate harness panel named by
+    # HARNESS_CONFIG_PATH (matching the exp subprocesses it spawns, which inherit
+    # the env) -- else the loop iterates the default Terminal Bench task set while
+    # the candidate runs would use SWE-bench, a silent substrate mismatch.
+    from src.supervisor.policy import Halt
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto(ctx):
+        captured["ctx"] = ctx
+        return Halt("nothing to do (test)")
+
+    monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", "config/harness_config.swe.json")
+
+    assert cli.main_auto() == 0
+    config = captured["ctx"].config
+    assert config.env_backend == "swe"
+    panel = list(config.train.task_names) + list(config.test.task_names)
+    assert len(panel) == 23
+    assert all(
+        name.split("__")[0] in {"sympy", "pytest-dev", "sphinx-doc", "pylint-dev"}
+        for name in panel
+    )
+
+
+def test_main_auto_defaults_to_terminal_bench_panel_without_the_env(monkeypatch):
+    # The unset path stays on the default Harbor/Terminal Bench config.
+    from src.supervisor.policy import Halt
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto(ctx):
+        captured["ctx"] = ctx
+        return Halt("nothing to do (test)")
+
+    monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
+    monkeypatch.delenv("HARNESS_CONFIG_PATH", raising=False)
+
+    assert cli.main_auto() == 0
+    assert captured["ctx"].config.env_backend == "harbor"
 
 
 def test_load_llm_provider_secret_skips_openrouter_key_for_chatgpt():

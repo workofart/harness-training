@@ -1,0 +1,53 @@
+{
+  "schema_version": 3,
+  "env_backend": "swe",
+  "train": {
+    "task_names": [
+      "sympy__sympy-11618",
+      "sympy__sympy-12419",
+      "sympy__sympy-13031",
+      "sympy__sympy-13091",
+      "sympy__sympy-13551",
+      "pytest-dev__pytest-10051",
+      "pytest-dev__pytest-5631",
+      "pytest-dev__pytest-5840",
+      "pytest-dev__pytest-7236",
+      "pytest-dev__pytest-7324",
+      "sphinx-doc__sphinx-10673",
+      "sphinx-doc__sphinx-11445",
+      "sphinx-doc__sphinx-7748",
+      "sphinx-doc__sphinx-8035",
+      "pylint-dev__pylint-6528",
+      "pylint-dev__pylint-7080"
+    ],
+    "task_timeout_sec": 1800.0,
+    "verify_timeout_sec": 900.0
+  },
+  "test": {
+    "task_names": [
+      "sympy__sympy-13615",
+      "sympy__sympy-13647",
+      "pytest-dev__pytest-7490",
+      "pytest-dev__pytest-7571",
+      "sphinx-doc__sphinx-10466",
+      "sphinx-doc__sphinx-7757",
+      "pylint-dev__pylint-6386"
+    ],
+    "task_timeout_sec": 1800.0,
+    "verify_timeout_sec": 900.0
+  },
+  "max_steps": 60,
+  "max_trial_concurrency": 15,
+  "max_heavy_action_concurrency": 8,
+  "env_setup_timeout_sec": 600.0,
+  "max_output_retries": 2,
+  "task_trials": 3,
+  "llm_provider_config": {
+    "provider": "chatgpt_codex",
+    "model_name": "gpt-5.5",
+    "max_context_length": 200000,
+    "reasoning_effort": "high",
+    "timeout_seconds": 300.0,
+    "service_tier": null
+  }
+}

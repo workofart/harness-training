@@ -13,6 +13,9 @@ dependencies = [
   "httpx==0.28.1",
   "python-dotenv==1.2.2",
   "openrouter==0.9.1",
+  # SWE-bench-Verified substrate (src/env/swe.py): task rows + offline grading.
+  "swebench==4.1.0",
+  "datasets==4.8.5",
 ]
 
 [project.scripts]

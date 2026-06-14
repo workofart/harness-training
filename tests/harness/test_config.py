@@ -57,6 +57,21 @@ def test_test_tasks_is_empty_without_a_veto_panel():
     assert config.test_tasks == frozenset()
 
 
+def test_env_backend_defaults_to_harbor():
+    config = HarnessConfig.model_validate(minimal_config_payload())
+    assert config.env_backend == "harbor"
+
+
+def test_env_backend_accepts_swe():
+    config = HarnessConfig.model_validate(minimal_config_payload(env_backend="swe"))
+    assert config.env_backend == "swe"
+
+
+def test_env_backend_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        HarnessConfig.model_validate(minimal_config_payload(env_backend="docker"))
+
+
 def test_harness_config_accepts_literal_narrow_loop_shape():
     payload = minimal_config_payload(
         train=train_panel(task_timeout_sec=30.0),

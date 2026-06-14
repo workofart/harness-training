@@ -145,10 +145,12 @@ celerybeat.pid
 .env
 .envrc
 .venv
-venv/
-ENV/
-env.bak/
-venv.bak/
+# Root-anchored: unanchored `venv/`/`ENV/` match source dirs (src/env, tests/env)
+# at any depth -- and `ENV/` matches `env/` case-insensitively on macOS.
+/venv/
+/ENV/
+/env.bak/
+/venv.bak/
 
 # Spyder project settings
 .spyderproject
