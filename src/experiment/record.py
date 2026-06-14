@@ -40,9 +40,14 @@ class TrialResult(BaseModel):
     crash/interrupt marker (set => the trial is excluded from scoring).
     ``run_id`` is the trial's key (the artifact dir is
     ``tasks/<task_id>/<run_id>/``). Telemetry stays in ``metrics.json``, reached
-    via ``metrics_path`` -- never embedded; raw reward lives at
-    ``verifier/reward.txt`` and the step count in ``TaskMetrics.steps_total``,
-    so neither is duplicated here (plan.md §13).
+    via ``metrics_path`` -- never embedded; the binary ``verifier/reward.txt``
+    and the step count in ``TaskMetrics.steps_total`` are not duplicated here.
+    ``reward`` is the one exception: a *graded* reward (fraction of verifier
+    tests passed, recovered from the CTRF report) that the binary
+    ``reward.txt`` discards -- recorded first-class so the run record is
+    self-contained for a graded promotion statistic. It is denser telemetry
+    only and never the solve judgment: ``solved`` stays bound to ``passed``.
+    ``None`` on records written before graded reward existed.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -51,6 +56,7 @@ class TrialResult(BaseModel):
     solved: bool
     failure_mode: FailureMode
     verifier_passed: bool | None = None
+    reward: float | None = None
     error: str | None = None
     trial_dir: str | None = None
     trace_path: str | None = None

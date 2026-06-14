@@ -439,6 +439,7 @@ async def run_trial(
         solved=solved,
         failure_mode=failure_mode,
         verifier_passed=verifier_passed,
+        reward=state.reward,
         error=error,
         trial_dir=trial_dir,
         trace_path=trace_path,

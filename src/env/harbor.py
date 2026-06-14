@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import shutil
 import tomllib
@@ -112,6 +113,26 @@ def _is_command_timeout(exc: Exception) -> bool:
     # RuntimeError whose message contains "timed out"; there is no typed
     # timeout exception to match on.
     return isinstance(exc, RuntimeError) and "timed out" in str(exc).lower()
+
+
+def _graded_reward_from_ctrf(ctrf_path: Path) -> float | None:
+    """Fraction of verifier tests passed, read from the pytest CTRF report.
+
+    TB verifiers run pytest with `--ctrf <path>` and then collapse the result to
+    a binary 1/0 in `reward.txt`; the per-test counts survive in `ctrf.json`.
+    Returns the pass fraction in [0, 1], or None when the report is absent,
+    unparseable, or records no tests (the caller falls back to the binary
+    reward). This is a denser reward only -- it never affects `passed`/`solved`.
+    """
+    try:
+        data = json.loads(ctrf_path.read_text())
+    except (OSError, ValueError):
+        return None
+    summary = (data.get("results") or data or {}).get("summary") or {}
+    total = summary.get("tests")
+    if not total:
+        return None
+    return summary.get("passed", 0) / total
 
 
 # High trial concurrency exposes host CPU contention from libraries/build tools
@@ -950,12 +971,20 @@ class Harbor:
                 verifier_result = await verifier_session.verify()
             rewards = verifier_result.rewards
             raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
-            reward = 0.0 if raw_reward is None else float(raw_reward)
+            binary_reward = 0.0 if raw_reward is None else float(raw_reward)
+            # `passed` (-> solved -> the promotion gate) stays bound to the
+            # authoritative binary reward.txt. The graded reward recovers the
+            # per-test pass fraction the binary value discards (denser signal
+            # for a graded statistic); it falls back to the binary value when no
+            # CTRF report is present.
+            graded = _graded_reward_from_ctrf(
+                self.session.trial_paths.verifier_dir / "ctrf.json"
+            )
             stdout_path = self.session.trial_paths.test_stdout_path
             stderr_path = self.session.trial_paths.test_stderr_path
             return RawState(
-                reward=reward,
-                passed=reward > 0.0,
+                reward=binary_reward if graded is None else graded,
+                passed=binary_reward > 0.0,
                 stdout=stdout_path.read_text() if stdout_path.exists() else None,
                 stderr=stderr_path.read_text() if stderr_path.exists() else None,
             )

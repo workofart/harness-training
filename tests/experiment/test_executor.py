@@ -107,9 +107,26 @@ def test_run_trial_solved_happy_path(tmp_path: Path) -> None:
     assert result.solved is True
     assert result.failure_mode == "solved"
     assert result.verifier_passed is True
+    assert result.reward == 1.0
     assert result.error is None
     assert result.metrics_path is not None and Path(result.metrics_path).exists()
     assert env.closed and llm.closed
+
+
+def test_run_trial_threads_graded_reward(tmp_path: Path) -> None:
+    # A partial verify (graded reward 0.6, verdict failed) must record the dense
+    # reward on the TrialResult while `solved` stays bound to the binary verdict.
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _StubEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=False, reward=0.6),
+    )
+
+    result = _run_one(llm=llm, env=env)
+
+    assert result.reward == 0.6
+    assert result.solved is False
+    assert result.failure_mode == "verified_rejected"
 
 
 def test_run_trial_classifies_verified_rejected(tmp_path: Path) -> None:

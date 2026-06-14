@@ -455,6 +455,42 @@ def test_gate_promotion_keeps_a_pure_frontier_panel() -> None:
     assert "improved" in decision.reason
 
 
+def test_promotion_carries_a_nondeciding_graded_shadow() -> None:
+    # The promotion reason records what the graded statistic would say, but the
+    # binary CMH still decides (Phase 1 step 2: additive, pre-cutover). Here both
+    # agree on keep (baseline 0/5 -> candidate 5/5 is a unanimous +1.0 delta).
+    tasks = {f"t{i}": _task(False, False) for i in range(5)}
+    baseline = _exp(tasks=tasks)
+    candidate = _exp(tasks={f"t{i}": _task(True, True) for i in range(5)})
+    decision = gate(candidate, baseline, task_ids=frozenset(tasks), purpose="promotion")
+    assert decision.kind == "keep"
+    assert "[graded-shadow, non-deciding]" in decision.reason
+    assert "would keep" in decision.reason
+
+
+def test_graded_shadow_does_not_override_the_binary_decision() -> None:
+    # A pure frontier panel: the binary gate keeps (candidate majority-solves),
+    # but the graded shadow has no both-arms strata -> would discard. The shadow
+    # must NOT flip the decision -- it is diagnostic only until the cutover.
+    baseline = _exp(tasks={})
+    candidate = _exp(tasks={"a": _task(True, True), "b": _task(True, True)})
+    decision = gate(
+        candidate, baseline, task_ids=frozenset({"a", "b"}), purpose="promotion"
+    )
+    assert decision.kind == "keep"  # binary still decides
+    assert "would discard" in decision.reason  # graded disagrees, harmlessly
+
+
+def test_regression_veto_has_no_graded_shadow() -> None:
+    # The shadow annotates the promotion test only, not the veto.
+    baseline = _exp(tasks={"x": _task(True, True), "y": _task(True, True)})
+    candidate = _exp(tasks={"x": _task(True, True), "y": _task(True, True)})
+    decision = gate(
+        candidate, baseline, task_ids=frozenset({"x", "y"}), purpose="regression_veto"
+    )
+    assert "graded-shadow" not in decision.reason
+
+
 # --- gate: regression-veto (can only block) ---------------------------------
 
 

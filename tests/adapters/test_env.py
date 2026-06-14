@@ -20,9 +20,52 @@ from src.env.harbor import (
     Harbor,
     HarborConfig,
     TaskDirectoryResolver,
+    _graded_reward_from_ctrf,
     _ResourceCappedEnvironment,
     _strip_ipv6_no_proxy,
 )
+
+
+def _write_ctrf(path: Path, *, tests: int, passed: int) -> None:
+    path.write_text(
+        json.dumps({"results": {"summary": {"tests": tests, "passed": passed}}})
+    )
+
+
+def test_graded_reward_full_pass(tmp_path: Path) -> None:
+    p = tmp_path / "ctrf.json"
+    _write_ctrf(p, tests=5, passed=5)
+    assert _graded_reward_from_ctrf(p) == 1.0
+
+
+def test_graded_reward_partial(tmp_path: Path) -> None:
+    # The case binary grading discards: pytorch-model-recovery-style 4/5.
+    p = tmp_path / "ctrf.json"
+    _write_ctrf(p, tests=5, passed=4)
+    assert _graded_reward_from_ctrf(p) == 0.8
+
+
+def test_graded_reward_all_fail(tmp_path: Path) -> None:
+    p = tmp_path / "ctrf.json"
+    _write_ctrf(p, tests=3, passed=0)
+    assert _graded_reward_from_ctrf(p) == 0.0
+
+
+def test_graded_reward_missing_file_is_none(tmp_path: Path) -> None:
+    # No CTRF report -> caller falls back to the binary reward.
+    assert _graded_reward_from_ctrf(tmp_path / "absent.json") is None
+
+
+def test_graded_reward_malformed_is_none(tmp_path: Path) -> None:
+    p = tmp_path / "ctrf.json"
+    p.write_text("not json{")
+    assert _graded_reward_from_ctrf(p) is None
+
+
+def test_graded_reward_zero_tests_is_none(tmp_path: Path) -> None:
+    p = tmp_path / "ctrf.json"
+    _write_ctrf(p, tests=0, passed=0)
+    assert _graded_reward_from_ctrf(p) is None
 
 
 def _write_minimal_task(
@@ -661,6 +704,7 @@ def test_harbor_verify_serializes_under_shared_semaphore(tmp_path: Path) -> None
         verifier_session=_RecordingVerifier(),
         trial_paths=SimpleNamespace(
             agent_dir=agent_dir,
+            verifier_dir=tmp_path / "trial",  # no ctrf.json -> graded falls back to binary
             test_stdout_path=tmp_path / "trial" / "stdout.txt",
             test_stderr_path=tmp_path / "trial" / "stderr.txt",
         ),

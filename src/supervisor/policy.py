@@ -28,7 +28,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from src.contracts import is_majority_solved
-from src.experiment.record import ExperimentResult
+from src.experiment.record import ExperimentResult, TrialResult
 
 # ----------------------------------------------------------------------------
 # Gate statistics (moved here from metrics.py; §9).
@@ -178,6 +178,81 @@ class StratifiedSolveTest:
             f"pooled {self.candidate_solved}/{self.candidate_total} vs "
             f"{self.baseline_solved}/{self.baseline_total} trial solves"
         )
+
+
+# ----------------------------------------------------------------------------
+# The graded promotion statistic (continuous reward; Phase 1 step 2).
+# ----------------------------------------------------------------------------
+
+# One-sided alpha for the graded promotion test. Same bar as the binary CMH so
+# the two are directly comparable; calibrated to ~alpha null false-keeps on the
+# resampling simulation (tests/supervisor/test_graded_gate_acceptance.py).
+GRADED_PROMOTION_P_VALUE_ALPHA = 0.10
+
+
+def _trial_graded_reward(trial: TrialResult) -> float:
+    """The per-trial graded reward the promotion test scores: the fraction of
+    verifier tests passed (``TrialResult.reward``, recovered from the CTRF
+    report), or the binary solve when no graded reward was recorded -- old
+    records (pre-graded-reward) and trials whose verifier wrote no CTRF both fall
+    back to 1.0/0.0, so the graded test degrades gracefully to the binary signal
+    on any task that carries no partial-credit granularity."""
+    if trial.reward is not None:
+        return trial.reward
+    return 1.0 if trial.solved else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class GradedRewardTest:
+    """One-sided test that the candidate's mean graded reward exceeds the
+    baseline's, with the **task as the unit of replication**: per task, the
+    candidate's mean per-trial reward minus the baseline's; the panel statistic
+    is a one-sample test over those per-task deltas.
+
+    Why task-as-unit (a cluster-robust delta) rather than the per-trial
+    stratification the binary CMH uses: graded reward has a few trials per task
+    (n~3-5) and many tasks are near-deterministic (within-arm sample variance
+    ~0), so an analytic per-stratum variance collapses and false-keeps panel
+    noise (measured: it spuriously kept a real historical discard). Using the
+    spread of per-task deltas as the variance is robust -- each delta already
+    carries its own within-task trial noise -- and stays deterministic +
+    closed-form like ``StratifiedSolveTest`` (no RNG in the decision path).
+
+    ``mean_delta`` is the average per-task reward gain (direction: promote iff
+    > 0). ``p_value`` is one-sided ``1 - Phi(mean_delta / (sd / sqrt(k)))``, a
+    large-K normal approximation (the train panel is ~59 tasks). Fewer than two
+    comparable tasks carry no spread estimate -> p_value 1.0 (no promotion);
+    a degenerate all-identical-delta panel is unanimous -> p_value 0.0 iff the
+    shared delta is positive. Golden-validated against history + the resampling
+    simulation before any cutover.
+    """
+
+    mean_delta: float
+    p_value: float
+    task_count: int
+
+    @classmethod
+    def from_task_deltas(cls, deltas: Iterable[float]) -> GradedRewardTest:
+        d = list(deltas)
+        k = len(d)
+        if k == 0:
+            return cls(0.0, 1.0, 0)
+        mean_delta = math.fsum(d) / k
+        if k < 2:
+            # A single comparable task gives no spread -> no significance claim.
+            return cls(mean_delta, 1.0, k)
+        variance = math.fsum((x - mean_delta) ** 2 for x in d) / (k - 1)
+        if variance == 0.0:
+            # Every task moved by the same amount: unanimous direction.
+            p_value = 0.0 if mean_delta > 0.0 else 1.0
+        else:
+            z = mean_delta / math.sqrt(variance / k)
+            p_value = 0.5 * math.erfc(z / math.sqrt(2.0))
+        return cls(mean_delta, p_value, k)
+
+    @property
+    def counts(self) -> str:
+        return f"mean per-task reward delta {self.mean_delta:+.3f} over {self.task_count} tasks"
 
 
 class BaselineComparison(BaseModel):
@@ -374,6 +449,36 @@ def _floor_regression_when_candidate_solves(
     return verdict
 
 
+def _graded_task_deltas(
+    *,
+    candidate: ExperimentResult,
+    baseline: ExperimentResult,
+    task_ids: frozenset[str],
+) -> list[float]:
+    """Per-task graded-reward deltas for ``GradedRewardTest``: for every task the
+    frozen baseline and the candidate both ran (the same both-arms strata the
+    binary CMH uses), the candidate's mean per-trial reward minus the baseline's.
+    Scored over valid trials only (crash trials excluded, matching the binary
+    gate). A task missing either arm carries no comparison and drops out."""
+    deltas: list[float] = []
+    for task_id in sorted(task_ids):
+        candidate_task = candidate.tasks.get(task_id)
+        baseline_task = baseline.tasks.get(task_id)
+        if candidate_task is None or baseline_task is None:
+            continue
+        candidate_rewards = [
+            _trial_graded_reward(t) for t in candidate_task.valid_trials
+        ]
+        baseline_rewards = [_trial_graded_reward(t) for t in baseline_task.valid_trials]
+        if not candidate_rewards or not baseline_rewards:
+            continue
+        deltas.append(
+            math.fsum(candidate_rewards) / len(candidate_rewards)
+            - math.fsum(baseline_rewards) / len(baseline_rewards)
+        )
+    return deltas
+
+
 def _aggregate_counts(
     verdicts: dict[str, BaselineComparison],
 ) -> tuple[int, int, int, int]:
@@ -488,6 +593,24 @@ def gate(
         for task_id in sorted(task_ids)
     }
     kind, reason = _panel_decision(verdicts=verdicts, purpose=purpose)
+    if purpose == "promotion":
+        # Shadow the graded promotion statistic alongside the binary CMH that
+        # actually decides (Phase 1 step 2): record what the continuous,
+        # per-task-stratified reward delta would say, so real cycles confirm it
+        # before the cutover (step 3). Non-deciding -- ``kind`` is untouched.
+        graded = GradedRewardTest.from_task_deltas(
+            _graded_task_deltas(
+                candidate=candidate, baseline=baseline, task_ids=task_ids
+            )
+        )
+        would_keep = (
+            graded.mean_delta > 0 and graded.p_value <= GRADED_PROMOTION_P_VALUE_ALPHA
+        )
+        reason += (
+            f"; [graded-shadow, non-deciding] {graded.counts} "
+            f"(one-sided p={graded.p_value:.3g} -> would "
+            f"{'keep' if would_keep else 'discard'})"
+        )
     return Decision(kind=kind, reason=reason, verdicts=verdicts)
 
 
