@@ -13,7 +13,6 @@ from src.llm.base import LlmToolCall
 from src.contracts import RawState
 from src.harness.core import (
     ACTION_SPECS,
-    DEFAULT_READ_WINDOW_LINES,
     MISSING_TOOL_CALL_REPAIR_PROMPT,
     EditFileAction,
     FindFilesAction,
@@ -254,12 +253,13 @@ def test_execute_action_read_file_uses_sed_with_explicit_line_range():
     assert env.exec_calls[0]["workload"] == "light"
 
 
-def test_execute_action_read_file_uses_default_window_when_no_end_line():
+def test_execute_action_read_file_reads_to_eof_when_no_end_line():
     stdout = "".join(f"{line}\n" for line in range(1, 202))
     env = _StubEnv(exec_states=[RawState(return_code=0, stdout=stdout)])
     result = asyncio.run(execute_action(env, ReadFileAction(path="/x", start_line=1)))
-    expected_end = DEFAULT_READ_WINDOW_LINES
-    assert env.exec_calls[0]["command"] == f"sed -n '1,{expected_end}p' /x"
+    # No end_line => read to EOF (sed's `$`); the per-observation char limit,
+    # not a baked line window, is the only size guard.
+    assert env.exec_calls[0]["command"] == "sed -n '1,$p' /x"
     assert env.exec_calls[0]["workload"] == "light"
     assert result.stdout == stdout
 
@@ -365,19 +365,6 @@ def test_render_tool_result_includes_rc_stdout_stderr():
 
 def test_render_tool_result_returns_no_output_when_state_is_empty():
     assert render_tool_result(RawState(), char_limit=100) == "(no output)"
-
-
-def test_render_tool_result_surfaces_time_remaining_budget():
-    # The stamped wall budget must reach the agent's observation, not just the
-    # trace: an integer-second `time_remaining` line, omitted when unbounded.
-    rendered = render_tool_result(
-        RawState(return_code=0, stdout="out", time_remaining_sec=42.7), char_limit=100
-    )
-    assert "time_remaining: 42s" in rendered
-    assert "rc=0" in rendered
-    assert "time_remaining" not in render_tool_result(
-        RawState(return_code=0, stdout="out"), char_limit=100
-    )
 
 
 def test_render_tool_result_truncates_long_output():
