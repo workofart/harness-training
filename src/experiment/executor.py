@@ -52,14 +52,24 @@ VERIFY_TIMEOUT_NOTICE = (
 
 
 class _VerifyCeilingEnv:
-    """Wraps a `HarnessEnv` to bound `verify()` by `timeout_sec`.
+    """Wraps a `HarnessEnv` to bound `verify()` by `timeout_sec` ALONE.
 
-    On expiry it records a trial-level `verify_timeout` fire and returns the
-    terminal non-passing `RawState` -- the unsolved verdict the task timeout
-    would reach anyway, sooner. Only the inner ceiling is caught; an outer
-    task-timeout cancellation passes through as `CancelledError` for upstream
-    classification. Every other call delegates to the inner env, so Harbor stays
-    trace-free and `core.py`'s `VerifyAction` is a bare `env.verify()`.
+    `verify()` is the terminal grade. Its budget is `timeout_sec` and nothing
+    else: once started it must run to a real verdict (or its own ceiling),
+    independent of how much of the outer `task_timeout_sec` remains. The task
+    timeout bounds the agent's *work* (non-verify steps); a verify already in
+    flight is exempt. So this wrapper shields the graded verify from the outer
+    task-timeout cancellation -- absorbing it with the same `asyncio.shield` +
+    `uncancel()` loop `_close_resources` uses -- and lets the verify finish under
+    its own ceiling. A late but completed verify thus yields a scorable verdict,
+    not a `hit_timeout`.
+
+    On ceiling expiry it records a trial-level `verify_timeout` fire and returns
+    the terminal non-passing `RawState` -- the unsolved verdict the task timeout
+    would reach anyway, sooner. A `TimeoutError` raised by the verifier itself
+    (infra failure, not the ceiling) propagates for `crash` classification.
+    Every other call delegates to the inner env, so Harbor stays trace-free and
+    `core.py`'s `VerifyAction` is a bare `env.verify()`.
     """
 
     def __init__(
@@ -72,6 +82,13 @@ class _VerifyCeilingEnv:
         self._inner = inner
         self._recorder = recorder
         self._timeout_sec = timeout_sec
+        self._task_deadline: asyncio.Timeout | None = None
+
+    def bind_task_deadline(self, deadline: asyncio.Timeout) -> None:
+        self._task_deadline = deadline
+
+    def _cancel_is_task_deadline(self) -> bool:
+        return self._task_deadline is not None and self._task_deadline.expired()
 
     @property
     def trial_dir(self) -> str | None:
@@ -96,7 +113,7 @@ class _VerifyCeilingEnv:
             command=command, cwd=cwd, timeout_sec=timeout_sec, workload=workload
         )
 
-    async def verify(self) -> RawState:
+    async def _verify_under_ceiling(self) -> RawState:
         ceiling = None
         try:
             async with asyncio.timeout(self._timeout_sec) as ceiling:
@@ -110,6 +127,34 @@ class _VerifyCeilingEnv:
                 raise
             self._recorder.rule_fired("verify_timeout")
             return RawState(reward=0.0, passed=False, stdout=VERIFY_TIMEOUT_NOTICE)
+
+    async def verify(self) -> RawState:
+        # The terminal verify is bounded by its own ceiling alone. Shield it from
+        # the outer task-timeout cancellation so a verify that starts before the
+        # agent deadline runs to a real verdict even if it outlasts that
+        # deadline; the outer timeout governs the agent's *work*, not the grade.
+        # Same `shield` + `uncancel()` loop `_close_resources` uses to let
+        # cleanup finish despite an outer cancel.
+        graded = asyncio.ensure_future(self._verify_under_ceiling())
+        while not graded.done():
+            try:
+                await asyncio.shield(graded)
+            except asyncio.CancelledError:
+                if graded.cancelled():
+                    raise
+                if not self._cancel_is_task_deadline():
+                    # External cancel (orchestrator early-stop / shutdown), not the
+                    # task deadline: abandon+drain the grade and propagate to tear down.
+                    graded.cancel()
+                    try:
+                        await graded
+                    except asyncio.CancelledError:
+                        pass
+                    raise
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        return graded.result()
 
     async def close(self) -> None:
         await self._inner.close()
@@ -293,12 +338,16 @@ async def run_trial(
             instruction=reset_state.instruction,
             working_dir=reset_state.working_dir,
         )
+        verify_ceiling_env = _VerifyCeilingEnv(
+            env, recorder, timeout_sec=verify_timeout_sec
+        )
         budget_env = _BudgetStampingEnv(
-            _VerifyCeilingEnv(env, recorder, timeout_sec=verify_timeout_sec),
+            verify_ceiling_env,
             budget_sec=task_timeout_sec,
             clock=clock,
         )
         async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
+            verify_ceiling_env.bind_task_deadline(agent_timeout_ctx)
             # The budget clock anchors here -- reset/bootstrap above never
             # counts -- and the reset state carries the first (full) stamp.
             budget_env.start_clock()
@@ -410,6 +459,7 @@ async def run_trial(
         solved=solved,
         failure_mode=failure_mode,
         verifier_passed=verifier_passed,
+        reward=state.reward,
         error=error,
         trial_dir=trial_dir,
         trace_path=trace_path,

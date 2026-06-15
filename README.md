@@ -6,7 +6,7 @@
 
 A self-improvement experiment in two layers:
 
-- **Inner — the harness** (`src/harness/core.py`): an LLM shell agent that solves [Terminal-Bench 2](https://www.tbench.ai/benchmarks/terminal-bench-2) tasks.
+- **Inner — the harness** (`src/harness/core.py`): an LLM shell agent that solves tasks behind a common `HarnessEnv` interface. The checked-in default uses [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified); Harbor/Terminal-Bench remains available via config.
 - **Outer — the supervisor** (`uv run auto`): a coding agent (Codex or Claude Code) that proposes one focused change to the inner harness per cycle, measures it against the current baseline, and keeps or discards it on statistical evidence.
 
 Architecture: [TECH_DESIGN.md](./TECH_DESIGN.md). Operating policy the outer agent follows: [program.md](./program.md).
@@ -20,7 +20,12 @@ uv sync
 source .venv/bin/activate
 ```
 
-Configure the harness in [config/harness_config.json](./config/harness_config.json); [config/harness_config.template.json](./config/harness_config.template.json) is the commented reference. The committed default is a bounded smoke run, not benchmark-quality evidence.
+Configure the harness in [config/harness_config.json](./config/harness_config.json); [config/harness_config.template.json](./config/harness_config.template.json) is the commented reference. `uv run exp` and `uv run auto` always read `config/harness_config.json`; switch substrates by editing its `env_backend`.
+
+Backend task names:
+
+- `env_backend: "swe"`: `task_names` are SWE-bench Verified `instance_id`s from the `test` split at https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified.
+- `env_backend: "harbor"`: `task_names` are Terminal-Bench 2 task IDs from https://www.tbench.ai/benchmarks/terminal-bench-2, with local `task_overrides/<task_id>/` taking precedence.
 
 Credentials, per layer:
 
@@ -67,7 +72,7 @@ It streams the agent's thinking and tool calls, then the same per-run progress b
 [supervisor] loop_iteration_started
 [claude] I'll read the authoritative files to understand the current state...
   [toolcall] read .../workspace/program.md
-  [toolcall] read .../workspace/config/harness_config.json
+  [toolcall] read .../workspace/src/harness/core.py
 ```
 
 ## Results
@@ -88,6 +93,6 @@ For multi-trial runs, [scripts/setup-apt-cache.sh](./scripts/setup-apt-cache.sh)
 <details>
 <summary>Task overrides</summary>
 
-Drop a valid Harbor task layout under `task_overrides/<task_id>/` to shadow a Terminal-Bench task or run a local task. Configure or disable overrides in [config/harbor_config.toml](./config/harbor_config.toml).
+For `env_backend: "harbor"`, drop a valid Harbor task layout under `task_overrides/<task_id>/` to shadow a Terminal-Bench task or run a local task. Configure or disable overrides in [config/harbor_config.toml](./config/harbor_config.toml).
 
 </details>

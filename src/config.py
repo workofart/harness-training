@@ -157,6 +157,15 @@ class HarnessConfig(BaseModel):
         default_factory=dict,
         description="Named task groups kept out of runnable panels.",
     )
+    env_backend: Literal["harbor", "swe"] = Field(
+        default="harbor",
+        description=(
+            "Which HarnessEnv backs each trial. 'harbor' (default): Terminal "
+            "Bench task directories. 'swe': SWE-bench-Verified instances, where "
+            "task_names are instance ids resolved to dataset rows. Selects the "
+            "trial_runner the cli builds; every other field applies unchanged."
+        ),
+    )
     max_steps: int = Field(
         default=50,
         gt=0,

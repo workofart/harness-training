@@ -397,6 +397,8 @@ def _run_exp(
         ChatGptCodexCredentialsExpiredError,
     )
 
+    env = dict(os.environ)
+    env.pop("HARNESS_CONFIG_PATH", None)
     completed = _run_with_live_tty_output(
         [
             "uv",
@@ -412,7 +414,7 @@ def _run_exp(
             json.dumps(dict(trial_budget)),
         ],
         cwd=worktree,
-        env=dict(os.environ),
+        env=env,
     )
     if completed.returncode == CODEX_CREDENTIALS_EXPIRED_EXIT_CODE:
         # Dead credentials need a human; halt rather than finalizing a crash record

@@ -9,10 +9,13 @@ import re
 import weakref
 from collections.abc import Awaitable, Callable
 from hashlib import sha1
+from typing import TYPE_CHECKING, Any
 
-from harbor.environments.base import BaseEnvironment, ExecResult
-from harbor.models.environment_type import EnvironmentType
-from harbor.models.trial.config import EnvironmentConfig
+from src.retry import retry_transient
+
+if TYPE_CHECKING:
+    from harbor.environments.base import BaseEnvironment
+    from harbor.models.trial.config import EnvironmentConfig
 
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
 _HARBOR_RUN_ID_EXAMPLE = "20260603-120000-abcdef12"
@@ -30,7 +33,105 @@ _CLEANUP_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
     dict[str, asyncio.Lock],
 ] = weakref.WeakKeyDictionary()
 
-_DockerCli = Callable[..., Awaitable[ExecResult]]
+_DockerCli = Callable[..., Awaitable[Any]]
+DOCKER_INFRA_RETRY_BUDGET = 5
+
+
+class TransientDockerError(RuntimeError):
+    pass
+
+
+async def run_docker_once(
+    *args: str, timeout: float | None = None
+) -> tuple[int, str, str]:
+    """One host Docker CLI subprocess, decoded stdout/stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        proc.kill()
+        await proc.wait()
+        raise
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        out.decode("utf-8", "replace"),
+        err.decode("utf-8", "replace"),
+    )
+
+
+async def run_docker_cli(
+    *args: str,
+    timeout: float | None = None,
+    retry: bool = False,
+    retry_budget: int = DOCKER_INFRA_RETRY_BUDGET,
+    logger: logging.Logger | None = None,
+) -> tuple[int, str, str]:
+    """Run a Docker CLI command, optionally retrying daemon-level failures."""
+    if not retry:
+        return await run_docker_once(*args, timeout=timeout)
+
+    async def _attempt() -> tuple[int, str, str]:
+        rc, out, err = await run_docker_once(*args, timeout=timeout)
+        if rc != 0 and err.strip():
+            raise TransientDockerError(f"{' '.join(args[:2])}: {err[:300]}")
+        return rc, out, err
+
+    def _on_retry(retry_count: int, exc: Exception) -> None:
+        if logger is None:
+            return
+        logger.warning(
+            "transient docker error; retrying (%d/%d): %s",
+            retry_count,
+            retry_budget,
+            exc,
+        )
+
+    return await retry_transient(
+        _attempt,
+        is_transient=lambda exc: isinstance(exc, TransientDockerError),
+        on_retry=_on_retry,
+        budget=retry_budget,
+    )
+
+
+# High trial concurrency exposes host CPU contention from libraries/build tools
+# that fan out inside each container. Cap those defaults at the Docker boundary
+# so environment adapters share one policy.
+CPU_THREAD_ENV_KEYS = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+    "CARGO_BUILD_JOBS",
+    "GOMAXPROCS",
+    "CMAKE_BUILD_PARALLEL_LEVEL",
+)
+NO_PROXY_ENV_KEYS = ("no_proxy", "NO_PROXY")
+
+
+def cpu_resource_env(cpus: int | None) -> dict[str, str]:
+    if cpus is None:
+        return {"TOKENIZERS_PARALLELISM": "false"}
+    cap = str(cpus)
+    return {
+        **{key: cap for key in CPU_THREAD_ENV_KEYS},
+        "MAKEFLAGS": f"-j{cap}",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+
+
+def strip_ipv6_no_proxy(value: str) -> str:
+    # A no_proxy entry is a hostname, domain suffix, IPv4 address, IPv4 CIDR, or
+    # host:port -- none carry more than one ':'. Entries with two or more colons
+    # are IPv6 addresses/CIDRs, which can trip older HTTP clients.
+    return ",".join(token for token in value.split(",") if token.count(":") < 2)
 
 
 def _safe_verifier_session_text(value: str) -> str:
@@ -175,6 +276,8 @@ class DockerCleanup:
         return False
 
     async def cleanup_stale_docker_compose_projects(self) -> None:
+        from harbor.models.environment_type import EnvironmentType
+
         if (
             not self.environment_config.delete
             or self.environment_config.type != EnvironmentType.DOCKER

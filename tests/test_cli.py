@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -105,6 +106,38 @@ def test_selected_task_ids_honors_tasks_subset():
     assert cli._selected_task_ids(harness, "b, c") == ["b", "c"]
 
 
+def test_build_trial_runner_selects_backend_by_env_backend(monkeypatch):
+    # The dispatcher routes to the SWE builder iff env_backend == "swe", else the
+    # Harbor builder; both backend builders are stubbed (no docker/dataset).
+    calls: list[str] = []
+
+    async def fake_harbor(**kwargs):
+        calls.append("harbor")
+        return "harbor-runner"
+
+    async def fake_swe(**kwargs):
+        calls.append("swe")
+        return "swe-runner"
+
+    monkeypatch.setattr(cli, "_build_harbor_trial_runner", fake_harbor)
+    monkeypatch.setattr(cli, "_build_swe_trial_runner", fake_swe)
+
+    def build(backend: str):
+        return asyncio.run(
+            cli._build_trial_runner(
+                harness_config=SimpleNamespace(env_backend=backend),
+                harbor_config=None,
+                api_key=None,
+                task_ids=["t"],
+                experiment_id="exp",
+            )
+        )
+
+    assert build("swe") == "swe-runner"
+    assert build("harbor") == "harbor-runner"
+    assert calls == ["swe", "harbor"]
+
+
 def test_selected_experiment_id_honors_the_flag():
     assert cli._selected_experiment_id("exp-existing") == "exp-existing"
 
@@ -205,6 +238,15 @@ def test_experiments_dir_override_rejects_a_relative_path():
         cli._apply_experiments_dir_override(HarborConfig(), "relative/experiments")
 
 
+def test_load_runtime_config_ignores_harness_config_path_env(monkeypatch):
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", "does/not/exist.json")
+
+    _, harness_config, _ = cli.load_runtime_config()
+
+    expected = json.loads(cli.DEFAULT_HARNESS_CONFIG_PATH.read_text())
+    assert harness_config.env_backend == expected["env_backend"]
+
+
 # --- auto entry point (Step 5: main_auto drives supervisor.loop.run_auto) ----
 
 
@@ -276,6 +318,73 @@ def test_main_auto_anchors_experiments_dir_to_the_repo_not_cwd(monkeypatch, tmp_
     experiments_dir = captured["ctx"].experiments_dir
     assert experiments_dir == (repo_root / "experiments").resolve()
     assert tmp_path.resolve() not in experiments_dir.parents
+
+
+def test_main_auto_ignores_harness_config_path_env(monkeypatch):
+    # Env selection lives in config/harness_config.json. A stale
+    # HARNESS_CONFIG_PATH must not silently move auto onto another substrate.
+    from src.supervisor.policy import Halt
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto(ctx):
+        captured["ctx"] = ctx
+        return Halt("nothing to do (test)")
+
+    monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", "does/not/exist.json")
+
+    assert cli.main_auto() == 0
+    config = captured["ctx"].config
+    expected = json.loads(cli.DEFAULT_HARNESS_CONFIG_PATH.read_text())
+    assert config.env_backend == expected["env_backend"]
+    panel = list(config.train.task_names) + list(config.test.task_names)
+    expected_panel = list(expected["train"]["task_names"]) + list(
+        expected["test"]["task_names"]
+    )
+    assert panel == expected_panel
+
+
+def test_main_auto_loads_env_backend_from_default_harness_config(monkeypatch):
+    # The unset path stays on the default config, whose own env_backend selects
+    # Harbor vs SWE.
+    from src.supervisor.policy import Halt
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto(ctx):
+        captured["ctx"] = ctx
+        return Halt("nothing to do (test)")
+
+    monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
+    monkeypatch.delenv("HARNESS_CONFIG_PATH", raising=False)
+
+    assert cli.main_auto() == 0
+    config = captured["ctx"].config
+    expected = json.loads(cli.DEFAULT_HARNESS_CONFIG_PATH.read_text())
+    assert config.env_backend == expected["env_backend"]
+    panel = list(config.train.task_names) + list(config.test.task_names)
+    expected_panel = list(expected["train"]["task_names"]) + list(
+        expected["test"]["task_names"]
+    )
+    assert panel == expected_panel
+
+
+def test_main_auto_default_config_currently_selects_swe(monkeypatch):
+    # The checked-in default config currently selects SWE-bench.
+    from src.supervisor.policy import Halt
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto(ctx):
+        captured["ctx"] = ctx
+        return Halt("nothing to do (test)")
+
+    monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
+    monkeypatch.delenv("HARNESS_CONFIG_PATH", raising=False)
+
+    assert cli.main_auto() == 0
+    assert captured["ctx"].config.env_backend == "swe"
 
 
 def test_load_llm_provider_secret_skips_openrouter_key_for_chatgpt():

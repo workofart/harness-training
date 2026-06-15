@@ -18,6 +18,19 @@ if TYPE_CHECKING:
     from src.experiment.record import TaskResult
 
 
+def _quiet_http_request_logs() -> None:
+    """Pin the HTTP stack's loggers to WARNING. httpx logs one INFO line per LLM
+    call (a run makes thousands) and httpcore/huggingface_hub are similarly noisy
+    at dataset load -- together they bury the progress bar. A dependency sets the
+    root logger to INFO at import; a named logger's own level takes precedence, so
+    this silences the per-request chatter without touching our logs. Errors still
+    surface at WARNING+."""
+    import logging
+
+    for name in ("httpx", "httpcore", "huggingface_hub"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def load_strict_runtime_config(
     *,
     harbor_config_path: Path,
@@ -197,15 +210,43 @@ async def _resolve_task_dirs(*, trial_harbor_config, task_names):
     )
 
 
-async def _build_trial_runner(
+async def _run_trial_with_env(
+    *,
+    env,
+    task_id,
+    run_id,
+    harness_config,
+    api_key,
+    task_timeout_sec,
+    verify_timeout_sec,
+    slot_release,
+):
+    """Drive one prepared env through `executor.run_trial` with this task's panel
+    wall budget -- the call shared by every backend's trial_runner."""
+    from src.experiment.executor import run_trial
+
+    return await run_trial(
+        task_id=task_id,
+        run_id=run_id,
+        llm=_make_llm_for_config(
+            config=harness_config.llm_provider_config, api_key=api_key
+        ),
+        env=env,
+        max_steps=harness_config.max_steps,
+        max_output_retries=harness_config.max_output_retries,
+        task_timeout_sec=task_timeout_sec,
+        env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
+        verify_timeout_sec=verify_timeout_sec,
+        slot_release=slot_release,
+    )
+
+
+async def _build_harbor_trial_runner(
     *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
 ):
-    """Resolve the selected tasks' directories once, then return the `run_tasks`
-    trial_runner -- the seam the orchestrator schedules. It builds each trial's
-    Harbor (handed the run-scoped heavy gate) + llm and calls `executor.run_trial`
-    with that task's panel wall budget."""
+    """Terminal Bench backend: resolve each selected task's directory once, then
+    build a per-trial `Harbor` handed the run-scoped heavy gate."""
     from src.env.harbor import Harbor
-    from src.experiment.executor import run_trial
 
     trial_harbor_config = harbor_config.model_copy(
         update={
@@ -225,22 +266,72 @@ async def _build_trial_runner(
             task_dir=task_dirs[task_id],
             exec_semaphore=heavy_action_semaphore,
         )
-        return await run_trial(
+        return await _run_trial_with_env(
+            env=env,
             task_id=task_id,
             run_id=run_id,
-            llm=_make_llm_for_config(
-                config=harness_config.llm_provider_config, api_key=api_key
-            ),
-            env=env,
-            max_steps=harness_config.max_steps,
-            max_output_retries=harness_config.max_output_retries,
+            harness_config=harness_config,
+            api_key=api_key,
             task_timeout_sec=task_timeout_sec[task_id],
-            env_setup_timeout_sec=harness_config.env_setup_timeout_sec,
             verify_timeout_sec=verify_timeout_sec[task_id],
             slot_release=slot_release,
         )
 
     return trial_runner
+
+
+async def _build_swe_trial_runner(
+    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
+):
+    """SWE-bench-Verified backend: resolve each instance id to a dataset row once,
+    then build a per-trial `SweEnv` (offline container, handed the run-scoped
+    heavy gate). Artifacts mirror Harbor's tasks/<task_id>/<run_id> layout."""
+    from src.env.swe import SweEnv, load_rows
+
+    rows = load_rows(list(task_ids))
+    tasks_root = harbor_config.experiments_dir / experiment_id / "tasks"
+    task_timeout_sec = _panel_seconds_by_task(harness_config, "task_timeout_sec")
+    verify_timeout_sec = _panel_seconds_by_task(harness_config, "verify_timeout_sec")
+
+    async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
+        env = SweEnv(
+            row=rows[task_id],
+            artifacts_dir=str(tasks_root / task_id / run_id),
+            heavy_semaphore=heavy_action_semaphore,
+        )
+        return await _run_trial_with_env(
+            env=env,
+            task_id=task_id,
+            run_id=run_id,
+            harness_config=harness_config,
+            api_key=api_key,
+            task_timeout_sec=task_timeout_sec[task_id],
+            verify_timeout_sec=verify_timeout_sec[task_id],
+            slot_release=slot_release,
+        )
+
+    return trial_runner
+
+
+async def _build_trial_runner(
+    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
+):
+    """Return the `run_tasks` trial_runner for the configured env backend -- the
+    seam the orchestrator schedules. Each builder resolves its task source once
+    and returns a `(task_id, run_id, heavy_action_semaphore, slot_release)`
+    closure that builds the per-trial env + llm and calls `executor.run_trial`."""
+    builder = (
+        _build_swe_trial_runner
+        if harness_config.env_backend == "swe"
+        else _build_harbor_trial_runner
+    )
+    return await builder(
+        harness_config=harness_config,
+        harbor_config=harbor_config,
+        api_key=api_key,
+        task_ids=task_ids,
+        experiment_id=experiment_id,
+    )
 
 
 # --- uv run exp live progress bar -------------------------------------------
@@ -429,6 +520,7 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
     from src.repo import get_head_commit, require_clean_worktree
 
+    _quiet_http_request_logs()
     args = _parse_exp_args(argv)
     harbor_config, harness_config, api_key = load_runtime_config(
         experiments_dir=args.experiments_dir
@@ -474,6 +566,35 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _install_runner_teardown_signal_handler() -> None:
+    """On SIGINT (Ctrl-C) / SIGTERM, reap the in-flight ``uv run exp`` subtree
+    before exiting. The active child is blocked deep inside ``run_streamed``'s
+    select loop with no handle reachable from here, so we reap via the module-level
+    registry instead. CRITICAL: a second Ctrl-C during cleanup would otherwise raise
+    ``KeyboardInterrupt`` straight through and abort the reap, leaving ``exp``
+    orphaned -- so we mask SIGINT (``SIG_IGN``) for the duration of cleanup."""
+    import signal
+
+    from src.supervisor.subproc import terminate_live_children
+
+    def handler(signum, _frame):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        name = signal.Signals(signum).name
+        print(
+            f"\n{name} received -- shutting down runner, please wait, "
+            "do NOT press Ctrl-C again.",
+            file=sys.stderr,
+            flush=True,
+        )
+        terminate_live_children()
+        print("Runner shutdown complete.", file=sys.stderr, flush=True)
+        raise SystemExit(130)
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 def main_auto() -> int:
     import contextlib
     import sys
@@ -486,6 +607,7 @@ def main_auto() -> int:
     from src.supervisor.agent_backend import create_backend, supervisor_root_for_repo
     from src.supervisor.loop import LoopContext, run_auto
 
+    _quiet_http_request_logs()
     agent_type = "codex"
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg in ("--agent", "-a") and i < len(sys.argv) - 1:
@@ -516,6 +638,7 @@ def main_auto() -> int:
         backend=create_backend(agent_type),
         program_md_path=repo_root / "program.md",
     )
+    _install_runner_teardown_signal_handler()
     try:
         halt = run_auto(ctx)
     except ChatGptCodexCredentialsExpiredError as exc:

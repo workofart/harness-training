@@ -39,12 +39,13 @@ from src.supervisor.policy import (
 # --- builders ---------------------------------------------------------------
 
 
-def _trial(run_id: str, *, solved: bool) -> TrialResult:
+def _trial(run_id: str, *, solved: bool, reward: float | None = None) -> TrialResult:
     return TrialResult(
         run_id=run_id,
         solved=solved,
         failure_mode="solved" if solved else "verified_rejected",
         verifier_passed=solved,
+        reward=reward,
     )
 
 
@@ -59,6 +60,12 @@ def _task(*solveds: bool, budget: int | None = None) -> TaskResult:
         expected_trial_count=budget if budget is not None else len(trials),
         trials=trials,
     )
+
+
+def _graded_task(*rewards: float) -> TaskResult:
+    # A task whose trials carry partial-credit reward; solved iff reward == 1.0.
+    trials = [_trial(f"r{i}", solved=r == 1.0, reward=r) for i, r in enumerate(rewards)]
+    return TaskResult(expected_trial_count=len(trials), trials=trials)
 
 
 def _exp(
@@ -453,6 +460,35 @@ def test_gate_promotion_keeps_a_pure_frontier_panel() -> None:
     )
     assert decision.kind == "keep"
     assert "improved" in decision.reason
+
+
+def test_gate_promotion_keeps_a_partial_credit_gain_the_binary_gate_missed() -> None:
+    # The cutover's whole point: a candidate that lifts graded reward WITHOUT
+    # crossing the solve threshold (no extra majority-solves) now promotes. The
+    # retired binary CMH saw 0 extra solves -> 0 stratified delta -> never
+    # significant. Every task moves +0.2 reward, none flips solved -> a unanimous
+    # positive per-task delta (p_value 0.0).
+    tasks = [f"t{i}" for i in range(6)]
+    baseline = _exp(tasks={t: _graded_task(0.6, 0.6) for t in tasks})
+    candidate = _exp(tasks={t: _graded_task(0.8, 0.8) for t in tasks})
+    decision = gate(candidate, baseline, task_ids=frozenset(tasks), purpose="promotion")
+    assert decision.kind == "keep"
+    assert "graded reward improved" in decision.reason
+    # Not a single task is majority-solved in either arm -- pure partial credit
+    # the binary gate is structurally blind to.
+    assert all(v.candidate_solved == 0 for v in decision.verdicts.values())
+    assert all(v.baseline_solved == 0 for v in decision.verdicts.values())
+
+
+def test_gate_promotion_discards_a_partial_credit_regression() -> None:
+    # The mirror: every task LOSES reward (still no solve change) -> negative mean
+    # delta -> discard on direction, before any significance test.
+    tasks = [f"t{i}" for i in range(6)]
+    baseline = _exp(tasks={t: _graded_task(0.8, 0.8) for t in tasks})
+    candidate = _exp(tasks={t: _graded_task(0.6, 0.6) for t in tasks})
+    decision = gate(candidate, baseline, task_ids=frozenset(tasks), purpose="promotion")
+    assert decision.kind == "discard"
+    assert "did not improve" in decision.reason
 
 
 # --- gate: regression-veto (can only block) ---------------------------------

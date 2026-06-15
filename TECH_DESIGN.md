@@ -29,7 +29,7 @@ Layer 4  experiment/   (one run = tasks → RAW ExperimentResult)
 Layer 3  harness/      (THE SURFACE UNDER TEST — candidate edits here)
    core   agent loop, 8-action vocab, tool specs, prompts
         │ uses ▼
-Layer 2  env/  (HarnessEnv impl: harbor, docker)     llm/  (BaseLlm impl: base, openrouter, codex)
+Layer 2  env/  (HarnessEnv impls: swe, harbor; docker utilities)     llm/  (BaseLlm impl: base, openrouter, codex)
         │ uses ▼
 Layer 1  foundation
    contracts (RawState, HarnessEnv, EnvExecWorkload, TaskMetrics, FailureMode,
@@ -47,7 +47,7 @@ The harness is an LLM shell agent. `core.py` owns the agent policy loop: build p
 
 The model-facing action vocabulary is eight typed dataclasses: `list_dir`, `find_files`, `search_text`, `read_file`, `write_file`, `edit_file`, `run`, `verify`. `ACTION_CLASSES` is the source of truth — each class declares its model-facing description, and `build_tool_specs()` derives required/optional keys and JSON scalar types from dataclass fields/type hints.
 
-`core.py` chooses each action's workload (`light` for file/list/search; `run` light or heavy by timeout; `verify` is a bare `await env.verify()`); the **enforcer** (the heavy-action semaphore) lives in `env/harbor`. The **verify-timeout ceiling lives in the executor**, which injects a ceiling-enforcing `HarnessEnv` wrapper into the loop, keeping grading infra off the candidate-editable surface.
+`core.py` chooses each action's workload (`light` for file/list/search; `run` light or heavy by timeout; `verify` is a bare `await env.verify()`); each environment implementation enforces the run-scoped heavy-action semaphore for reset/run/verify. The **verify-timeout ceiling lives in the executor**, which injects a ceiling-enforcing `HarnessEnv` wrapper into the loop, keeping grading infra off the candidate-editable surface.
 
 This is the only file the outer agent may edit, plus its test (`tests/harness/test_core.py`).
 
@@ -195,11 +195,12 @@ The supervisor never auto-recovers, resumes, or re-runs *broken* work. A run tha
 
 ## Configuration
 
-`uv run exp` and `uv run auto` load [config/harbor_config.toml](./config/harbor_config.toml) and [config/harness_config.json](./config/harness_config.json), load OpenRouter credentials when configured, and require a clean worktree unless `EXP_ALLOW_DIRTY_WORKTREE=1`.
+`uv run exp` and `uv run auto` load [config/harness_config.json](./config/harness_config.json) as the sole harness runtime config. They also load [config/harbor_config.toml](./config/harbor_config.toml) for shared artifact-root settings and Harbor-specific settings. OpenRouter credentials are loaded only when configured, and `uv run exp` requires a clean worktree unless `EXP_ALLOW_DIRTY_WORKTREE=1`.
 
 `HarnessConfig` (`src/config.py`) is strict `schema_version: 3`. Key fields:
 
 - `train`: the promotion panel — what `auto` trains and gates on. `test` (optional): the held-out regression-veto panel.
+- `env_backend`: the environment implementation. `"swe"` means `task_names` are SWE-bench Verified `instance_id`s from the Hugging Face `test` split; `"harbor"` means Terminal-Bench task IDs resolved through Harbor and local `task_overrides/`.
 - `max_steps`, `task_trials`: per-trial action budget and independent trials per task.
 - `max_trial_concurrency`, `max_heavy_action_concurrency`: live trial bound and reset/run/verify bound.
 - `env_setup_timeout_sec`, `max_output_retries`: reset/bootstrap timeout and invalid-output repair budget.
@@ -219,15 +220,28 @@ Supported harness providers (`src/llm/`):
 
 Per-step flow: task instructions + trajectory + current observation are replayed into model-facing messages; request/response metadata and model-emitted tool calls / reasoning are persisted under trial artifacts via `trace.py`.
 
-## Terminal Bench environment
+## Environments
 
-Only Terminal-Bench is implemented today; `HarnessEnv` (`contracts.py`) abstracts the environment so more can be added. `src/env/harbor.py` implements it:
+`HarnessEnv` (`contracts.py`) is the common contract. `env_backend` in `HarnessConfig` selects the implementation at the CLI layer; the harness loop and executor see only the interface.
+
+### SWE-bench Verified
+
+`src/env/swe.py` implements SWE-bench Verified:
+
+- `task_names` are `instance_id`s from `princeton-nlp/SWE-bench_Verified`, `split="test"`; the Hugging Face dataset is the source of truth
+- each trial runs the SWE instance image offline (`--network none`) at `base_commit`
+- `verify()` injects and runs the hidden test patch once, then grades with SWE-bench's log parser into solved/reward
+- the run-scoped heavy-action semaphore bounds reset/run/verify just like Harbor
+
+### Harbor / Terminal-Bench
+
+`src/env/harbor.py` implements Terminal-Bench tasks through Harbor:
 
 - resolves tasks (checking `task_overrides/<task_id>/` before the Harbor registry), starts Harbor-backed Docker task environments
 - executes `run` actions via `HarnessEnv.exec` and the authoritative verifier via `verify`, returning stdout/stderr/return-code observations
 - holds the heavy-action semaphore (light actions bypass) and writes per-trial artifacts under the configured experiments dir
 
-`src/env/docker.py` and the bootstrap preamble (apt/pypi proxy wiring, `no_proxy` sanitize, apt-shim restore) support it; the verifier context/image cache is anchored under `experiments_dir`. Harbor stays trace-free — the verify-ceiling and telemetry live in the executor.
+`src/env/docker.py` holds shared Docker CLI/retry/resource helpers. Harbor-specific bootstrap preamble logic (apt/pypi proxy wiring, `no_proxy` sanitize, apt-shim restore) stays in Harbor; verifier context/image cache is anchored under `experiments_dir`. Env adapters stay trace-free — the verify-ceiling and telemetry live in the executor.
 
 ## Artifact layout
 
@@ -279,7 +293,7 @@ Supervisor-level (working dirs only — control state is derived, not persisted 
 - `src/trace.py`: trace writer and stable artifact filenames
 - `src/repo.py`, `src/retry.py`, `src/serialization.py`: git wrapper, retry policy, (de)serialization helpers
 - `src/harness/core.py`: **the harness policy/action loop — the only file the outer agent may modify (plus its unit test)**
-- `src/env/harbor.py`, `src/env/docker.py`: Harbor/Docker task environment + heavy-action gating
+- `src/env/swe.py`, `src/env/harbor.py`, `src/env/docker.py`: SWE/Harbor task environments + shared Docker helpers
 - `src/llm/openrouter.py`, `src/llm/codex.py`, `src/llm/base.py`: provider adapters + interface
 - `src/experiment/orchestrator.py`: many-trial concurrency, scheduling, aggregation → raw `ExperimentResult`
 - `src/experiment/executor.py`: one trial (`run_trial`) — env lifecycle, timeouts, verify-ceiling, classification

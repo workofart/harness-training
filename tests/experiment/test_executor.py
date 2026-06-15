@@ -91,6 +91,45 @@ def test_verify_ceiling_propagates_inner_verifier_timeout() -> None:
     assert recorder.metrics.rule_fires == {}  # the ceiling did not fire
 
 
+def test_verify_ceiling_propagates_external_cancellation() -> None:
+    # An EXTERNAL cancel -- the orchestrator cancelling an in-flight sibling after
+    # an early majority decision (orchestrator opt #6), or shutdown -- must
+    # propagate promptly, NOT be absorbed like the agent task-timeout. Absorbing
+    # it holds the grader (and its container) alive until the verify ceiling (900s
+    # in prod), defeating early-stop on a result that gets discarded anyway. With
+    # no task deadline bound, every cancel is external.
+    grade_cancelled: list[bool] = []
+    started = asyncio.Event()
+
+    class _BlockingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            started.set()
+            try:
+                await asyncio.Event().wait()  # blocks until cancelled
+            except asyncio.CancelledError:
+                grade_cancelled.append(True)
+                raise
+            return self._verify_state
+
+    inner = _BlockingVerifyEnv()
+    recorder = Recorder.create()
+    # High ceiling: only correct cancel-propagation (not the ceiling) ends this.
+    wrapped = _VerifyCeilingEnv(inner, recorder, timeout_sec=30.0)
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(wrapped.verify())
+        await started.wait()  # the grade is in flight
+        task.cancel()  # external cancel (early-stop / shutdown)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert inner.verify_calls == 1
+    assert grade_cancelled == [True]  # the in-flight grade was abandoned
+    assert recorder.metrics.rule_fires.get("verify_timeout") is None  # ceiling unused
+
+
 # --- terminal classification ------------------------------------------------
 
 
@@ -107,9 +146,26 @@ def test_run_trial_solved_happy_path(tmp_path: Path) -> None:
     assert result.solved is True
     assert result.failure_mode == "solved"
     assert result.verifier_passed is True
+    assert result.reward == 1.0
     assert result.error is None
     assert result.metrics_path is not None and Path(result.metrics_path).exists()
     assert env.closed and llm.closed
+
+
+def test_run_trial_threads_graded_reward(tmp_path: Path) -> None:
+    # A partial verify (graded reward 0.6, verdict failed) must record the dense
+    # reward on the TrialResult while `solved` stays bound to the binary verdict.
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _StubEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=False, reward=0.6),
+    )
+
+    result = _run_one(llm=llm, env=env)
+
+    assert result.reward == 0.6
+    assert result.solved is False
+    assert result.failure_mode == "verified_rejected"
 
 
 def test_run_trial_classifies_verified_rejected(tmp_path: Path) -> None:
@@ -220,6 +276,140 @@ def test_agent_timeout_is_hit_timeout(tmp_path: Path) -> None:
     assert result.failure_mode == "hit_timeout"
     assert result.error is None
     assert result.solved is False
+
+
+def test_agent_work_timeout_is_hit_timeout(tmp_path: Path) -> None:
+    # A non-verify WORK step (here an `exec`/run) that outruns the task deadline
+    # with NO verify in flight is still hard-cut to `hit_timeout`. The task
+    # timeout bounds the agent's work; only the terminal verify is exempt.
+    class _HangingExecEnv(_StubEnv):
+        async def exec(self, **kwargs):
+            await asyncio.sleep(30)  # the work step never returns in time
+            return await super().exec(**kwargs)
+
+    llm = _StubLlm([_completion(_tool_call("run", command="loop"))])
+    env = _HangingExecEnv(trial_dir=str(tmp_path / "trial"))
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05)
+
+    assert result.failure_mode == "hit_timeout"
+    assert result.error is None
+    assert result.solved is False
+
+
+def test_late_verify_runs_to_completion_not_hit_timeout(tmp_path: Path) -> None:
+    # Bug repro: the agent calls verify with little task budget left. The verify
+    # duration (0.3s) exceeds the remaining task budget (~0.05s) but is well
+    # under the verify ceiling (5s). The terminal verify must run to completion
+    # and yield a REAL verdict -- it is bounded by `verify_timeout_sec` ALONE,
+    # not by however much `task_timeout_sec` remains. On the buggy code the outer
+    # task timeout cancels the grade mid-flight -> `hit_timeout`/`passed=None`.
+    class _SlowVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(0.3)  # outlasts the task deadline, under ceiling
+            return self._verify_state
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _SlowVerifyEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=True, reward=1.0),
+    )
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05, verify_timeout_sec=5.0)
+
+    assert env.verify_calls == 1
+    assert result.failure_mode == "solved"
+    assert result.solved is True
+    assert result.verifier_passed is True
+    assert result.error is None
+
+
+def test_late_verify_rejected_runs_to_completion(tmp_path: Path) -> None:
+    # Same late-verify scoping, but the verifier returns a non-passing verdict:
+    # the trial must classify `verified_rejected` (a real, scorable verdict),
+    # NOT `hit_timeout`.
+    class _SlowVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(0.3)
+            return self._verify_state
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _SlowVerifyEnv(
+        trial_dir=str(tmp_path / "trial"),
+        verify_state=RawState(passed=False, reward=0.0),
+    )
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05, verify_timeout_sec=5.0)
+
+    assert result.failure_mode == "verified_rejected"
+    assert result.solved is False
+    assert result.verifier_passed is False
+    assert result.error is None
+
+
+def test_verify_ceiling_still_caps_a_late_hung_grader(tmp_path: Path) -> None:
+    # The verify exemption is bounded by `verify_timeout_sec` alone: a grader
+    # that hangs past its ceiling is still cut to a terminal non-passing verdict
+    # with a `verify_timeout` fire, even when the task deadline already passed.
+    class _HangingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            await asyncio.sleep(30)
+            return RawState(passed=True, reward=1.0)
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _HangingVerifyEnv(trial_dir=str(tmp_path / "trial"))
+
+    result = _run_one(llm=llm, env=env, task_timeout_sec=0.05, verify_timeout_sec=0.1)
+
+    assert result.failure_mode == "verified_rejected"
+    assert result.solved is False and result.verifier_passed is False
+    assert result.error is None
+    metrics = json.loads(Path(result.metrics_path).read_text())
+    assert metrics["rule_fires"].get("verify_timeout") == 1
+
+
+def test_external_cancel_during_verify_tears_down_promptly(tmp_path: Path) -> None:
+    # End-to-end: the orchestrator cancels an in-flight sibling (early-stop /
+    # shutdown) while its terminal verify is running, with the task deadline NOT
+    # yet reached. The cancel must propagate out of run_trial (so the slot frees
+    # and the env tears down now), NOT be absorbed until the verify ceiling. This
+    # exercises the deadline binding: only a cancel from the bound task deadline
+    # is shielded; an external one propagates.
+    started = asyncio.Event()
+
+    class _BlockingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            started.set()
+            await asyncio.Event().wait()  # blocks until cancelled
+            return self._verify_state
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _BlockingVerifyEnv(trial_dir=str(tmp_path / "trial"))
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(
+            run_trial(
+                task_id="task-a",
+                run_id="r1",
+                llm=llm,
+                env=env,
+                max_steps=5,
+                task_timeout_sec=30.0,  # high: the deadline does NOT fire here
+                verify_timeout_sec=30.0,
+            )
+        )
+        await started.wait()  # the grade is in flight
+        task.cancel()  # external cancel, not the task deadline
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert env.verify_calls == 1
+    assert env.closed is True  # teardown ran despite the abandoned grade
 
 
 # --- budget stamping (PR1: time_remaining_sec) -------------------------------

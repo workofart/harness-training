@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import shutil
 import tomllib
@@ -37,6 +38,9 @@ from src.env.docker import (
     _MAX_VERIFIER_ENV_SESSION_ID_LEN,
     _compact_verifier_task_session_prefix,
     _safe_verifier_session_text,
+    cpu_resource_env as _cpu_resource_env,
+    strip_ipv6_no_proxy as _strip_ipv6_no_proxy,
+    NO_PROXY_ENV_KEYS as _NO_PROXY_ENV_KEYS,
 )
 from src.contracts import EnvExecWorkload, RawState
 
@@ -114,60 +118,24 @@ def _is_command_timeout(exc: Exception) -> bool:
     return isinstance(exc, RuntimeError) and "timed out" in str(exc).lower()
 
 
-# High trial concurrency exposes host CPU contention from libraries/build tools
-# that fan out inside each container. Cap those defaults at the Harbor boundary
-# from the declared task CPU budget so agent and verifier exec share one policy.
-_CPU_THREAD_ENV_KEYS = (
-    "OPENBLAS_NUM_THREADS",
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "BLIS_NUM_THREADS",
-    "RAYON_NUM_THREADS",
-    "CARGO_BUILD_JOBS",
-    "GOMAXPROCS",
-    "CMAKE_BUILD_PARALLEL_LEVEL",
-)
+def _graded_reward_from_ctrf(ctrf_path: Path) -> float | None:
+    """Fraction of verifier tests passed, read from the pytest CTRF report.
 
-
-def _cpu_resource_env(cpus: int | None) -> dict[str, str]:
-    if cpus is None:
-        return {"TOKENIZERS_PARALLELISM": "false"}
-    cap = str(cpus)
-    return {
-        **{key: cap for key in _CPU_THREAD_ENV_KEYS},
-        "MAKEFLAGS": f"-j{cap}",
-        "TOKENIZERS_PARALLELISM": "false",
-    }
-
-
-# OrbStack -- and some other Docker setups -- inject a `no_proxy`/`NO_PROXY` into
-# every container listing OrbStack's internal IPv6 ULA range (e.g. `::1` and
-# `fd07:...::/64`). httpx cannot parse a bare IPv6 entry in no_proxy: it splits
-# each entry on ':' to peel off a port, then reads the address bytes as the port
-# and raises `httpx.InvalidURL: Invalid port: '...'` at Client construction. Any
-# task that builds an httpx client then crashes before its first request -- most
-# commonly huggingface_hub v1.x (pulled in by `datasets`), so every HF download
-# dies and silently falls back to the offline cache, surfacing as a misleading
-# "cache not found". The injection is intentional and OrbStack rewrites
-# ~/.docker/config.json on every engine restart, so a host-side edit does not
-# stick; stripping the IPv6 entries from no_proxy in each exec's env instead is
-# restart-proof and a no-op on hosts that inject no IPv6.
-#   httpx fix (open):     https://github.com/encode/httpx/pull/3741
-#                         (encode/httpx Issues are disabled; the PR closes the
-#                          original report #3221)
-#   same bug in requests: https://github.com/psf/requests/issues/6313
-#   OrbStack injection:   https://github.com/orbstack/orbstack/issues/2449
-_NO_PROXY_ENV_KEYS = ("no_proxy", "NO_PROXY")
-
-
-def _strip_ipv6_no_proxy(value: str) -> str:
-    # A no_proxy entry is a hostname, domain suffix, IPv4 address, IPv4 CIDR, or
-    # host:port -- none carry more than one ':'. An entry with two or more colons
-    # is therefore an IPv6 address or CIDR, which is exactly what trips httpx.
-    # Drop those and keep everything else in its original order.
-    return ",".join(token for token in value.split(",") if token.count(":") < 2)
+    TB verifiers run pytest with `--ctrf <path>` and then collapse the result to
+    a binary 1/0 in `reward.txt`; the per-test counts survive in `ctrf.json`.
+    Returns the pass fraction in [0, 1], or None when the report is absent,
+    unparseable, or records no tests (the caller falls back to the binary
+    reward). This is a denser reward only -- it never affects `passed`/`solved`.
+    """
+    try:
+        data = json.loads(ctrf_path.read_text())
+    except (OSError, ValueError):
+        return None
+    summary = (data.get("results") or data or {}).get("summary") or {}
+    total = summary.get("tests")
+    if not total:
+        return None
+    return summary.get("passed", 0) / total
 
 
 def _directory_content_hash(directory: Path) -> str:
@@ -950,12 +918,20 @@ class Harbor:
                 verifier_result = await verifier_session.verify()
             rewards = verifier_result.rewards
             raw_reward = 0.0 if rewards is None else rewards.get("reward", 0.0)
-            reward = 0.0 if raw_reward is None else float(raw_reward)
+            binary_reward = 0.0 if raw_reward is None else float(raw_reward)
+            # `passed` (-> solved -> the promotion gate) stays bound to the
+            # authoritative binary reward.txt. The graded reward recovers the
+            # per-test pass fraction the binary value discards (denser signal
+            # for a graded statistic); it falls back to the binary value when no
+            # CTRF report is present.
+            graded = _graded_reward_from_ctrf(
+                self.session.trial_paths.verifier_dir / "ctrf.json"
+            )
             stdout_path = self.session.trial_paths.test_stdout_path
             stderr_path = self.session.trial_paths.test_stderr_path
             return RawState(
-                reward=reward,
-                passed=reward > 0.0,
+                reward=binary_reward if graded is None else graded,
+                passed=binary_reward > 0.0,
                 stdout=stdout_path.read_text() if stdout_path.exists() else None,
                 stderr=stderr_path.read_text() if stderr_path.exists() else None,
             )

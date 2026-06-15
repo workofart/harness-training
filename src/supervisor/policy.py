@@ -2,7 +2,7 @@
 
 Every pure function and data type the supervisor needs, with zero I/O: the
 ``decide(world) -> Command`` transition, the promotion/veto ``gate`` and its
-statistics (per-task Fisher exact diagnostics + the stratified CMH promotion
+statistics (per-task Fisher exact diagnostics + the graded-reward promotion
 test), ``combine``, the per-task trial ``budget_from_baseline``, the
 ``validate_candidate`` diff check, and the agent's view constants
 (``VISIBLE_PATHS``/``EDITABLE_PATHS``). ``loop.py`` does the reading (builds
@@ -28,7 +28,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from src.contracts import is_majority_solved
-from src.experiment.record import ExperimentResult
+from src.experiment.record import ExperimentResult, TrialResult
 
 # ----------------------------------------------------------------------------
 # Gate statistics (moved here from metrics.py; §9).
@@ -39,15 +39,6 @@ from src.experiment.record import ExperimentResult
 # uses the aggregate alpha below. The strict 0.05 bar relies on Fisher exact
 # being strongly conservative at small per-task trial counts (n~3-5).
 PER_TASK_VERDICT_P_VALUE_ALPHA = 0.05
-
-# One-sided alpha for the promotion test: a Cochran-Mantel-Haenszel test over
-# pooled per-trial solves, stratified by task. Permissive on purpose --
-# identical-code panel noise is ~+-1.8 majority-solved tasks while a real
-# single-mechanism effect is ~+1 task, so a strict aggregate bar is unpassable
-# by any real candidate. The direction requirement plus the CMH's conservatism
-# at these trial counts keep the measured null false-keep at ~0.03 (see
-# tests/supervisor/test_gate_acceptance.py).
-PROMOTION_P_VALUE_ALPHA = 0.10
 
 Purpose = Literal["promotion", "regression_veto"]
 VerdictKind = Literal["improvement", "regression", "unchanged", "uncompared"]
@@ -117,9 +108,10 @@ Stratum = tuple[int, int, int, int]
 class StratifiedSolveTest:
     """One-sided Cochran-Mantel-Haenszel test that the candidate's per-trial
     solve odds exceed the baseline's, stratified by task. Built from the
-    per-task strata in one pass by ``from_strata``; the promotion branch of
-    ``_panel_decision`` reads ``delta`` (direction), ``p_value``
-    (significance), and ``counts`` (the reason-string evidence).
+    per-task strata in one pass by ``from_strata``. Retained as the binary
+    comparison baseline the graded promotion decider is measured against
+    (tests/supervisor/test_graded_gate.py): ``delta`` is the direction,
+    ``p_value`` the significance, ``counts`` the reason-string evidence.
 
     Pure-Python normal approximation (no continuity correction), golden-tested
     against statsmodels/scipy offline. ``delta`` is the CMH numerator -- the
@@ -178,6 +170,86 @@ class StratifiedSolveTest:
             f"pooled {self.candidate_solved}/{self.candidate_total} vs "
             f"{self.baseline_solved}/{self.baseline_total} trial solves"
         )
+
+
+# ----------------------------------------------------------------------------
+# The graded promotion statistic (continuous reward; Phase 1 step 2).
+# ----------------------------------------------------------------------------
+
+# One-sided alpha for the graded promotion test -- the live promotion bar since
+# the cutover from the binary CMH. Set to 0.08, below the nominal 0.10: the
+# one-sample test runs slightly hot because a few thin tasks carry near-constant
+# reward whose ~zero deltas shrink the variance estimate. A resampling sim over
+# the real char reward distributions realizes ~0.12 false-keep at 0.10 vs ~0.09
+# at 0.08 with negligible power loss; calibration is pinned by the synthetic
+# population (tests/supervisor/test_graded_gate.py) and the real baseline panel
+# (tests/supervisor/test_gate_acceptance.py).
+GRADED_PROMOTION_P_VALUE_ALPHA = 0.08
+
+
+def _trial_graded_reward(trial: TrialResult) -> float:
+    """The per-trial graded reward the promotion test scores: the fraction of
+    verifier tests passed (``TrialResult.reward``, recovered from the CTRF
+    report), or the binary solve when no graded reward was recorded -- old
+    records (pre-graded-reward) and trials whose verifier wrote no CTRF both fall
+    back to 1.0/0.0, so the graded test degrades gracefully to the binary signal
+    on any task that carries no partial-credit granularity."""
+    if trial.reward is not None:
+        return trial.reward
+    return 1.0 if trial.solved else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class GradedRewardTest:
+    """One-sided test that the candidate's mean graded reward exceeds the
+    baseline's, with the **task as the unit of replication**: per task, the
+    candidate's mean per-trial reward minus the baseline's; the panel statistic
+    is a one-sample test over those per-task deltas.
+
+    Why task-as-unit (a cluster-robust delta) rather than the per-trial
+    stratification the binary CMH uses: graded reward has a few trials per task
+    (n~3-5) and many tasks are near-deterministic (within-arm sample variance
+    ~0), so an analytic per-stratum variance collapses and false-keeps panel
+    noise (measured: it spuriously kept a real historical discard). Using the
+    spread of per-task deltas as the variance is robust -- each delta already
+    carries its own within-task trial noise -- and stays deterministic +
+    closed-form like ``StratifiedSolveTest`` (no RNG in the decision path).
+
+    ``mean_delta`` is the average per-task reward gain (direction: promote iff
+    > 0). ``p_value`` is one-sided ``1 - Phi(mean_delta / (sd / sqrt(k)))``, a
+    large-K normal approximation (train panels are ~30-60 tasks). Fewer than two
+    comparable tasks carry no spread estimate -> p_value 1.0 (no promotion);
+    a degenerate all-identical-delta panel is unanimous -> p_value 0.0 iff the
+    shared delta is positive. Golden-validated against history + the resampling
+    simulation (tests/supervisor/test_graded_gate.py).
+    """
+
+    mean_delta: float
+    p_value: float
+    task_count: int
+
+    @classmethod
+    def from_task_deltas(cls, deltas: Iterable[float]) -> GradedRewardTest:
+        d = list(deltas)
+        k = len(d)
+        if k == 0:
+            return cls(0.0, 1.0, 0)
+        mean_delta = math.fsum(d) / k
+        if k < 2:
+            # A single comparable task gives no spread -> no significance claim.
+            return cls(mean_delta, 1.0, k)
+        variance = math.fsum((x - mean_delta) ** 2 for x in d) / (k - 1)
+        if variance == 0.0:
+            # Every task moved by the same amount: unanimous direction.
+            p_value = 0.0 if mean_delta > 0.0 else 1.0
+        else:
+            z = mean_delta / math.sqrt(variance / k)
+            p_value = 0.5 * math.erfc(z / math.sqrt(2.0))
+        return cls(mean_delta, p_value, k)
+
+    @property
+    def counts(self) -> str:
+        return f"mean per-task reward delta {self.mean_delta:+.3f} over {self.task_count} tasks"
 
 
 class BaselineComparison(BaseModel):
@@ -374,6 +446,36 @@ def _floor_regression_when_candidate_solves(
     return verdict
 
 
+def _graded_task_deltas(
+    *,
+    candidate: ExperimentResult,
+    baseline: ExperimentResult,
+    task_ids: frozenset[str],
+) -> list[float]:
+    """Per-task graded-reward deltas for ``GradedRewardTest``: for every task the
+    frozen baseline and the candidate both ran (the same both-arms strata the
+    binary CMH uses), the candidate's mean per-trial reward minus the baseline's.
+    Scored over valid trials only (crash trials excluded, matching the binary
+    gate). A task missing either arm carries no comparison and drops out."""
+    deltas: list[float] = []
+    for task_id in sorted(task_ids):
+        candidate_task = candidate.tasks.get(task_id)
+        baseline_task = baseline.tasks.get(task_id)
+        if candidate_task is None or baseline_task is None:
+            continue
+        candidate_rewards = [
+            _trial_graded_reward(t) for t in candidate_task.valid_trials
+        ]
+        baseline_rewards = [_trial_graded_reward(t) for t in baseline_task.valid_trials]
+        if not candidate_rewards or not baseline_rewards:
+            continue
+        deltas.append(
+            math.fsum(candidate_rewards) / len(candidate_rewards)
+            - math.fsum(baseline_rewards) / len(baseline_rewards)
+        )
+    return deltas
+
+
 def _aggregate_counts(
     verdicts: dict[str, BaselineComparison],
 ) -> tuple[int, int, int, int]:
@@ -401,69 +503,57 @@ def _aggregate_counts(
     return candidate_solved, candidate_total, baseline_solved, baseline_total
 
 
-def _panel_decision(
+def _regression_veto(
+    verdicts: dict[str, BaselineComparison],
+) -> tuple[DecisionKind, str]:
+    # Veto can only block, never promote: discard iff the candidate solves
+    # strictly fewer tasks (majority-solved) than the frozen baseline did. Stays
+    # binary on purpose -- "lost a task it should still solve" is a solve fact,
+    # and the graded cutover's scope is the promotion decision, not the veto.
+    candidate_solved, candidate_total, baseline_solved, baseline_total = (
+        _aggregate_counts(verdicts)
+    )
+    counts = (
+        f"{candidate_solved}/{candidate_total} vs {baseline_solved}/{baseline_total}"
+    )
+    if candidate_solved < baseline_solved:
+        return "discard", f"test aggregate regressed: {counts}"
+    return "keep", f"test aggregate did not regress: {counts}"
+
+
+def _graded_promotion(
     *,
     verdicts: dict[str, BaselineComparison],
-    purpose: Purpose,
+    deltas: list[float],
 ) -> tuple[DecisionKind, str]:
-    if purpose == "regression_veto":
-        # Veto can only block, never promote: discard iff the candidate solves
-        # strictly fewer tasks (majority-solved) than the frozen baseline did.
-        candidate_solved, candidate_total, baseline_solved, baseline_total = (
-            _aggregate_counts(verdicts)
-        )
-        counts = (
-            f"{candidate_solved}/{candidate_total} "
-            f"vs {baseline_solved}/{baseline_total}"
-        )
-        if candidate_solved < baseline_solved:
-            return "discard", f"test aggregate regressed: {counts}"
-        return "keep", f"test aggregate did not regress: {counts}"
-
-    # Promotion: pooled per-trial solves, stratified by task. Only tasks with
-    # trials in BOTH arms enter the test -- a no-baseline frontier task has
-    # nothing to stratify against.
-    strata = [
-        (
-            verdict.candidate_solved,
-            verdict.candidate_total,
-            verdict.baseline_solved,
-            verdict.baseline_total,
-        )
-        for verdict in verdicts.values()
-        if verdict.candidate_total > 0 and verdict.baseline_total > 0
-    ]
-    if not strata:
-        # Pure frontier panel (the baseline never ran any of these tasks):
-        # majority-solved counts are the only evidence, as before.
+    # The promotion decision (cut over from the binary CMH): the per-task
+    # graded-reward delta with the task as the unit of replication. It scores
+    # the partial-credit movement the binary gate is blind to (a candidate can
+    # lift reward without crossing the solve threshold) and the per-task spread,
+    # not an analytic per-stratum variance, is what stops a single high-variance
+    # task from carrying the panel -- the failure that false-kept on history.
+    if not deltas:
+        # Pure frontier panel (the baseline ran none of these tasks, so no
+        # both-arms delta exists): majority-solved counts are the only evidence.
         candidate_solved, _, baseline_solved, _ = _aggregate_counts(verdicts)
         counts = f"{candidate_solved} vs {baseline_solved} majority-solved tasks"
         if candidate_solved <= baseline_solved:
             return "discard", f"train aggregate did not improve: {counts}"
         return "keep", f"train aggregate improved: {counts}"
 
-    # Direction must be checked stratified, not on raw pooled rates: the
-    # deterministic-tier single-trial budget weights candidate trials toward
-    # hard tasks, so the raw pooled candidate rate can sit below the baseline's
-    # by composition alone. The CMH numerator conditions on each task's own
-    # margins.
-    test = StratifiedSolveTest.from_strata(strata)
-    if test.delta <= 0:
-        return (
-            "discard",
-            f"train stratified solve delta did not improve: "
-            f"{test.delta:+.2f} ({test.counts})",
-        )
-    if test.p_value > PROMOTION_P_VALUE_ALPHA:
+    test = GradedRewardTest.from_task_deltas(deltas)
+    if test.mean_delta <= 0:
+        return "discard", f"train graded reward did not improve: {test.counts}"
+    if test.p_value > GRADED_PROMOTION_P_VALUE_ALPHA:
         return (
             "discard",
             f"train improvement not significant: {test.counts} "
-            f"(one-sided CMH p={test.p_value:.3g} > {PROMOTION_P_VALUE_ALPHA})",
+            f"(one-sided p={test.p_value:.3g} > {GRADED_PROMOTION_P_VALUE_ALPHA})",
         )
     return (
         "keep",
-        f"train pooled solve rate improved: {test.counts} "
-        f"(one-sided CMH p={test.p_value:.3g} <= {PROMOTION_P_VALUE_ALPHA})",
+        f"train graded reward improved: {test.counts} "
+        f"(one-sided p={test.p_value:.3g} <= {GRADED_PROMOTION_P_VALUE_ALPHA})",
     )
 
 
@@ -476,18 +566,24 @@ def gate(
 ) -> Decision:
     """Judge ``candidate`` against the frozen ``baseline`` over ``task_ids``.
 
-    Promotion is stratified per-trial: the stratified solve delta must be
-    strictly positive and the one-sided CMH test significant at
-    ``PROMOTION_P_VALUE_ALPHA``. Regression-veto can only block (discard iff
-    fewer majority-solved tasks). Per-task verdicts stay diagnostic, carried
-    on the returned ``Decision`` -- the single source of truth for the gate
-    decision and the persisted evidence both.
+    Promotion is the graded reward test (task as the unit of replication): the
+    mean per-task reward delta must be positive and the one-sided test
+    significant at ``GRADED_PROMOTION_P_VALUE_ALPHA``. Regression-veto can only
+    block (discard iff fewer majority-solved tasks). Per-task verdicts stay
+    diagnostic, carried on the returned ``Decision`` -- the single source of
+    truth for the gate decision and the persisted evidence both.
     """
     verdicts = {
         task_id: _task_verdict(candidate=candidate, baseline=baseline, task_id=task_id)
         for task_id in sorted(task_ids)
     }
-    kind, reason = _panel_decision(verdicts=verdicts, purpose=purpose)
+    if purpose == "promotion":
+        deltas = _graded_task_deltas(
+            candidate=candidate, baseline=baseline, task_ids=task_ids
+        )
+        kind, reason = _graded_promotion(verdicts=verdicts, deltas=deltas)
+    else:
+        kind, reason = _regression_veto(verdicts)
     return Decision(kind=kind, reason=reason, verdicts=verdicts)
 
 
