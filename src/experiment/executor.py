@@ -82,6 +82,13 @@ class _VerifyCeilingEnv:
         self._inner = inner
         self._recorder = recorder
         self._timeout_sec = timeout_sec
+        self._task_deadline: asyncio.Timeout | None = None
+
+    def bind_task_deadline(self, deadline: asyncio.Timeout) -> None:
+        self._task_deadline = deadline
+
+    def _cancel_is_task_deadline(self) -> bool:
+        return self._task_deadline is not None and self._task_deadline.expired()
 
     @property
     def trial_dir(self) -> str | None:
@@ -134,6 +141,15 @@ class _VerifyCeilingEnv:
                 await asyncio.shield(graded)
             except asyncio.CancelledError:
                 if graded.cancelled():
+                    raise
+                if not self._cancel_is_task_deadline():
+                    # External cancel (orchestrator early-stop / shutdown), not the
+                    # task deadline: abandon+drain the grade and propagate to tear down.
+                    graded.cancel()
+                    try:
+                        await graded
+                    except asyncio.CancelledError:
+                        pass
                     raise
                 current = asyncio.current_task()
                 if current is not None:
@@ -322,12 +338,16 @@ async def run_trial(
             instruction=reset_state.instruction,
             working_dir=reset_state.working_dir,
         )
+        verify_ceiling_env = _VerifyCeilingEnv(
+            env, recorder, timeout_sec=verify_timeout_sec
+        )
         budget_env = _BudgetStampingEnv(
-            _VerifyCeilingEnv(env, recorder, timeout_sec=verify_timeout_sec),
+            verify_ceiling_env,
             budget_sec=task_timeout_sec,
             clock=clock,
         )
         async with asyncio.timeout(task_timeout_sec) as agent_timeout_ctx:
+            verify_ceiling_env.bind_task_deadline(agent_timeout_ctx)
             # The budget clock anchors here -- reset/bootstrap above never
             # counts -- and the reset state carries the first (full) stamp.
             budget_env.start_clock()

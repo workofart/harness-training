@@ -91,6 +91,45 @@ def test_verify_ceiling_propagates_inner_verifier_timeout() -> None:
     assert recorder.metrics.rule_fires == {}  # the ceiling did not fire
 
 
+def test_verify_ceiling_propagates_external_cancellation() -> None:
+    # An EXTERNAL cancel -- the orchestrator cancelling an in-flight sibling after
+    # an early majority decision (orchestrator opt #6), or shutdown -- must
+    # propagate promptly, NOT be absorbed like the agent task-timeout. Absorbing
+    # it holds the grader (and its container) alive until the verify ceiling (900s
+    # in prod), defeating early-stop on a result that gets discarded anyway. With
+    # no task deadline bound, every cancel is external.
+    grade_cancelled: list[bool] = []
+    started = asyncio.Event()
+
+    class _BlockingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            started.set()
+            try:
+                await asyncio.Event().wait()  # blocks until cancelled
+            except asyncio.CancelledError:
+                grade_cancelled.append(True)
+                raise
+            return self._verify_state
+
+    inner = _BlockingVerifyEnv()
+    recorder = Recorder.create()
+    # High ceiling: only correct cancel-propagation (not the ceiling) ends this.
+    wrapped = _VerifyCeilingEnv(inner, recorder, timeout_sec=30.0)
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(wrapped.verify())
+        await started.wait()  # the grade is in flight
+        task.cancel()  # external cancel (early-stop / shutdown)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert inner.verify_calls == 1
+    assert grade_cancelled == [True]  # the in-flight grade was abandoned
+    assert recorder.metrics.rule_fires.get("verify_timeout") is None  # ceiling unused
+
+
 # --- terminal classification ------------------------------------------------
 
 
@@ -330,6 +369,47 @@ def test_verify_ceiling_still_caps_a_late_hung_grader(tmp_path: Path) -> None:
     assert result.error is None
     metrics = json.loads(Path(result.metrics_path).read_text())
     assert metrics["rule_fires"].get("verify_timeout") == 1
+
+
+def test_external_cancel_during_verify_tears_down_promptly(tmp_path: Path) -> None:
+    # End-to-end: the orchestrator cancels an in-flight sibling (early-stop /
+    # shutdown) while its terminal verify is running, with the task deadline NOT
+    # yet reached. The cancel must propagate out of run_trial (so the slot frees
+    # and the env tears down now), NOT be absorbed until the verify ceiling. This
+    # exercises the deadline binding: only a cancel from the bound task deadline
+    # is shielded; an external one propagates.
+    started = asyncio.Event()
+
+    class _BlockingVerifyEnv(_StubEnv):
+        async def verify(self) -> RawState:
+            self.verify_calls += 1
+            started.set()
+            await asyncio.Event().wait()  # blocks until cancelled
+            return self._verify_state
+
+    llm = _StubLlm([_completion(_tool_call("verify"))])
+    env = _BlockingVerifyEnv(trial_dir=str(tmp_path / "trial"))
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(
+            run_trial(
+                task_id="task-a",
+                run_id="r1",
+                llm=llm,
+                env=env,
+                max_steps=5,
+                task_timeout_sec=30.0,  # high: the deadline does NOT fire here
+                verify_timeout_sec=30.0,
+            )
+        )
+        await started.wait()  # the grade is in flight
+        task.cancel()  # external cancel, not the task deadline
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert env.verify_calls == 1
+    assert env.closed is True  # teardown ran despite the abandoned grade
 
 
 # --- budget stamping (PR1: time_remaining_sec) -------------------------------
