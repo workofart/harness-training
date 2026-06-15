@@ -32,15 +32,10 @@ from swebench.harness.grading import get_eval_tests_report, get_logs_eval
 from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
 
 from src.contracts import EnvExecWorkload, RawState
-from src.retry import retry_transient
+from src.env import docker as docker_utils
 
 logger = logging.getLogger(__name__)
 
-DOCKER_INFRA_RETRY_BUDGET = 5
-
-
-class _TransientDockerError(RuntimeError):
-    pass
 
 class VerifierCorruptError(RuntimeError):
     """A verify() run swebench could not grade -- a failed held-out test-patch
@@ -115,53 +110,6 @@ def _grade_log(
     return _score_report(report)
 
 
-async def _run_once(*args: str, timeout: float | None = None) -> tuple[int, str, str]:
-    """One host subprocess (docker CLI), decoded stdout/stderr."""
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, TimeoutError):
-        proc.kill()
-        await proc.wait()
-        raise
-    return (
-        proc.returncode if proc.returncode is not None else -1,
-        out.decode("utf-8", "replace"),
-        err.decode("utf-8", "replace"),
-    )
-
-
-async def _run(
-    *args: str, timeout: float | None = None, retry: bool = False
-) -> tuple[int, str, str]:
-    """Run a docker CLI command. With `retry`, ride out a docker-level failure (a daemon blip)
-    """
-    if not retry:
-        return await _run_once(*args, timeout=timeout)
-
-    async def _attempt() -> tuple[int, str, str]:
-        rc, out, err = await _run_once(*args, timeout=timeout)
-        if rc != 0 and err.strip():
-            raise _TransientDockerError(f"{' '.join(args[:2])}: {err[:300]}")
-        return rc, out, err
-
-    return await retry_transient(
-        _attempt,
-        is_transient=lambda exc: isinstance(exc, _TransientDockerError),
-        on_retry=lambda n, exc: logger.warning(
-            "transient docker error; retrying (%d/%d): %s",
-            n,
-            DOCKER_INFRA_RETRY_BUDGET,
-            exc,
-        ),
-        budget=DOCKER_INFRA_RETRY_BUDGET,
-    )
-
-
 def load_rows(instance_ids: list[str]) -> dict[str, dict]:
     """Map SWE-bench-Verified instance ids -> dataset rows (the task source for a
     SWE-backed panel).
@@ -234,7 +182,7 @@ class SweEnv:
         # A daemon blip fails the ping before the container exists, so a retried
         # `docker run` safely re-uses the same --name.
         async with self._gate("heavy"):
-            rc, _out, err = await _run(
+            rc, _out, err = await docker_utils.run_docker_cli(
                 "docker",
                 "run",
                 "-d",
@@ -249,6 +197,7 @@ class SweEnv:
                 "infinity",
                 timeout=600,
                 retry=True,
+                logger=logger,
             )
         if rc != 0:
             raise RuntimeError(f"container start failed ({rc}): {err[:500]}")
@@ -270,7 +219,7 @@ class SweEnv:
         # Light actions (ls/find/read/search/edit) bypass the gate; only the
         # agent's `run` (emulated pytest/python) counts against heavy CPU work.
         async with self._gate(workload):
-            rc, out, err = await _run(
+            rc, out, err = await docker_utils.run_docker_cli(
                 "docker",
                 "exec",
                 "-w",
@@ -304,27 +253,10 @@ class SweEnv:
 
     async def close(self) -> None:
         if self._started:
-            await _run("docker", "rm", "-f", self._container, timeout=120)
+            await docker_utils.run_docker_cli(
+                "docker", "rm", "-f", self._container, timeout=120
+            )
             self._started = False
-
-    # --- panel-building helpers (not part of HarnessEnv) ---------------------
-
-    async def apply_patch(self, diff: str) -> tuple[int, str]:
-        """Apply a unified diff to /testbed. Used by the gold-offline pre-screen
-        that selects deterministically-gradable tasks for a panel."""
-        await self._copy_in(diff, "/patch.diff")
-        rc, out, err = await _run(
-            "docker",
-            "exec",
-            "-w",
-            "/testbed",
-            self._container,
-            "bash",
-            "-lc",
-            "git apply -v /patch.diff",
-            timeout=120,
-        )
-        return rc, (err or out)
 
     # --- internals -----------------------------------------------------------
 
@@ -333,7 +265,9 @@ class SweEnv:
         fd, host = tempfile.mkstemp(dir=self._artifacts_dir)
         with os.fdopen(fd, "w") as fh:
             fh.write(content)
-        await _run("docker", "cp", host, f"{self._container}:{container_path}")
+        await docker_utils.run_docker_cli(
+            "docker", "cp", host, f"{self._container}:{container_path}"
+        )
         os.unlink(host)
 
     async def _run_eval_script(self) -> str:
@@ -343,7 +277,7 @@ class SweEnv:
         # marker extraction. Retried so a daemon blip here is not misread as a
         # corrupt log -- its signature is on docker's own stderr channel, which a
         # real non-zero test run leaves clean, so retry never masks a failure.
-        _rc, out, _err = await _run(
+        _rc, out, _err = await docker_utils.run_docker_cli(
             "docker",
             "exec",
             self._container,
@@ -352,5 +286,6 @@ class SweEnv:
             "bash /eval.sh 2>&1",
             timeout=1800,
             retry=True,
+            logger=logger,
         )
         return out
