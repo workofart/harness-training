@@ -95,58 +95,27 @@ def test_harness_config_accepts_literal_narrow_loop_shape():
 def test_default_harness_config_matches_baseline_run_profile():
     config = HarnessConfig.model_validate_json(DEFAULT_HARNESS_CONFIG_PATH.read_text())
     held_out = config.test
-    ignored_group = config.excluded_task_groups["ignored"]
-    slow_group = config.excluded_task_groups["slow"]
-    contamination_group = config.excluded_task_groups["contamination_risk"]
-    cyber_group = config.excluded_task_groups["cyber_risk_unactionable"]
 
-    assert len(config.train.task_names) == 59
+    assert config.env_backend == "swe"
+    assert len(config.train.task_names) == 30
     assert held_out is not None
-    assert len(held_out.task_names) == 10
-    assert len(ignored_group.task_names) == 2
-    assert len(slow_group.task_names) == 15
-    assert len(cyber_group.task_names) == 2
-    assert contamination_group.task_names == ["reshard-c4-data"]
+    assert len(held_out.task_names) == 9
+    assert config.excluded_task_groups == {}
     assert set(config.train.task_names).isdisjoint(held_out.task_names)
-    assert set(config.train.task_names).isdisjoint(ignored_group.task_names)
-    assert set(config.train.task_names).isdisjoint(slow_group.task_names)
-    assert set(held_out.task_names).isdisjoint(ignored_group.task_names)
-    assert set(held_out.task_names).isdisjoint(slow_group.task_names)
-    assert set(ignored_group.task_names).isdisjoint(slow_group.task_names)
-    assert set(cyber_group.task_names).isdisjoint(config.train.task_names)
-    assert set(cyber_group.task_names).isdisjoint(held_out.task_names)
-    assert set(cyber_group.task_names).isdisjoint(ignored_group.task_names)
-    assert set(cyber_group.task_names).isdisjoint(slow_group.task_names)
-    assert (
-        len(
-            set(config.train.task_names)
-            | set(held_out.task_names)
-            | set(ignored_group.task_names)
-            | set(slow_group.task_names)
-            | set(contamination_group.task_names)
-            | set(cyber_group.task_names)
-        )
-        == 89
-    )
-    assert "gpt2-codegolf" in held_out.task_names
-    assert "configure-git-webserver" in held_out.task_names
-    assert "break-filter-js-from-html" in ignored_group.task_names
-    assert "pytorch-model-cli" in ignored_group.task_names
-    assert "vulnerable-secret" in cyber_group.task_names
-    assert "model-extraction-relu-logits" in cyber_group.task_names
-    assert "qemu-startup" in slow_group.task_names
-    assert "financial-document-processor" in config.train.task_names
-    assert "dna-assembly" in config.train.task_names
-    assert config.max_trial_concurrency == 25
-    assert config.max_heavy_action_concurrency == 10
-    assert config.train.task_timeout_sec == 1200.0
+    assert "django__django-10973" in config.train.task_names
+    assert "sympy__sympy-24443" in config.train.task_names
+    assert "django__django-10999" in held_out.task_names
+    assert "sympy__sympy-18763" in held_out.task_names
+    assert config.max_trial_concurrency == 12
+    assert config.max_heavy_action_concurrency == 8
+    assert config.train.task_timeout_sec == 1800.0
     assert held_out.task_timeout_sec == 1800.0
     assert config.env_setup_timeout_sec == 600.0
-    assert config.task_trials == 5
+    assert config.task_trials == 3
     assert config.llm_provider_config.provider == "chatgpt_codex"
     assert config.llm_provider_config.model_name == "gpt-5.5"
     assert config.llm_provider_config.max_context_length == 200000
-    assert config.llm_provider_config.reasoning_effort == "high"
+    assert config.llm_provider_config.reasoning_effort == "low"
 
 
 def test_harness_config_rejects_v1_payload():

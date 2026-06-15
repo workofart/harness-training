@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -237,6 +238,15 @@ def test_experiments_dir_override_rejects_a_relative_path():
         cli._apply_experiments_dir_override(HarborConfig(), "relative/experiments")
 
 
+def test_load_runtime_config_ignores_harness_config_path_env(monkeypatch):
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", "does/not/exist.json")
+
+    _, harness_config, _ = cli.load_runtime_config()
+
+    expected = json.loads(cli.DEFAULT_HARNESS_CONFIG_PATH.read_text())
+    assert harness_config.env_backend == expected["env_backend"]
+
+
 # --- auto entry point (Step 5: main_auto drives supervisor.loop.run_auto) ----
 
 
@@ -310,11 +320,9 @@ def test_main_auto_anchors_experiments_dir_to_the_repo_not_cwd(monkeypatch, tmp_
     assert tmp_path.resolve() not in experiments_dir.parents
 
 
-def test_main_auto_honors_harness_config_path_env(monkeypatch):
-    # Regression: main_auto must select the alternate harness panel named by
-    # HARNESS_CONFIG_PATH (matching the exp subprocesses it spawns, which inherit
-    # the env) -- else the loop iterates the default Terminal Bench task set while
-    # the candidate runs would use SWE-bench, a silent substrate mismatch.
+def test_main_auto_ignores_harness_config_path_env(monkeypatch):
+    # Env selection lives in config/harness_config.json. A stale
+    # HARNESS_CONFIG_PATH must not silently move auto onto another substrate.
     from src.supervisor.policy import Halt
 
     captured: dict[str, object] = {}
@@ -324,26 +332,22 @@ def test_main_auto_honors_harness_config_path_env(monkeypatch):
         return Halt("nothing to do (test)")
 
     monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
-    monkeypatch.setenv("HARNESS_CONFIG_PATH", "config/harness_config.swe.json")
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", "does/not/exist.json")
 
     assert cli.main_auto() == 0
     config = captured["ctx"].config
-    assert config.env_backend == "swe"
-    # Honored the path iff the loaded panel is the one named by the env var (not
-    # the TB default). Compare against the file directly so the guard tracks
-    # panel edits instead of pinning a brittle task count / repo set.
-    import json
-    from pathlib import Path
-
-    named = json.loads(Path("config/harness_config.swe.json").read_text())
-    expected = list(named["train"]["task_names"]) + list(named["test"]["task_names"])
+    expected = json.loads(cli.DEFAULT_HARNESS_CONFIG_PATH.read_text())
+    assert config.env_backend == expected["env_backend"]
     panel = list(config.train.task_names) + list(config.test.task_names)
-    assert panel == expected
-    assert all("__" in name for name in panel)
+    expected_panel = list(expected["train"]["task_names"]) + list(
+        expected["test"]["task_names"]
+    )
+    assert panel == expected_panel
 
 
-def test_main_auto_defaults_to_terminal_bench_panel_without_the_env(monkeypatch):
-    # The unset path stays on the default Harbor/Terminal Bench config.
+def test_main_auto_loads_env_backend_from_default_harness_config(monkeypatch):
+    # The unset path stays on the default config, whose own env_backend selects
+    # Harbor vs SWE.
     from src.supervisor.policy import Halt
 
     captured: dict[str, object] = {}
@@ -356,7 +360,31 @@ def test_main_auto_defaults_to_terminal_bench_panel_without_the_env(monkeypatch)
     monkeypatch.delenv("HARNESS_CONFIG_PATH", raising=False)
 
     assert cli.main_auto() == 0
-    assert captured["ctx"].config.env_backend == "harbor"
+    config = captured["ctx"].config
+    expected = json.loads(cli.DEFAULT_HARNESS_CONFIG_PATH.read_text())
+    assert config.env_backend == expected["env_backend"]
+    panel = list(config.train.task_names) + list(config.test.task_names)
+    expected_panel = list(expected["train"]["task_names"]) + list(
+        expected["test"]["task_names"]
+    )
+    assert panel == expected_panel
+
+
+def test_main_auto_default_config_currently_selects_swe(monkeypatch):
+    # The checked-in default config currently selects SWE-bench.
+    from src.supervisor.policy import Halt
+
+    captured: dict[str, object] = {}
+
+    def fake_run_auto(ctx):
+        captured["ctx"] = ctx
+        return Halt("nothing to do (test)")
+
+    monkeypatch.setattr("src.supervisor.loop.run_auto", fake_run_auto)
+    monkeypatch.delenv("HARNESS_CONFIG_PATH", raising=False)
+
+    assert cli.main_auto() == 0
+    assert captured["ctx"].config.env_backend == "swe"
 
 
 def test_load_llm_provider_secret_skips_openrouter_key_for_chatgpt():

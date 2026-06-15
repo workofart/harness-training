@@ -1107,10 +1107,11 @@ def test_run_exp_serializes_the_seam_to_the_command_line(
     # --experiments-dir / --trial-budget (JSON). cli._parse_exp_args reads them.
     import json
 
-    captured: dict[str, list[str]] = {}
+    captured: dict[str, object] = {}
 
     def fake_tty(args, *, cwd, env):
         captured["args"] = args
+        captured["env"] = env
         # the orchestrator would write the record; stub it so the existence check passes
         write_experiment_result(
             _result("exp-x", commit="c0", solved_by_task={"a": True}),
@@ -1121,6 +1122,7 @@ def test_run_exp_serializes_the_seam_to_the_command_line(
         )
 
     monkeypatch.setattr(loop_mod, "_run_with_live_tty_output", fake_tty)
+    monkeypatch.setenv("HARNESS_CONFIG_PATH", "config/harness_config.swe.json")
     loop_mod._run_exp(
         worktree=repo_root,
         experiment_id="exp-x",
@@ -1129,12 +1131,16 @@ def test_run_exp_serializes_the_seam_to_the_command_line(
         trial_budget={"a": 1, "b": 3},
     )
     args = captured["args"]
+    assert isinstance(args, list)
     assert args[:3] == ["uv", "run", "exp"]
     flags = dict(zip(args[3::2], args[4::2]))
     assert flags["--experiment-id"] == "exp-x"
     assert flags["--tasks"] == "a,b"
     assert flags["--experiments-dir"] == str(experiments_dir.resolve())
     assert json.loads(flags["--trial-budget"]) == {"a": 1, "b": 3}
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "HARNESS_CONFIG_PATH" not in env
 
 
 # --- Diagnose ---------------------------------------------------------------

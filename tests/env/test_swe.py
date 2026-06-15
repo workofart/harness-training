@@ -21,7 +21,6 @@ from swebench.harness.constants import (
 from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
 
 from src.env import docker as docker_module
-from src.env import swe as swe_module
 from src.env.swe import (
     SweEnv,
     VerifierCorruptError,
@@ -173,7 +172,9 @@ def test_run_retries_a_docker_blip(monkeypatch):
     run_once, calls = _fake_run_sequence([blip, ok])
     monkeypatch.setattr(docker_module, "run_docker_once", run_once)
 
-    rc, out, _err = asyncio.run(docker_module.run_docker_cli("docker", "run", retry=True))
+    rc, out, _err = asyncio.run(
+        docker_module.run_docker_cli("docker", "run", retry=True)
+    )
     assert (rc, out) == (0, "started")
     assert calls["n"] == 2
 
@@ -187,7 +188,9 @@ def test_run_does_not_retry_a_verdict(monkeypatch):
     run_once, calls = _fake_run_sequence([fail, (0, "should-not-reach", "")])
     monkeypatch.setattr(docker_module, "run_docker_once", run_once)
 
-    rc, out, _err = asyncio.run(docker_module.run_docker_cli("docker", "exec", retry=True))
+    rc, out, _err = asyncio.run(
+        docker_module.run_docker_cli("docker", "exec", retry=True)
+    )
     assert (rc, out) == (1, "3 failed, 5 passed")
     assert calls["n"] == 1
 

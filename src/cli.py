@@ -61,14 +61,9 @@ def load_runtime_config(
 ) -> tuple[HarborConfig, HarnessConfig, str | None]:
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
 
-    # HARNESS_CONFIG_PATH selects an alternate harness config (e.g. the SWE-bench
-    # panel) for both `exp` and the `auto` worktree runs it spawns, without
-    # clobbering the default Terminal Bench config.
-    override = os.environ.get("HARNESS_CONFIG_PATH")
-    harness_config_path = Path(override) if override else DEFAULT_HARNESS_CONFIG_PATH
     harbor_config, harness_config = load_strict_runtime_config(
         harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
-        harness_config_path=harness_config_path,
+        harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
     )
     harbor_config = _apply_experiments_dir_override(harbor_config, experiments_dir)
     api_key = _load_llm_provider_secret(harness_config=harness_config)
@@ -540,9 +535,7 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
     print(f"experiment: {experiment_id}")
     print(f"tasks ({len(task_ids)}): {', '.join(task_ids)}")
     print(f"harbor config: {DEFAULT_HARBOR_CONFIG_PATH}")
-    print(
-        f"harness config: {os.environ.get('HARNESS_CONFIG_PATH', DEFAULT_HARNESS_CONFIG_PATH)}"
-    )
+    print(f"harness config: {DEFAULT_HARNESS_CONFIG_PATH}")
     if _require_clean_worktree_for_exp():
         require_clean_worktree()
     git_commit_hash = get_head_commit()
@@ -629,18 +622,10 @@ def main_auto() -> int:
     # relative experiments_dir against cwd -- so load with cwd at repo_root, making
     # `uv run auto` cwd-independent (an absolute config path is unaffected; cwd is
     # restored on exit, and the loop's I/O all uses explicit paths, never cwd).
-    # HARNESS_CONFIG_PATH selects an alternate harness panel (e.g. SWE-bench) for
-    # the loop itself, matching the `exp` subprocesses it spawns (which inherit the
-    # env). Resolve a relative override against repo_root so it stays cwd-independent
-    # (an absolute override replaces it outright).
-    override = os.environ.get("HARNESS_CONFIG_PATH")
-    harness_config_path = (
-        repo_root / override if override else DEFAULT_HARNESS_CONFIG_PATH
-    )
     with contextlib.chdir(repo_root):
         harbor_config, harness_config = load_strict_runtime_config(
             harbor_config_path=DEFAULT_HARBOR_CONFIG_PATH,
-            harness_config_path=harness_config_path,
+            harness_config_path=DEFAULT_HARNESS_CONFIG_PATH,
         )
     ctx = LoopContext(
         repo_root=repo_root,

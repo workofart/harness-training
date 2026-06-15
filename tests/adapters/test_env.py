@@ -704,7 +704,8 @@ def test_harbor_verify_serializes_under_shared_semaphore(tmp_path: Path) -> None
         verifier_session=_RecordingVerifier(),
         trial_paths=SimpleNamespace(
             agent_dir=agent_dir,
-            verifier_dir=tmp_path / "trial",  # no ctrf.json -> graded falls back to binary
+            verifier_dir=tmp_path
+            / "trial",  # no ctrf.json -> graded falls back to binary
             test_stdout_path=tmp_path / "trial" / "stdout.txt",
             test_stderr_path=tmp_path / "trial" / "stderr.txt",
         ),
