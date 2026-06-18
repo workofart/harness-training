@@ -479,39 +479,8 @@ async def run_experiment(
     )
 
 
-async def _run_exp_async(
-    *,
-    harness_config,
-    harbor_config,
-    api_key,
-    git_commit_hash,
-    task_ids,
-    experiment_id,
-    budget,
-    on_progress=None,
-):
-    trial_runner = await _build_trial_runner(
-        harness_config=harness_config,
-        harbor_config=harbor_config,
-        api_key=api_key,
-        task_ids=task_ids,
-        experiment_id=experiment_id,
-    )
-    return await run_experiment(
-        harness_config=harness_config,
-        harbor_config=harbor_config,
-        git_commit_hash=git_commit_hash,
-        task_ids=task_ids,
-        experiment_id=experiment_id,
-        trial_runner=trial_runner,
-        budget=budget,
-        on_progress=on_progress,
-    )
-
-
 def main_exp(argv: Sequence[str] | None = None) -> int:
     import asyncio
-    import sys
 
     from src.llm.codex import (
         CODEX_CREDENTIALS_EXPIRED_EXIT_CODE,
@@ -543,19 +512,28 @@ def main_exp(argv: Sequence[str] | None = None) -> int:
         task_ids=task_ids,
         max_trial_concurrency=harness_config.max_trial_concurrency,
     )
-    try:
-        result = asyncio.run(
-            _run_exp_async(
-                harness_config=harness_config,
-                harbor_config=harbor_config,
-                api_key=api_key,
-                git_commit_hash=git_commit_hash,
-                task_ids=task_ids,
-                experiment_id=experiment_id,
-                budget=budget,
-                on_progress=bar.render,
-            )
+
+    async def _go():
+        trial_runner = await _build_trial_runner(
+            harness_config=harness_config,
+            harbor_config=harbor_config,
+            api_key=api_key,
+            task_ids=task_ids,
+            experiment_id=experiment_id,
         )
+        return await run_experiment(
+            harness_config=harness_config,
+            harbor_config=harbor_config,
+            git_commit_hash=git_commit_hash,
+            task_ids=task_ids,
+            experiment_id=experiment_id,
+            trial_runner=trial_runner,
+            budget=budget,
+            on_progress=bar.render,
+        )
+
+    try:
+        result = asyncio.run(_go())
     except ChatGptCodexCredentialsExpiredError as exc:
         bar.close()
         print(str(exc), file=sys.stderr)

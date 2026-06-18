@@ -260,18 +260,15 @@ class SweEnv:
 
     # --- internals -----------------------------------------------------------
 
-    async def _copy_in(self, content: str, container_path: str) -> None:
+    async def _run_eval_script(self) -> str:
         # docker cp is robust against the slim image's missing shell tools.
         fd, host = tempfile.mkstemp(dir=self._artifacts_dir)
         with os.fdopen(fd, "w") as fh:
-            fh.write(content)
+            fh.write(self._spec.eval_script)
         await docker_utils.run_docker_cli(
-            "docker", "cp", host, f"{self._container}:{container_path}"
+            "docker", "cp", host, f"{self._container}:/eval.sh"
         )
         os.unlink(host)
-
-    async def _run_eval_script(self) -> str:
-        await self._copy_in(self._spec.eval_script, "/eval.sh")
         # Merge streams IN ORDER inside the container: `set -x` echoes the
         # Start/End markers to stderr; separate capture reorders them and breaks
         # marker extraction. Retried so a daemon blip here is not misread as a
