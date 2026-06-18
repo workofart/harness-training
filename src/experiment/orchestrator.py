@@ -53,9 +53,8 @@ def _utcnow_iso() -> str:
 # --- pure scheduling helpers ------------------------------------------------
 
 
-def _load_task_duration_priors(
-    path: Path = DEFAULT_TASK_DURATION_PRIORS_PATH,
-) -> dict[str, float]:
+def _load_task_duration_priors() -> dict[str, float]:
+    path = DEFAULT_TASK_DURATION_PRIORS_PATH
     if not path.exists():
         return {}
     payload = json.loads(path.read_text())
@@ -143,13 +142,8 @@ def _planned_admission_count(task_result: TaskResult) -> int:
     )
 
 
-def _set_trial_budget(task_result: TaskResult, *, expected_trial_count: int) -> bool:
-    if expected_trial_count < len(task_result.trials):
-        raise ValueError("trial budget cannot be below recorded trials")
-    if task_result.expected_trial_count == expected_trial_count:
-        return False
+def _set_trial_budget(task_result: TaskResult, *, expected_trial_count: int) -> None:
     task_result.expected_trial_count = expected_trial_count
-    return True
 
 
 # --- stateful priority admission --------------------------------------------
@@ -264,8 +258,6 @@ async def _run_panel(
             remaining_budget = task_result.expected_trial_count - len(
                 task_result.trials
             )
-            if remaining_budget <= 0:
-                break
             if admit_all_remaining:
                 admission_count = remaining_budget
                 admit_all_remaining = False

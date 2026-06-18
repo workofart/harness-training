@@ -15,6 +15,7 @@ import httpx
 
 from src.retry import INFRA_RETRY_BUDGET, retry_transient
 from src.llm.base import (
+    RETRYABLE_HTTP_STATUS_CODES,
     BaseLlm,
     LlmCompletion,
     LlmToolCall,
@@ -32,7 +33,6 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 TOKEN_REFRESH_SKEW_SECONDS = 60
 
-RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 524, 529})
 # A token-endpoint refusal with one of these codes means the stored credentials
 # are dead (OAuth `invalid_grant` is 400; `invalid_client` is 401), not a
 # transient blip -- only re-login fixes it.
@@ -72,7 +72,7 @@ def _is_retryable_infra_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.TransportError):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in RETRYABLE_STATUS_CODES
+        return exc.response.status_code in RETRYABLE_HTTP_STATUS_CODES
     return False
 
 
@@ -400,27 +400,11 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 
 async def _iter_sse_json(response: Any):
-    data_lines: list[str] = []
     async for line in response.aiter_lines():
-        if line == "":
-            if data_lines:
-                event = _parse_sse_data(data_lines)
-                if event is not None:
-                    yield event
-            data_lines = []
-            continue
         if line.startswith("data:"):
-            data = line.removeprefix("data:").strip()
-            if not data_lines:
-                event = _parse_sse_data([data])
-                if event is not None:
-                    yield event
-                continue
-            data_lines.append(data)
-    if data_lines:
-        event = _parse_sse_data(data_lines)
-        if event is not None:
-            yield event
+            event = _parse_sse_data([line.removeprefix("data:").strip()])
+            if event is not None:
+                yield event
 
 
 def _parse_sse_data(data_lines: list[str]) -> dict[str, Any] | None:
@@ -536,15 +520,7 @@ def _extract_final_output(
     if not isinstance(output, list):
         return calls, text_by_item
     for item in output:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "function_call":
-            item_id, call = _function_call_item(item, empty_arguments="{}")
-            calls[item_id] = call
-        elif item.get("type") == "message":
-            text = _text_from_content(item.get("content"))
-            if text:
-                text_by_item[str(item.get("id"))] = text
+        _merge_done_item(item, calls, text_by_item)
     return calls, text_by_item
 
 

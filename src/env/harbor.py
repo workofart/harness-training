@@ -338,9 +338,6 @@ class Harbor:
     def _agent_log_path(self) -> Path:
         return self.session.trial_paths.agent_dir / "exec.log"
 
-    def _bootstrap_log_dir(self) -> Path:
-        return self.session.trial_paths.trial_dir / "bootstrap"
-
     def _append_agent_log(
         self,
         *,
@@ -455,7 +452,7 @@ class Harbor:
         if not commands:
             return
 
-        bootstrap_dir = self._bootstrap_log_dir()
+        bootstrap_dir = self.session.trial_paths.trial_dir / "bootstrap"
         bootstrap_dir.mkdir(parents=True, exist_ok=True)
         script_path = bootstrap_dir / "bootstrap.sh"
         script_path.write_text(_BOOTSTRAP_PREAMBLE + "\n".join(commands) + "\n")
@@ -957,19 +954,15 @@ class Harbor:
         )
         stdout_bytes, _ = await process.communicate()
         stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
-        result = ExecResult(
-            stdout=stdout,
-            stderr=None,
-            return_code=process.returncode or 0,
-        )
-        if result.return_code != 0:
+        return_code = process.returncode or 0
+        if return_code != 0:
             raise RuntimeError(
                 f"{failure_context}. "
                 f"Command: docker {' '.join(args)}. "
-                f"Return code: {result.return_code}. "
-                f"Output: {result.stdout}."
+                f"Return code: {return_code}. "
+                f"Output: {stdout}."
             )
-        return result
+        return ExecResult(stdout=stdout, stderr=None, return_code=return_code)
 
     def _docker_cleanup(self) -> DockerCleanup:
         return DockerCleanup(

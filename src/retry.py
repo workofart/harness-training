@@ -13,18 +13,13 @@ INFRA_RETRY_BUDGET = 2
 _T = TypeVar("_T")
 
 
-def _linear_backoff(retries: int, exc: Exception) -> float:
-    del exc
-    return float(retries)
-
-
 async def retry_transient(
     operation: Callable[[], Awaitable[_T]],
     *,
     is_transient: Callable[[Exception], bool],
     on_retry: Callable[[int, Exception], None],
     budget: int = INFRA_RETRY_BUDGET,
-    delay: Callable[[int, Exception], float] = _linear_backoff,
+    delay: Callable[[int, Exception], float] = lambda retries, _exc: float(retries),
 ) -> _T:
     retries = 0
     while True:

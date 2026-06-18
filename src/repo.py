@@ -10,16 +10,14 @@ def _git_run(
     input: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    kwargs = {
-        "check": check,
-        "capture_output": True,
-        "text": True,
-    }
-    if input is not None:
-        kwargs["input"] = input
-    if cwd is not None:
-        kwargs["cwd"] = cwd
-    return subprocess.run(["git", *args], **kwargs)
+    return subprocess.run(
+        ["git", *args],
+        check=check,
+        capture_output=True,
+        text=True,
+        input=input,
+        cwd=cwd,
+    )
 
 
 def _git_stdout(*args: str, cwd: Path | None = None) -> str:
@@ -92,7 +90,7 @@ def git_diff_added_lines_worktree(
 
 
 def get_head_commit(*, cwd: Path | None = None) -> str:
-    return _git_stdout("rev-parse", "HEAD", cwd=cwd).strip()
+    return resolve_ref("HEAD", cwd=cwd)
 
 
 def changed_paths(*, cwd: Path | None = None) -> tuple[str, ...]:
@@ -138,26 +136,12 @@ def add_worktree(
     *,
     cwd: Path | None = None,
     ref: str = "HEAD",
-    detach: bool = True,
-    force: bool = False,
 ) -> None:
-    args = ["worktree", "add"]
-    if force:
-        args.append("--force")
-    if detach:
-        args.append("--detach")
-    args.extend([str(worktree_path), ref])
-    _git_run(*args, cwd=cwd)
+    _git_run("worktree", "add", "--force", "--detach", str(worktree_path), ref, cwd=cwd)
 
 
-def remove_worktree(
-    worktree_path: Path, *, cwd: Path | None = None, force: bool = True
-) -> None:
-    args = ["worktree", "remove"]
-    if force:
-        args.append("--force")
-    args.append(str(worktree_path))
-    _git_run(*args, cwd=cwd)
+def remove_worktree(worktree_path: Path, *, cwd: Path | None = None) -> None:
+    _git_run("worktree", "remove", "--force", str(worktree_path), cwd=cwd)
 
 
 def merge_ff_only(commit_hash: str, *, cwd: Path | None = None) -> None:

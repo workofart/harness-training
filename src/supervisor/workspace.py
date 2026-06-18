@@ -59,7 +59,7 @@ def sparse_worktree(
     """A fresh detached worktree at HEAD with only ``paths`` checked out (the
     agent's sparse edit view). Removed on exit even if the body raises."""
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    repo.add_worktree(worktree_path, cwd=repo_root, ref="HEAD", detach=True, force=True)
+    repo.add_worktree(worktree_path, cwd=repo_root, ref="HEAD")
     try:
         repo.sparse_checkout_init_no_cone(cwd=worktree_path)
         repo.sparse_checkout_set(tuple(sorted(paths)), cwd=worktree_path)
@@ -76,7 +76,7 @@ def full_worktree(repo_root: Path, worktree_path: Path, *, ref: str) -> Iterator
     """A fresh detached full worktree at ``ref`` (the candidate ref), where
     ``uv run exp`` runs. Removed on exit even if the body raises."""
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    repo.add_worktree(worktree_path, cwd=repo_root, ref=ref, detach=True, force=True)
+    repo.add_worktree(worktree_path, cwd=repo_root, ref=ref)
     try:
         yield worktree_path
     finally:

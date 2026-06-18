@@ -208,7 +208,7 @@ The supervisor never auto-recovers, resumes, or re-runs *broken* work. A run tha
 
 A panel carries only membership (`task_names`) and a per-trial wall budget (`task_timeout_sec`); the promotion→veto sequencing is hardcoded in `supervisor/policy.decide()`, not configured. The mechanism label is `LoopResult.focus_name`, captured from the proposal turn — it is not a config field.
 
-Validated at load: `train`, `test`, and every `excluded_task_groups` entry are pairwise disjoint (a task sits in exactly one group). `scan()` additionally requires both panels non-empty before any `auto` command runs.
+Validated at load: `train` and `test` are disjoint (a task sits in exactly one panel). `scan()` additionally requires both panels non-empty before any `auto` command runs.
 
 ## LLM providers
 

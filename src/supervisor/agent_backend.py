@@ -88,10 +88,8 @@ def paint(text: str, code: str, *, enabled: bool) -> str:
 
 def role_label(role: str, *, enabled: bool) -> str:
     palette = {
-        "supervisor": "1;35",
         "codex": "1;34",
         "claude": "1;36",
-        "agent": "1;32",
         "toolcall": "1;33",
         "codex stderr": "1;31",
         "claude stderr": "1;31",
@@ -402,7 +400,7 @@ class CodexBackend:
         try:
             argv = shlex.split(stripped)
         except ValueError:
-            return truncate(stripped, limit=120)
+            argv = []
         if (
             len(argv) == 3
             and argv[1] == "-lc"
@@ -580,11 +578,7 @@ class ClaudeBackend:
             cmd = tool_input.get("command")
             if isinstance(cmd, str) and cmd.strip():
                 return truncate(cmd.strip(), limit=120)
-        if tool_name == "Read":
-            fp = tool_input.get("file_path")
-            if isinstance(fp, str):
-                return compact_path(fp)
-        if tool_name in ("Edit", "Write"):
+        if tool_name in ("Read", "Edit", "Write"):
             fp = tool_input.get("file_path")
             if isinstance(fp, str):
                 return compact_path(fp)
