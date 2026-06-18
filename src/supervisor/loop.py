@@ -505,6 +505,28 @@ def _refresh_baseline(ctx: LoopContext) -> None:
     )
 
 
+def _run_candidate_panel(
+    ctx: LoopContext, *, experiment_id: str, suffix: str, baseline, task_ids
+) -> None:
+    # Run one candidate panel (train or veto) in a throwaway full worktree at the
+    # candidate ref, appending into the shared experiment dir. A task the baseline
+    # solved deterministically starts at 1 trial (confirm-on-fail expands it);
+    # everything else at full (§9 #7).
+    run_worktree = ctx.worktree_root / f"{experiment_id}-{suffix}"
+    with workspace.full_worktree(
+        ctx.repo_root, run_worktree, ref=workspace.candidate_ref(experiment_id)
+    ) as run_view:
+        ctx.run_exp(
+            worktree=run_view,
+            experiment_id=experiment_id,
+            task_ids=task_ids,
+            experiments_dir=ctx.experiments_dir,
+            trial_budget=budget_from_baseline(
+                baseline, task_ids=task_ids, full=ctx.config.task_trials
+            ),
+        )
+
+
 def _propose_and_launch(world: World, ctx: LoopContext) -> None:
     baseline = world.active_baseline
     assert baseline is not None  # rule 8 fires only when baseline_ok (commit==HEAD)
@@ -536,43 +558,25 @@ def _propose_and_launch(world: World, ctx: LoopContext) -> None:
         focus_name=proposed.focus_name,
         parent=baseline.experiment_id,
     )
-    run_worktree = ctx.worktree_root / f"{experiment_id}-train"
-    with workspace.full_worktree(
-        ctx.repo_root, run_worktree, ref=workspace.candidate_ref(experiment_id)
-    ) as run_view:
-        ctx.run_exp(
-            worktree=run_view,
-            experiment_id=experiment_id,
-            task_ids=world.train_tasks,
-            experiments_dir=ctx.experiments_dir,
-            # A train task the baseline solved deterministically starts at 1 trial
-            # (confirm-on-fail expands it); everything else at full (§9 #7).
-            trial_budget=budget_from_baseline(
-                baseline, task_ids=world.train_tasks, full=ctx.config.task_trials
-            ),
-        )
+    _run_candidate_panel(
+        ctx,
+        experiment_id=experiment_id,
+        suffix="train",
+        baseline=baseline,
+        task_ids=world.train_tasks,
+    )
 
 
 def _run_veto(experiment_id: str, world: World, ctx: LoopContext) -> None:
     # train kept; run the TEST panel into the same experiment dir (the candidate ref
     # still exists -- Conclude drops it). exp appends to the existing experiment.json.
-    run_worktree = ctx.worktree_root / f"{experiment_id}-veto"
-    with workspace.full_worktree(
-        ctx.repo_root, run_worktree, ref=workspace.candidate_ref(experiment_id)
-    ) as run_view:
-        ctx.run_exp(
-            worktree=run_view,
-            experiment_id=experiment_id,
-            task_ids=world.test_tasks,
-            experiments_dir=ctx.experiments_dir,
-            # Same baseline-derived budget for the veto panel: a test task the
-            # baseline solved deterministically starts at 1 trial (§9 #7).
-            trial_budget=budget_from_baseline(
-                world.active_baseline,
-                task_ids=world.test_tasks,
-                full=ctx.config.task_trials,
-            ),
-        )
+    _run_candidate_panel(
+        ctx,
+        experiment_id=experiment_id,
+        suffix="veto",
+        baseline=world.active_baseline,
+        task_ids=world.test_tasks,
+    )
 
 
 def _conclude(world: World, ctx: LoopContext) -> None:

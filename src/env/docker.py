@@ -154,6 +154,14 @@ def _compact_verifier_task_session_prefix(task_name: str) -> str | None:
     return f"{task_prefix or digest}__{digest}__"
 
 
+def _sanitize_compose_project_name(name: str) -> str:
+    from harbor.environments.docker.docker import (
+        _sanitize_docker_compose_project_name,
+    )
+
+    return _sanitize_docker_compose_project_name(name)
+
+
 class DockerCleanup:
     def __init__(
         self,
@@ -170,32 +178,18 @@ class DockerCleanup:
 
     @staticmethod
     def docker_compose_project_name(env: BaseEnvironment) -> str:
-        from harbor.environments.docker.docker import (
-            _sanitize_docker_compose_project_name,
-        )
-
         # Must stay in sync with Harbor's private DockerEnvironment
         # `docker compose -p` derivation; drift makes label cleanup a no-op.
-        return _sanitize_docker_compose_project_name(env.session_id)
+        return _sanitize_compose_project_name(env.session_id)
 
     def _docker_compose_task_project_prefix(self) -> str:
-        from harbor.environments.docker.docker import (
-            _sanitize_docker_compose_project_name,
-        )
-
-        return f"{_sanitize_docker_compose_project_name(self.task_name)}__"
+        return f"{_sanitize_compose_project_name(self.task_name)}__"
 
     def _docker_compose_cleanup_project_prefixes(self) -> tuple[str, ...]:
-        from harbor.environments.docker.docker import (
-            _sanitize_docker_compose_project_name,
-        )
-
         prefixes = [self._docker_compose_task_project_prefix()]
         compact_verifier_prefix = _compact_verifier_task_session_prefix(self.task_name)
         if compact_verifier_prefix is not None:
-            prefixes.append(
-                _sanitize_docker_compose_project_name(compact_verifier_prefix)
-            )
+            prefixes.append(_sanitize_compose_project_name(compact_verifier_prefix))
         return tuple(prefixes)
 
     def _cleanup_lock(self) -> asyncio.Lock:

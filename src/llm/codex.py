@@ -520,15 +520,7 @@ def _extract_final_output(
     if not isinstance(output, list):
         return calls, text_by_item
     for item in output:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "function_call":
-            item_id, call = _function_call_item(item, empty_arguments="{}")
-            calls[item_id] = call
-        elif item.get("type") == "message":
-            text = _text_from_content(item.get("content"))
-            if text:
-                text_by_item[str(item.get("id"))] = text
+        _merge_done_item(item, calls, text_by_item)
     return calls, text_by_item
 
 

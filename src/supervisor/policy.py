@@ -384,10 +384,10 @@ class LoopResult(BaseModel):
 # ----------------------------------------------------------------------------
 
 
-def _baseline_counts(baseline: ExperimentResult, task_id: str) -> tuple[int, int]:
-    # The frozen baseline's own valid trials for this task; (0, 0) for a task it
-    # never ran (no-baseline frontier).
-    task = baseline.tasks.get(task_id)
+def _task_counts(result: ExperimentResult, task_id: str) -> tuple[int, int]:
+    # One arm's valid trials for this task: (solved, total); (0, 0) for a task it
+    # never ran (a no-baseline frontier task on the baseline side).
+    task = result.tasks.get(task_id)
     if task is None:
         return (0, 0)
     return (task.solved_count, len(task.valid_trials))
@@ -396,10 +396,8 @@ def _baseline_counts(baseline: ExperimentResult, task_id: str) -> tuple[int, int
 def _task_verdict(
     *, candidate: ExperimentResult, baseline: ExperimentResult, task_id: str
 ) -> BaselineComparison:
-    candidate_task = candidate.tasks.get(task_id)
-    candidate_solved = candidate_task.solved_count if candidate_task else 0
-    candidate_total = len(candidate_task.valid_trials) if candidate_task else 0
-    baseline_solved, baseline_total = _baseline_counts(baseline, task_id)
+    candidate_solved, candidate_total = _task_counts(candidate, task_id)
+    baseline_solved, baseline_total = _task_counts(baseline, task_id)
     verdict = compare_candidate_against_baseline(
         candidate_solved=candidate_solved,
         candidate_total=candidate_total,

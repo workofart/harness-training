@@ -202,14 +202,6 @@ def _make_llm_for_config(*, config, api_key: str | None):
             return ChatGptCodex(config=config)
 
 
-async def _resolve_task_dirs(*, trial_harbor_config, task_names):
-    from src.env.harbor import TaskDirectoryResolver
-
-    return dict(
-        await TaskDirectoryResolver(trial_harbor_config).resolve(list(task_names))
-    )
-
-
 async def _run_trial_with_env(
     *,
     env,
@@ -241,33 +233,16 @@ async def _run_trial_with_env(
     )
 
 
-async def _build_harbor_trial_runner(
-    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
-):
-    """Terminal Bench backend: resolve each selected task's directory once, then
-    build a per-trial `Harbor` handed the run-scoped heavy gate."""
-    from src.env.harbor import Harbor
-
-    trial_harbor_config = harbor_config.model_copy(
-        update={
-            "experiments_dir": harbor_config.experiments_dir / experiment_id / "tasks"
-        }
-    )
-    task_dirs = await _resolve_task_dirs(
-        trial_harbor_config=trial_harbor_config, task_names=task_ids
-    )
+def _make_trial_runner(*, harness_config, api_key, build_env):
+    # The trial_runner closure shared by every backend: look up each task's panel
+    # wall budgets once, then drive `build_env(task_id, run_id, heavy_semaphore)`
+    # through `_run_trial_with_env`. Each builder supplies only its env factory.
     task_timeout_sec = _panel_seconds_by_task(harness_config, "task_timeout_sec")
     verify_timeout_sec = _panel_seconds_by_task(harness_config, "verify_timeout_sec")
 
     async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
-        env = Harbor(
-            trial_harbor_config,
-            task_name=task_id,
-            task_dir=task_dirs[task_id],
-            exec_semaphore=heavy_action_semaphore,
-        )
         return await _run_trial_with_env(
-            env=env,
+            env=build_env(task_id, run_id, heavy_action_semaphore),
             task_id=task_id,
             run_id=run_id,
             harness_config=harness_config,
@@ -278,6 +253,33 @@ async def _build_harbor_trial_runner(
         )
 
     return trial_runner
+
+
+async def _build_harbor_trial_runner(
+    *, harness_config, harbor_config, api_key: str | None, task_ids, experiment_id
+):
+    """Terminal Bench backend: resolve each selected task's directory once, then
+    build a per-trial `Harbor` handed the run-scoped heavy gate."""
+    from src.env.harbor import Harbor, TaskDirectoryResolver
+
+    trial_harbor_config = harbor_config.model_copy(
+        update={
+            "experiments_dir": harbor_config.experiments_dir / experiment_id / "tasks"
+        }
+    )
+    task_dirs = dict(
+        await TaskDirectoryResolver(trial_harbor_config).resolve(list(task_ids))
+    )
+    return _make_trial_runner(
+        harness_config=harness_config,
+        api_key=api_key,
+        build_env=lambda task_id, _run_id, sem: Harbor(
+            trial_harbor_config,
+            task_name=task_id,
+            task_dir=task_dirs[task_id],
+            exec_semaphore=sem,
+        ),
+    )
 
 
 async def _build_swe_trial_runner(
@@ -290,27 +292,15 @@ async def _build_swe_trial_runner(
 
     rows = load_rows(list(task_ids))
     tasks_root = harbor_config.experiments_dir / experiment_id / "tasks"
-    task_timeout_sec = _panel_seconds_by_task(harness_config, "task_timeout_sec")
-    verify_timeout_sec = _panel_seconds_by_task(harness_config, "verify_timeout_sec")
-
-    async def trial_runner(task_id, run_id, heavy_action_semaphore, slot_release):
-        env = SweEnv(
+    return _make_trial_runner(
+        harness_config=harness_config,
+        api_key=api_key,
+        build_env=lambda task_id, run_id, sem: SweEnv(
             row=rows[task_id],
             artifacts_dir=str(tasks_root / task_id / run_id),
-            heavy_semaphore=heavy_action_semaphore,
-        )
-        return await _run_trial_with_env(
-            env=env,
-            task_id=task_id,
-            run_id=run_id,
-            harness_config=harness_config,
-            api_key=api_key,
-            task_timeout_sec=task_timeout_sec[task_id],
-            verify_timeout_sec=verify_timeout_sec[task_id],
-            slot_release=slot_release,
-        )
-
-    return trial_runner
+            heavy_semaphore=sem,
+        ),
+    )
 
 
 async def _build_trial_runner(

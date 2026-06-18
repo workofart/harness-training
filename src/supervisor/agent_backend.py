@@ -400,7 +400,7 @@ class CodexBackend:
         try:
             argv = shlex.split(stripped)
         except ValueError:
-            return truncate(stripped, limit=120)
+            argv = []
         if (
             len(argv) == 3
             and argv[1] == "-lc"
@@ -578,11 +578,7 @@ class ClaudeBackend:
             cmd = tool_input.get("command")
             if isinstance(cmd, str) and cmd.strip():
                 return truncate(cmd.strip(), limit=120)
-        if tool_name == "Read":
-            fp = tool_input.get("file_path")
-            if isinstance(fp, str):
-                return compact_path(fp)
-        if tool_name in ("Edit", "Write"):
+        if tool_name in ("Read", "Edit", "Write"):
             fp = tool_input.get("file_path")
             if isinstance(fp, str):
                 return compact_path(fp)
