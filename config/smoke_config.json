@@ -12,7 +12,6 @@
     ],
     "task_timeout_sec": 1800.0
   },
-  "excluded_task_groups": {},
   "max_steps": 1000,
   "max_trial_concurrency": 6,
   "max_heavy_action_concurrency": 4,

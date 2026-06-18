@@ -133,12 +133,6 @@ class TaskPanel(BaseModel):
     verify_timeout_sec: float = Field(default=900.0, gt=0)
 
 
-class ExcludedTaskGroup(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    task_names: list[str] = Field(default_factory=list)
-
-
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -151,10 +145,6 @@ class HarnessConfig(BaseModel):
     test: TaskPanel | None = Field(
         default=None,
         description="Optional regression-veto panel (held-out tasks; block-only).",
-    )
-    excluded_task_groups: dict[str, ExcludedTaskGroup] = Field(
-        default_factory=dict,
-        description="Named task groups kept out of runnable panels.",
     )
     env_backend: Literal["harbor", "swe"] = Field(
         default="harbor",
@@ -218,16 +208,12 @@ class HarnessConfig(BaseModel):
 
     @model_validator(mode="after")
     def task_groups_are_disjoint(self) -> Self:
-        # A task sits in exactly one group: train, test, or one excluded group.
+        # A task sits in exactly one panel: train or test.
         task_groups: list[tuple[str, set[str]]] = [
             ("train.task_names", set(self.train.task_names))
         ]
         if self.test is not None:
             task_groups.append(("test.task_names", set(self.test.task_names)))
-        task_groups.extend(
-            (f"excluded_task_groups.{name}.task_names", set(group.task_names))
-            for name, group in self.excluded_task_groups.items()
-        )
         for index, (left_name, left_tasks) in enumerate(task_groups):
             for right_name, right_tasks in task_groups[index + 1 :]:
                 overlap = sorted(left_tasks & right_tasks)

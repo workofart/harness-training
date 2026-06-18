@@ -100,7 +100,6 @@ def test_default_harness_config_matches_baseline_run_profile():
     assert len(config.train.task_names) == 30
     assert held_out is not None
     assert len(held_out.task_names) == 9
-    assert config.excluded_task_groups == {}
     assert set(config.train.task_names).isdisjoint(held_out.task_names)
     assert "django__django-10973" in config.train.task_names
     assert "sympy__sympy-24443" in config.train.task_names
