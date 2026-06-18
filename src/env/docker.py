@@ -67,7 +67,6 @@ async def run_docker_cli(
     *args: str,
     timeout: float | None = None,
     retry: bool = False,
-    retry_budget: int = DOCKER_INFRA_RETRY_BUDGET,
     logger: logging.Logger | None = None,
 ) -> tuple[int, str, str]:
     """Run a Docker CLI command, optionally retrying daemon-level failures."""
@@ -86,7 +85,7 @@ async def run_docker_cli(
         logger.warning(
             "transient docker error; retrying (%d/%d): %s",
             retry_count,
-            retry_budget,
+            DOCKER_INFRA_RETRY_BUDGET,
             exc,
         )
 
@@ -94,7 +93,7 @@ async def run_docker_cli(
         _attempt,
         is_transient=lambda exc: isinstance(exc, TransientDockerError),
         on_retry=_on_retry,
-        budget=retry_budget,
+        budget=DOCKER_INFRA_RETRY_BUDGET,
     )
 
 

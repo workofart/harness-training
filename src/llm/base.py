@@ -7,6 +7,9 @@ from typing import Any, Literal
 
 ReasoningEffort = Literal["none", "low", "medium", "high"]
 
+# HTTP status codes worth retrying a request on (shared by the LLM transports).
+RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 524, 529})
+
 
 def _int_or_none(value: Any) -> int | None:
     return value if isinstance(value, int) else None

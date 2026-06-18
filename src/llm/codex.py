@@ -15,6 +15,7 @@ import httpx
 
 from src.retry import INFRA_RETRY_BUDGET, retry_transient
 from src.llm.base import (
+    RETRYABLE_HTTP_STATUS_CODES,
     BaseLlm,
     LlmCompletion,
     LlmToolCall,
@@ -32,7 +33,6 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 TOKEN_REFRESH_SKEW_SECONDS = 60
 
-RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 524, 529})
 # A token-endpoint refusal with one of these codes means the stored credentials
 # are dead (OAuth `invalid_grant` is 400; `invalid_client` is 401), not a
 # transient blip -- only re-login fixes it.
@@ -72,7 +72,7 @@ def _is_retryable_infra_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.TransportError):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in RETRYABLE_STATUS_CODES
+        return exc.response.status_code in RETRYABLE_HTTP_STATUS_CODES
     return False
 
 

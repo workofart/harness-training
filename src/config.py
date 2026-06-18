@@ -68,7 +68,7 @@ class OpenRouterConfig(BaseModel):
         description="Provider service tier requested for completions.",
     )
     provider_kwargs: OpenRouterProviderKwargs = Field(
-        default_factory=lambda: OpenRouterProviderKwargs(),
+        default_factory=OpenRouterProviderKwargs,
         description="Additional provider-specific request arguments.",
     )
 
@@ -137,7 +137,6 @@ class ExcludedTaskGroup(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_names: list[str] = Field(default_factory=list)
-    reason: str = ""
 
 
 class HarnessConfig(BaseModel):

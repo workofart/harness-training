@@ -44,15 +44,11 @@ def load_strict_runtime_config(
     return harbor_config, harness_config
 
 
-def _load_llm_provider_secret(
-    *,
-    harness_config: HarnessConfig,
-    dotenv_path: str | Path = ".env",
-) -> str | None:
+def _load_llm_provider_secret(*, harness_config: HarnessConfig) -> str | None:
     if harness_config.llm_provider_config.provider == "openrouter":
         from src.llm.openrouter import load_openrouter_api_key
 
-        return load_openrouter_api_key(dotenv_path=dotenv_path)
+        return load_openrouter_api_key()
     return None
 
 

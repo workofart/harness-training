@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -18,6 +17,7 @@ from src.llm.base import (
     LlmCompletion,
     LlmToolCall,
     LlmUsage,
+    RETRYABLE_HTTP_STATUS_CODES,
     ReasoningEffort,
     _int_or_none,
 )
@@ -39,11 +39,8 @@ class OpenRouterEmbeddedProviderError(RuntimeError):
         self.status_code = status_code
 
 
-def load_openrouter_api_key(
-    *,
-    dotenv_path: str | Path = ".env",
-) -> str:
-    load_dotenv(dotenv_path=dotenv_path, override=True)
+def load_openrouter_api_key() -> str:
+    load_dotenv(dotenv_path=".env", override=True)
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is not set")
@@ -55,24 +52,27 @@ def _normalize_openrouter_model_name(model_name: str) -> str:
 
 
 def _is_retryable_openrouter_error(exc: Exception) -> bool:
-    return isinstance(
-        exc,
-        (
-            TimeoutError,
-            httpx.TimeoutException,
-            httpx.TransportError,
-            errors.NoResponseError,
-            errors.BadGatewayResponseError,
-            errors.EdgeNetworkTimeoutResponseError,
-            errors.InternalServerResponseError,
-            errors.OpenRouterDefaultError,
-            errors.ProviderOverloadedResponseError,
-            errors.RequestTimeoutResponseError,
-            errors.ServiceUnavailableResponseError,
-            errors.TooManyRequestsResponseError,
-            OpenRouterEmbeddedProviderError,
-        ),
-    ) and getattr(exc, "status_code", 500) in {408, 429, 500, 502, 503, 524, 529}
+    return (
+        isinstance(
+            exc,
+            (
+                TimeoutError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+                errors.NoResponseError,
+                errors.BadGatewayResponseError,
+                errors.EdgeNetworkTimeoutResponseError,
+                errors.InternalServerResponseError,
+                errors.OpenRouterDefaultError,
+                errors.ProviderOverloadedResponseError,
+                errors.RequestTimeoutResponseError,
+                errors.ServiceUnavailableResponseError,
+                errors.TooManyRequestsResponseError,
+                OpenRouterEmbeddedProviderError,
+            ),
+        )
+        and getattr(exc, "status_code", 500) in RETRYABLE_HTTP_STATUS_CODES
+    )
 
 
 def _extract_reasoning_payload(message: Any) -> Any:
