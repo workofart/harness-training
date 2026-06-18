@@ -323,13 +323,10 @@ class Recorder:
             detail=str(exc),
         )
 
-    def write_metrics(self, path: str | Path | None = None) -> None:
-        if self.metrics is None:
+    def write_metrics(self) -> None:
+        if self.metrics is None or self.metrics_path is None:
             return
-        resolved_path = self.metrics_path if path is None else Path(path)
-        if resolved_path is None:
-            return
-        self.metrics.write(resolved_path)
+        self.metrics.write(self.metrics_path)
 
     def set_trial_outcome(
         self,

@@ -400,27 +400,11 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 
 async def _iter_sse_json(response: Any):
-    data_lines: list[str] = []
     async for line in response.aiter_lines():
-        if line == "":
-            if data_lines:
-                event = _parse_sse_data(data_lines)
-                if event is not None:
-                    yield event
-            data_lines = []
-            continue
         if line.startswith("data:"):
-            data = line.removeprefix("data:").strip()
-            if not data_lines:
-                event = _parse_sse_data([data])
-                if event is not None:
-                    yield event
-                continue
-            data_lines.append(data)
-    if data_lines:
-        event = _parse_sse_data(data_lines)
-        if event is not None:
-            yield event
+            event = _parse_sse_data([line.removeprefix("data:").strip()])
+            if event is not None:
+                yield event
 
 
 def _parse_sse_data(data_lines: list[str]) -> dict[str, Any] | None:

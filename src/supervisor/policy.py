@@ -110,8 +110,8 @@ class StratifiedSolveTest:
     solve odds exceed the baseline's, stratified by task. Built from the
     per-task strata in one pass by ``from_strata``. Retained as the binary
     comparison baseline the graded promotion decider is measured against
-    (tests/supervisor/test_graded_gate.py): ``delta`` is the direction,
-    ``p_value`` the significance, ``counts`` the reason-string evidence.
+    (tests/supervisor/test_graded_gate.py): ``delta`` is the direction
+    and ``p_value`` the significance.
 
     Pure-Python normal approximation (no continuity correction), golden-tested
     against statsmodels/scipy offline. ``delta`` is the CMH numerator -- the
@@ -127,24 +127,17 @@ class StratifiedSolveTest:
 
     delta: float
     p_value: float
-    candidate_solved: int
-    candidate_total: int
-    baseline_solved: int
-    baseline_total: int
 
     @classmethod
     def from_strata(cls, strata: Iterable[Stratum]) -> StratifiedSolveTest:
         numerator = 0.0
         variance = 0.0
-        pooled = [0, 0, 0, 0]
         for stratum in strata:
             candidate_solved, candidate_total, baseline_solved, baseline_total = stratum
             if not 0 <= candidate_solved <= candidate_total:
                 raise ValueError("candidate_solved must be in [0, candidate_total]")
             if not 0 <= baseline_solved <= baseline_total:
                 raise ValueError("baseline_solved must be in [0, baseline_total]")
-            for i, count in enumerate(stratum):
-                pooled[i] += count
             if candidate_total == 0 or baseline_total == 0:
                 continue  # a stratum missing either arm carries no comparison
             n = candidate_total + baseline_total  # >= 2 with both arms present
@@ -162,14 +155,7 @@ class StratifiedSolveTest:
         else:
             z = numerator / math.sqrt(variance)
             p_value = 0.5 * math.erfc(z / math.sqrt(2.0))
-        return cls(numerator, p_value, *pooled)
-
-    @property
-    def counts(self) -> str:
-        return (
-            f"pooled {self.candidate_solved}/{self.candidate_total} vs "
-            f"{self.baseline_solved}/{self.baseline_total} trial solves"
-        )
+        return cls(numerator, p_value)
 
 
 # ----------------------------------------------------------------------------

@@ -88,10 +88,8 @@ def paint(text: str, code: str, *, enabled: bool) -> str:
 
 def role_label(role: str, *, enabled: bool) -> str:
     palette = {
-        "supervisor": "1;35",
         "codex": "1;34",
         "claude": "1;36",
-        "agent": "1;32",
         "toolcall": "1;33",
         "codex stderr": "1;31",
         "claude stderr": "1;31",

@@ -597,7 +597,6 @@ def _install_runner_teardown_signal_handler() -> None:
 
 def main_auto() -> int:
     import contextlib
-    import sys
 
     from src.env.harbor import DEFAULT_HARBOR_CONFIG_PATH
     from src.llm.codex import (

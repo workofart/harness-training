@@ -53,7 +53,6 @@ def run_turns_until(
     prompt_builder: Callable[[str | None], str],
     check: Callable[[], str | None],
     max_attempts: int,
-    on_turn_complete: Callable[[str], None] | None = None,
 ) -> str:
     """Resume agent turns until ``check()`` accepts (returns ``None``) or the cap
     is hit. The capped feedback primitive shared by the prelaunch proposal and the
@@ -88,8 +87,6 @@ def run_turns_until(
             feedback_note = str(exc)
             continue
         current_thread_id = turn.thread_id
-        if on_turn_complete is not None:
-            on_turn_complete(current_thread_id)
         rejection = check()
         if rejection is None:
             return current_thread_id
@@ -157,7 +154,6 @@ def propose_candidate(
     prompt_builder: Callable[[str | None], str],
     validate: Callable[[Path], str | None],
     max_attempts: int = DEFAULT_MAX_PROPOSAL_ATTEMPTS,
-    on_turn_complete: Callable[[str], None] | None = None,
 ) -> ProposedCandidate:
     """Run agent turns until the candidate clears ``validate`` or the cap is hit.
 
@@ -173,7 +169,6 @@ def propose_candidate(
             prompt_builder=prompt_builder,
             check=lambda: validate(worktree_path),
             max_attempts=max_attempts,
-            on_turn_complete=on_turn_complete,
         )
     except AgentTurnsExhausted as exc:
         raise ProposalRejected(
