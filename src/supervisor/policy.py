@@ -99,65 +99,6 @@ def compute_fisher_exact_p_value(
     return min(1.0, total)
 
 
-# One stratum of the promotion test: one task's per-trial 2x2 table as
-# (candidate_solved, candidate_total, baseline_solved, baseline_total).
-Stratum = tuple[int, int, int, int]
-
-
-@dataclass(frozen=True, slots=True)
-class StratifiedSolveTest:
-    """One-sided Cochran-Mantel-Haenszel test that the candidate's per-trial
-    solve odds exceed the baseline's, stratified by task. Built from the
-    per-task strata in one pass by ``from_strata``. Retained as the binary
-    comparison baseline the graded promotion decider is measured against
-    (tests/supervisor/test_graded_gate.py): ``delta`` is the direction
-    and ``p_value`` the significance.
-
-    Pure-Python normal approximation (no continuity correction), golden-tested
-    against statsmodels/scipy offline. ``delta`` is the CMH numerator -- the
-    sum over strata of (observed candidate solves - expected under the task's
-    own pooled rate, both margins fixed), positive iff the candidate
-    out-solves the baseline after conditioning on per-task margins.
-    ``p_value`` is 1 - Phi(delta / sqrt(sum of per-stratum hypergeometric
-    variances)). Unequal arm sizes per stratum are fine. Strata missing
-    either arm, and degenerate strata (all trials solved or none solved
-    across both arms), carry zero information and drop out; with zero total
-    variance there is no evidence at all -> p_value = 1.0.
-    """
-
-    delta: float
-    p_value: float
-
-    @classmethod
-    def from_strata(cls, strata: Iterable[Stratum]) -> StratifiedSolveTest:
-        numerator = 0.0
-        variance = 0.0
-        for stratum in strata:
-            candidate_solved, candidate_total, baseline_solved, baseline_total = stratum
-            if not 0 <= candidate_solved <= candidate_total:
-                raise ValueError("candidate_solved must be in [0, candidate_total]")
-            if not 0 <= baseline_solved <= baseline_total:
-                raise ValueError("baseline_solved must be in [0, baseline_total]")
-            if candidate_total == 0 or baseline_total == 0:
-                continue  # a stratum missing either arm carries no comparison
-            n = candidate_total + baseline_total  # >= 2 with both arms present
-            solved = candidate_solved + baseline_solved
-            numerator += candidate_solved - candidate_total * solved / n
-            variance += (
-                candidate_total
-                * baseline_total
-                * solved
-                * (n - solved)
-                / (n * n * (n - 1))
-            )
-        if variance == 0.0:
-            p_value = 1.0
-        else:
-            z = numerator / math.sqrt(variance)
-            p_value = 0.5 * math.erfc(z / math.sqrt(2.0))
-        return cls(numerator, p_value)
-
-
 # ----------------------------------------------------------------------------
 # The graded promotion statistic (continuous reward; Phase 1 step 2).
 # ----------------------------------------------------------------------------
@@ -199,7 +140,7 @@ class GradedRewardTest:
     noise (measured: it spuriously kept a real historical discard). Using the
     spread of per-task deltas as the variance is robust -- each delta already
     carries its own within-task trial noise -- and stays deterministic +
-    closed-form like ``StratifiedSolveTest`` (no RNG in the decision path).
+    closed-form (no RNG in the decision path).
 
     ``mean_delta`` is the average per-task reward gain (direction: promote iff
     > 0). ``p_value`` is one-sided ``1 - Phi(mean_delta / (sd / sqrt(k)))``, a

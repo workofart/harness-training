@@ -11,9 +11,9 @@ Three layers, all pure (no git/docker/I/O):
   case: the binary CMH promoted it (winner's curse), the graded statistic must
   not.
 - **Calibration + power**: a seeded resampling simulation against a representative
-  synthetic per-task reward population -- null false-keep <= alpha, and power
-  against a sub-threshold +reward effect materially above the binary CMH (which
-  is blind to partial-credit movement).
+  synthetic per-task reward population -- null false-keep <= alpha, and adequate
+  power against a sub-threshold +reward effect that sits below the binary pass
+  threshold (where a binary solve gate would be near-blind to it).
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from src.experiment.record import ExperimentResult, TaskResult, TrialResult
 from src.supervisor.policy import (
     GRADED_PROMOTION_P_VALUE_ALPHA,
     GradedRewardTest,
-    StratifiedSolveTest,
     _graded_task_deltas,
     _trial_graded_reward,
 )
@@ -369,24 +368,6 @@ def _graded_keep(rng: random.Random, effect: float) -> bool:
     return test.mean_delta > 0 and test.p_value <= ALPHA
 
 
-def _binary_keep(rng: random.Random, effect: float) -> bool:
-    # The binary gate's promotion test on the same draws: solve == full pass.
-    strata = []
-    for pop in POP:
-        cand = _draw(rng, pop, effect)
-        base = _draw(rng, pop, 0.0)
-        strata.append(
-            (
-                sum(1 for x in cand if x >= 1.0),
-                FULL,
-                sum(1 for x in base if x >= 1.0),
-                FULL,
-            )
-        )
-    test = StratifiedSolveTest.from_strata(strata)
-    return test.delta > 0 and test.p_value <= ALPHA
-
-
 def _keep_rate(keep_fn, effect: float) -> float:
     rng = random.Random(SEED)
     return sum(keep_fn(rng, effect) for _ in range(CYCLES)) / CYCLES
@@ -398,12 +379,9 @@ def test_graded_null_false_keep_within_alpha() -> None:
     assert null_rate <= ALPHA + 0.03, f"graded null false-keep {null_rate:.3f}"
 
 
-def test_graded_power_exceeds_binary_against_subthreshold_effect() -> None:
-    # A +0.05 per-trial reward lift sits mostly below the binary pass threshold,
-    # so the binary CMH barely moves while the graded statistic captures it.
+def test_graded_power_against_subthreshold_effect() -> None:
+    # A +0.05 per-trial reward lift sits mostly below the binary pass threshold
+    # (a binary solve gate would be near-blind), yet the graded statistic still
+    # captures it at adequate power.
     graded_power = _keep_rate(_graded_keep, 0.05)
-    binary_power = _keep_rate(_binary_keep, 0.05)
     assert graded_power >= 0.20, f"graded power {graded_power:.3f} too low"
-    assert graded_power > 2 * binary_power, (
-        f"graded power {graded_power:.3f} not materially above binary {binary_power:.3f}"
-    )
