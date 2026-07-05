@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -23,6 +24,7 @@ from src.env.base import (
 from src.env.base import StepResult
 from src.policy import core
 from src.policy.core import (
+    FILE_TOOL_TIMEOUT_SEC,
     TOOLS,
     Action,
     ActionGuard,
@@ -31,15 +33,21 @@ from src.policy.core import (
     FailedStep,
     LlmAgent,
     NoValidActionError,
+    ReadArgs,
     ReminderRule,
     RepeatedLengthCutoffError,
+    ReplaceArgs,
     RunArgs,
     SubmitArgs,
     Trajectory,
+    WriteArgs,
     _ContextWindow,
     _RequestBuilder,
     build_env_action,
+    build_read_command,
+    build_replace_command,
     build_tool_specs,
+    build_write_command,
 )
 from src.llm.backend import (
     Completion,
@@ -63,9 +71,20 @@ _TRUNCATED_ARGS_LENGTH_CUTOFF = Completion(
 def test_build_tool_specs_cover_action_space_and_embed_pydantic_schemas() -> None:
     by_name = {s["function"]["name"]: s for s in build_tool_specs()}
 
-    assert set(by_name) == set(TOOLS) == {"run", "submit"}
+    assert set(by_name) == set(TOOLS) == {
+        "read",
+        "replace",
+        "run",
+        "submit",
+        "write",
+    }
     assert by_name["run"]["function"]["parameters"] == RunArgs.model_json_schema()
     assert by_name["submit"]["function"]["parameters"] == SubmitArgs.model_json_schema()
+    assert by_name["read"]["function"]["parameters"] == ReadArgs.model_json_schema()
+    assert (
+        by_name["replace"]["function"]["parameters"] == ReplaceArgs.model_json_schema()
+    )
+    assert by_name["write"]["function"]["parameters"] == WriteArgs.model_json_schema()
     assert by_name["run"]["function"]["parameters"]["required"] == ["command"]
     assert by_name["run"]["function"]["parameters"]["additionalProperties"] is False
     assert RunArgs(command="pytest").timeout_sec == COMMAND_TIMEOUT_SEC
@@ -88,6 +107,129 @@ def test_build_env_action_passes_through_run_fields() -> None:
 def test_build_env_action_rejects_submit():
     with pytest.raises(ValueError, match="unsupported editable action"):
         build_env_action(Action(name="submit", args=SubmitArgs()))
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        pytest.param(
+            Action(
+                name="replace",
+                args=ReplaceArgs(path="mod.py", old_text="old", new_text="new"),
+            ),
+            id="replace",
+        ),
+        pytest.param(
+            Action(name="read", args=ReadArgs(path="mod.py", offset=10, limit=50)),
+            id="read",
+        ),
+        pytest.param(
+            Action(name="write", args=WriteArgs(path="new.py", content="content")),
+            id="write",
+        ),
+    ],
+)
+def test_build_env_action_routes_file_tools_to_metered_runs(action: Action) -> None:
+    env_action = build_env_action(action)
+
+    assert env_action == RunAction(
+        command={
+            "replace": build_replace_command,
+            "read": build_read_command,
+            "write": build_write_command,
+        }[action.name](action.args),
+        cwd=None,
+        timeout_sec=FILE_TOOL_TIMEOUT_SEC,
+    )
+
+
+def _run_shell(command: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        shell=True,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_replace_command_persists_exact_edit_and_rejects_invalid_matches(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "pkg" / "mod.py"
+    target.parent.mkdir(parents=True)
+    original = 'def f():\n    return "a\'b$`c\\\\"\n'
+    target.write_text(original)
+    args = ReplaceArgs(
+        path="pkg/mod.py",
+        old_text='    return "a\'b$`c\\\\"\n',
+        new_text="    return NotImplemented\n",
+    )
+
+    command = build_replace_command(args)
+    proc = _run_shell(command, tmp_path)
+
+    assert args.old_text not in command
+    assert proc.returncode == 0, proc.stderr
+    assert target.read_text() == "def f():\n    return NotImplemented\n"
+
+    target.write_text("same\nsame\n")
+    ambiguous = _run_shell(
+        build_replace_command(
+            ReplaceArgs(path="pkg/mod.py", old_text="same\n", new_text="new\n")
+        ),
+        tmp_path,
+    )
+    assert ambiguous.returncode != 0
+    assert "2 locations" in ambiguous.stderr
+    assert target.read_text() == "same\nsame\n"
+
+    missing = _run_shell(
+        build_replace_command(
+            ReplaceArgs(path="missing.py", old_text="old", new_text="new")
+        ),
+        tmp_path,
+    )
+    assert missing.returncode != 0
+    assert "file not found" in missing.stderr
+
+
+def test_write_command_preserves_content(tmp_path: Path) -> None:
+    content = 'def f():\n    return "a\'b$`c\\\\"\n'
+    target = tmp_path / "pkg" / "new.py"
+
+    write = _run_shell(
+        build_write_command(WriteArgs(path="pkg/new.py", content=content)), tmp_path
+    )
+
+    assert write.returncode == 0, write.stderr
+    assert target.read_text() == content
+
+
+def test_read_command_handles_windows_quoted_paths_and_missing_files(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "lines.txt").write_text(
+        "".join(f"line{index}\n" for index in range(1, 11))
+    )
+    read = _run_shell(
+        build_read_command(ReadArgs(path="lines.txt", offset=3, limit=2)), tmp_path
+    )
+
+    assert read.returncode == 0, read.stderr
+    assert "line3\nline4\n" in read.stdout
+    assert "line5" not in read.stdout
+    assert "file has 10 lines total" in read.stdout
+
+    (tmp_path / "my file.txt").write_text("payload\n")
+    quoted = _run_shell(build_read_command(ReadArgs(path="my file.txt")), tmp_path)
+    assert quoted.returncode == 0, quoted.stderr
+    assert "payload" in quoted.stdout
+
+    missing = _run_shell(build_read_command(ReadArgs(path="missing.py")), tmp_path)
+    assert missing.returncode != 0
+    assert "missing.py" in missing.stderr
 
 
 def test_request_builder_tool_result_renders_fields_and_truncates() -> None:
@@ -770,6 +912,44 @@ def test_action_parser_actions_accepts_offered_tool():
     actions = ActionParser.actions(completion, offered=frozenset({"submit"}))
 
     assert actions == _SUBMIT_ACTIONS
+
+
+def test_action_parser_actions_ignores_empty_invalid_call_with_valid_sibling():
+    actions = ActionParser.actions(
+        Completion(
+            tool_calls=(
+                ToolCall(name="run", arguments="{}"),
+                _tool_call("run", command="pwd"),
+            )
+        ),
+        offered=frozenset({"run"}),
+    )
+
+    assert actions == (Action(name="run", args=RunArgs(command="pwd")),)
+
+
+def test_action_parser_actions_rejects_single_empty_invalid_call():
+    with pytest.raises(ValueError, match="Field required"):
+        ActionParser.actions(
+            Completion(tool_calls=(ToolCall(name="run", arguments="{}"),)),
+            offered=frozenset({"run"}),
+        )
+
+
+def test_action_parser_actions_rejects_nonempty_invalid_call_with_valid_sibling():
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ActionParser.actions(
+            Completion(
+                tool_calls=(
+                    ToolCall(
+                        name="run",
+                        arguments=json.dumps({"command": "pwd", "extra": "boom"}),
+                    ),
+                    _tool_call("run", command="ls"),
+                )
+            ),
+            offered=frozenset({"run"}),
+        )
 
 
 def test_repair_messages_for_unoffered_tool_names_the_offered_set():
