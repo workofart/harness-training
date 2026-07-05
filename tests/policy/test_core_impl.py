@@ -903,6 +903,23 @@ def test_action_parser_validate_args_accepted_variants() -> None:
     )
 
 
+def test_action_parser_validate_args_drops_empty_transport_artifact_key():
+    args = {"command": "pwd", "timeout_sec}\n</parameter": ""}
+
+    assert ActionParser.validate_args("run", args) == RunArgs(command="pwd")
+
+
+def test_action_parser_validate_args_drops_empty_tool_name_artifact_key():
+    args = {"run": "", "command": "pwd"}
+
+    assert ActionParser.validate_args("run", args) == RunArgs(command="pwd")
+
+
+def test_action_parser_validate_args_keeps_ordinary_empty_unknown_key_strict():
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ActionParser.validate_args("run", {"command": "pwd", "extra": ""})
+
+
 def _unoffered_read_completion() -> Completion:
     arguments = (
         '{"limit": "15", "offset": "218", '

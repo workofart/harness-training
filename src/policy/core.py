@@ -910,11 +910,28 @@ class ActionParser:
             return {}
         return json.loads(raw)
 
-    @staticmethod
-    def validate_args(action_name: ActionName, args: Any) -> ToolArgs:
+    @classmethod
+    def validate_args(cls, action_name: ActionName, args: Any) -> ToolArgs:
         if not isinstance(args, dict):
             raise ValueError(f"{action_name}: arguments must decode to an object")
-        return TOOLS[action_name].args_model.model_validate(args)
+        return TOOLS[action_name].args_model.model_validate(
+            cls._drop_empty_artifact_args(action_name, args)
+        )
+
+    @classmethod
+    def _drop_empty_artifact_args(
+        cls, action_name: ActionName, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        fields = TOOLS[action_name].args_model.model_fields
+        return {
+            key: value
+            for key, value in args.items()
+            if key in fields or not cls._is_empty_artifact_arg(action_name, key, value)
+        }
+
+    @staticmethod
+    def _is_empty_artifact_arg(action_name: ActionName, key: str, value: Any) -> bool:
+        return value == "" and (key == action_name or "</parameter" in key)
 
     @classmethod
     def action(cls, name: str, arguments: str) -> Action:
