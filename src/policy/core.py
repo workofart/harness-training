@@ -66,7 +66,7 @@ def build_system_prompt() -> str:
             "run output is scratch: editing a file inside a `python` snippet or a here-doc that only prints does NOT persist your fix.",
             f"Each run command is terminated after its timeout_sec (default {COMMAND_TIMEOUT_SEC}s) and returns the output captured so far.",
             "Observation text may mask volatile tokens as <TIME>, <PID>, <BINARY_STDOUT>, and similar placeholders; treat them as framework redactions of unstable runtime data.",
-            "To change a file on disk, call write (create or overwrite a whole file) or replace (one exact old_text edit in an existing file); the on-disk state at submit is the only thing graded.",
+            "To change a file on disk, call write (create or overwrite a whole file; use append=true on later write calls to split long files) or replace (one exact old_text edit in an existing file); the on-disk state at submit is the only thing graded.",
             "Return one or more tool calls. They execute in order with no intermediate observation, then the resulting observation appears in the next turn.",
             "Call submit when the solution is ready for the authoritative task judgment; submit ends the trial.",
         ]
@@ -183,16 +183,30 @@ class WriteArgs(ToolArgs):
     content: str = Field(
         description="Full file content, written to disk exactly as given."
     )
+    append: bool = Field(
+        default=False,
+        description=(
+            "Append this content to the file instead of overwriting it; use a first "
+            "write with append=false and later writes with append=true for long files."
+        ),
+    )
 
 
 def build_write_command(args: WriteArgs) -> str:
     """Render `write`; base64 keeps arbitrary UTF-8 quote-safe."""
     qpath = shlex.quote(args.path)
     blob = base64.b64encode(args.content.encode("utf-8")).decode("ascii")
+    op = ">>" if args.append else ">"
+    size = f'"$(($(wc -c < {qpath})))"'
+    status = (
+        f"printf 'write: appended to %s; file has %s bytes\\n' {qpath} {size}"
+        if args.append
+        else f"printf 'write: wrote %s bytes to %s\\n' {size} {qpath}"
+    )
     return (
         f'mkdir -p -- "$(dirname -- {qpath})" && '
-        f"printf '%s' '{blob}' | base64 -d > {qpath} && "
-        f"printf 'write: wrote %s bytes to %s\\n' \"$(($(wc -c < {qpath})))\" {qpath}"
+        f"printf '%s' '{blob}' | base64 -d {op} {qpath} && "
+        f"{status}"
     )
 
 

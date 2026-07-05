@@ -207,6 +207,22 @@ def test_write_command_preserves_content(tmp_path: Path) -> None:
     assert target.read_text() == content
 
 
+def test_write_command_appends_existing_file(tmp_path: Path) -> None:
+    target = tmp_path / "mod.py"
+    target.write_text("first\n")
+
+    append = _run_shell(
+        build_write_command(
+            WriteArgs(path="mod.py", content="second\n", append=True)
+        ),
+        tmp_path,
+    )
+
+    assert append.returncode == 0, append.stderr
+    assert "write: appended" in append.stdout
+    assert target.read_text() == "first\nsecond\n"
+
+
 def test_read_command_handles_windows_quoted_paths_and_missing_files(
     tmp_path: Path,
 ) -> None:
@@ -380,6 +396,13 @@ def test_system_prompt_documents_contract_and_redactions() -> None:
     assert "<TIME>" in prompt
     assert "<PID>" in prompt
     assert "<BINARY_STDOUT>" in prompt
+
+
+def test_system_prompt_exposes_write_append_for_long_files() -> None:
+    prompt = core.build_system_prompt()
+
+    assert "append=true" in prompt
+    assert "split long files" in prompt
 
 
 class _RecordingEvents:
