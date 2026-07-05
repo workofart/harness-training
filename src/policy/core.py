@@ -639,6 +639,12 @@ class _RequestBuilder:
     # Replayed tool-call args are model-visible and recoverable, so use a tighter cap.
     ARG_TOKEN_LIMIT: ClassVar[int] = 1000
     ARG_CHAR_LIMIT: ClassVar[int] = ARG_TOKEN_LIMIT * 4
+    # File payloads live on disk after execution; replay keeps only a breadcrumb.
+    FILE_PAYLOAD_ARG_TOKEN_LIMIT: ClassVar[int] = 250
+    FILE_PAYLOAD_ARG_CHAR_LIMIT: ClassVar[int] = FILE_PAYLOAD_ARG_TOKEN_LIMIT * 4
+    FILE_PAYLOAD_ARGS: ClassVar[frozenset[tuple[ActionName, str]]] = frozenset(
+        {("write", "content")}
+    )
 
     token_counter: HfTokenCounter | None = None
 
@@ -744,7 +750,7 @@ class _RequestBuilder:
         # Clip string values before JSON serialization so replayed calls stay valid JSON.
         args = {
             key: (
-                self._bounded(value, self.ARG_TOKEN_LIMIT, self.ARG_CHAR_LIMIT)
+                self._bounded_arg(action, key, value)
                 if isinstance(value, str)
                 else value
             )
@@ -758,6 +764,15 @@ class _RequestBuilder:
                 "arguments": json.dumps(args, sort_keys=True, separators=(",", ":")),
             },
         }
+
+    def _bounded_arg(self, action: Action, key: str, value: str) -> str:
+        if (action.name, key) in self.FILE_PAYLOAD_ARGS:
+            return self._bounded(
+                value,
+                self.FILE_PAYLOAD_ARG_TOKEN_LIMIT,
+                self.FILE_PAYLOAD_ARG_CHAR_LIMIT,
+            )
+        return self._bounded(value, self.ARG_TOKEN_LIMIT, self.ARG_CHAR_LIMIT)
 
 
 @dataclass(slots=True)

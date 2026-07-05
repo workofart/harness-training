@@ -322,6 +322,26 @@ def test_request_builder_replay_clips_oversized_args_in_tokens():
     assert _QWEN_LIKE_COUNTER.count(args["command"]) <= builder.ARG_TOKEN_LIMIT
 
 
+def test_request_builder_replay_clips_write_payloads_more_tightly_than_commands():
+    content = "print('payload')\n" * 2000
+    builder = _RequestBuilder(token_counter=_QWEN_LIKE_COUNTER)
+
+    args = _replayed_args(
+        _single_action_messages(
+            builder,
+            Action(name="write", args=WriteArgs(path="gen.py", content=content)),
+        )
+    )
+
+    assert args["path"] == "gen.py"
+    assert args["content"].startswith("print('payload')")
+    assert args["content"].endswith("...[truncated]")
+    assert (
+        _QWEN_LIKE_COUNTER.count(args["content"])
+        <= builder.FILE_PAYLOAD_ARG_TOKEN_LIMIT
+    )
+
+
 def test_request_builder_replay_clips_oversized_args_in_chars_without_tokenizer():
     heredoc = "cat > gen.py << 'EOF'\n" + "x" * (2 * _RequestBuilder.ARG_CHAR_LIMIT)
 
