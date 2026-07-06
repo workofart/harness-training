@@ -1170,6 +1170,32 @@ def test_llm_agent_drops_thinking_for_rest_of_rollout_after_truncated_output():
     assert llm.thinking_overrides == [None, False, False, None]
 
 
+def test_llm_agent_first_step_runaway_uses_generic_recovery():
+    llm = _StubLlm([Completion(finish_reason="length"), _SUBMIT_COMPLETION])
+    agent = _agent(llm, thinking_toggleable=True)
+
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
+
+    recovery = _string_contents(llm.calls[1])
+    assert any(core.MISSING_TOOL_CALL_REPAIR_PROMPT in text for text in recovery)
+    assert all(core.REASONING_RUNAWAY_REPAIR_PROMPT not in text for text in recovery)
+
+
+def test_llm_agent_later_step_runaway_gets_cause_accurate_steer():
+    llm = _StubLlm([Completion(finish_reason="length"), _SUBMIT_COMPLETION])
+    agent = _agent(llm, thinking_toggleable=True)
+    agent._trajectory = (
+        (Action(name="run", args=RunArgs(command="ls")), RawEnvOutput(exit_code=0)),
+    )
+
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
+
+    assert llm.thinking_overrides == [None, False]
+    recovery = _string_contents(llm.calls[1])
+    assert any(core.REASONING_RUNAWAY_REPAIR_PROMPT in text for text in recovery)
+    assert all(core.MISSING_TOOL_CALL_REPAIR_PROMPT not in text for text in recovery)
+
+
 def test_llm_agent_aborts_after_repeated_length_cutoffs():
     llm = _StubLlm(
         [

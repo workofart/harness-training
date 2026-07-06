@@ -93,6 +93,12 @@ INVALID_TOOL_CALL_REPAIR_PROMPT = (
     "Emit a corrected JSON tool call this turn."
 )
 
+REASONING_RUNAWAY_REPAIR_PROMPT = (
+    "Your previous response reached the output length limit while still "
+    "reasoning, before it emitted any tool call. Stop reasoning now and reply "
+    "with a single, concise tool call and no other text."
+)
+
 OVERSIZED_CALL_REPAIR_PROMPT = (
     "Your last tool call was cut off at the output length limit before its JSON "
     "finished, so its arguments could not be parsed -- the call is too large, not "
@@ -517,6 +523,13 @@ class LlmAgent:
                             raise RepeatedLengthCutoffError(
                                 "repeated length-truncated model outputs"
                             ) from exc
+                        if step_index > 1 and self.thinking_toggleable:
+                            enable_thinking = False
+                            self._thinking_disabled = True
+                            turn_messages = (
+                                ActionParser.reasoning_runaway_repair_messages()
+                            )
+                            continue
                     elif self._thinking_disabled or not self.thinking_toggleable:
                         if self._seen_oversized_call_cutoff and attempt_index == 0:
                             turn_messages = (
@@ -1024,6 +1037,10 @@ class ActionParser:
     @staticmethod
     def oversized_call_repair_messages() -> list[dict[str, Any]]:
         return [{"role": "user", "content": OVERSIZED_CALL_REPAIR_PROMPT}]
+
+    @staticmethod
+    def reasoning_runaway_repair_messages() -> list[dict[str, Any]]:
+        return [{"role": "user", "content": REASONING_RUNAWAY_REPAIR_PROMPT}]
 
     @classmethod
     def repair_messages(
