@@ -71,13 +71,17 @@ _TRUNCATED_ARGS_LENGTH_CUTOFF = Completion(
 def test_build_tool_specs_cover_action_space_and_embed_pydantic_schemas() -> None:
     by_name = {s["function"]["name"]: s for s in build_tool_specs()}
 
-    assert set(by_name) == set(TOOLS) == {
-        "read",
-        "replace",
-        "run",
-        "submit",
-        "write",
-    }
+    assert (
+        set(by_name)
+        == set(TOOLS)
+        == {
+            "read",
+            "replace",
+            "run",
+            "submit",
+            "write",
+        }
+    )
     assert by_name["run"]["function"]["parameters"] == RunArgs.model_json_schema()
     assert by_name["submit"]["function"]["parameters"] == SubmitArgs.model_json_schema()
     assert by_name["read"]["function"]["parameters"] == ReadArgs.model_json_schema()
@@ -212,9 +216,7 @@ def test_write_command_appends_existing_file(tmp_path: Path) -> None:
     target.write_text("first\n")
 
     append = _run_shell(
-        build_write_command(
-            WriteArgs(path="mod.py", content="second\n", append=True)
-        ),
+        build_write_command(WriteArgs(path="mod.py", content="second\n", append=True)),
         tmp_path,
     )
 
@@ -938,9 +940,33 @@ def test_action_parser_validate_args_drops_empty_tool_name_artifact_key():
     assert ActionParser.validate_args("run", args) == RunArgs(command="pwd")
 
 
-def test_action_parser_validate_args_keeps_ordinary_empty_unknown_key_strict():
-    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        ActionParser.validate_args("run", {"command": "pwd", "extra": ""})
+def test_action_parser_validate_args_salvages_ordinary_unknown_key():
+    assert ActionParser.validate_args(
+        "run", {"command": "pwd", "extra": ""}
+    ) == RunArgs(command="pwd")
+
+
+def test_action_parser_validate_args_salvages_unknown_key():
+    assert ActionParser.validate_args(
+        "run", {"command": "pwd", "extra": "boom"}
+    ) == RunArgs(command="pwd")
+
+
+def test_action_parser_validate_args_salvage_preserves_other_valid_fields():
+    assert ActionParser.validate_args(
+        "run", {"command": "pwd", "timeout_sec": "120", "path": "/app/x.py"}
+    ) == RunArgs(command="pwd", timeout_sec=120)
+
+
+def test_action_parser_validate_args_fails_if_pruning_leaves_call_broken():
+    with pytest.raises(ValueError, match="Field required"):
+        ActionParser.validate_args("run", {"path": "/app/x.py"})
+
+
+def test_action_parser_validate_args_no_op_on_well_formed_call():
+    assert ActionParser.validate_args(
+        "run", {"command": "pwd", "timeout_sec": 5}
+    ) == RunArgs(command="pwd", timeout_sec=5)
 
 
 def _unoffered_read_completion() -> Completion:
@@ -996,14 +1022,14 @@ def test_action_parser_actions_rejects_single_empty_invalid_call():
         )
 
 
-def test_action_parser_actions_rejects_nonempty_invalid_call_with_valid_sibling():
-    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+def test_action_parser_actions_rejects_unsalvageable_call_with_valid_sibling():
+    with pytest.raises(ValueError, match="Input should be a valid integer"):
         ActionParser.actions(
             Completion(
                 tool_calls=(
                     ToolCall(
                         name="run",
-                        arguments=json.dumps({"command": "pwd", "extra": "boom"}),
+                        arguments=json.dumps({"command": "pwd", "timeout_sec": "soon"}),
                     ),
                     _tool_call("run", command="ls"),
                 )

@@ -928,9 +928,15 @@ class ActionParser:
     def validate_args(cls, action_name: ActionName, args: Any) -> ToolArgs:
         if not isinstance(args, dict):
             raise ValueError(f"{action_name}: arguments must decode to an object")
-        return TOOLS[action_name].args_model.model_validate(
-            cls._drop_empty_artifact_args(action_name, args)
-        )
+        model = TOOLS[action_name].args_model
+        prepared = cls._drop_empty_artifact_args(action_name, args)
+        try:
+            return model.model_validate(prepared)
+        except ValidationError as exc:
+            pruned = cls._without_unexpected_fields(prepared, exc)
+            if pruned is None:
+                raise
+            return model.model_validate(pruned)
 
     @classmethod
     def _drop_empty_artifact_args(
@@ -946,6 +952,19 @@ class ActionParser:
     @staticmethod
     def _is_empty_artifact_arg(action_name: ActionName, key: str, value: Any) -> bool:
         return value == "" and (key == action_name or "</parameter" in key)
+
+    @staticmethod
+    def _without_unexpected_fields(
+        args: dict[str, Any], exc: ValidationError
+    ) -> dict[str, Any] | None:
+        unexpected = {
+            str(error["loc"][0])
+            for error in exc.errors()
+            if error.get("type") == "extra_forbidden" and error.get("loc")
+        }
+        if not unexpected:
+            return None
+        return {key: value for key, value in args.items() if key not in unexpected}
 
     @classmethod
     def action(cls, name: str, arguments: str) -> Action:
