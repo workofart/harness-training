@@ -1243,6 +1243,24 @@ def test_llm_agent_keeps_output_budget_and_drops_thinking_on_truncated_args():
     assert llm.thinking_overrides == [None, False]
 
 
+def test_llm_agent_thinking_on_oversized_cutoff_gets_cause_accurate_repair():
+    truncated_write = Completion(
+        tool_calls=(
+            ToolCall(name="write", arguments='{"path": "/f", "content": "xxxx'),
+        ),
+        finish_reason="length",
+    )
+    llm = _StubLlm([truncated_write, _SUBMIT_COMPLETION])
+    agent = _agent(llm, thinking_toggleable=True)
+
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
+
+    assert llm.thinking_overrides == [None, False]
+    repair = _string_contents(llm.calls[1])
+    assert any(core.OVERSIZED_CALL_REPAIR_PROMPT in text for text in repair)
+    assert all("Your previous tool call was invalid" not in text for text in repair)
+
+
 def test_llm_agent_breaks_early_when_truncated_tool_call_recurs_thinking_off():
     # A repeated cutoff with thinking already off cannot improve deterministically.
     llm = _StubLlm([_TRUNCATED_ARGS_LENGTH_CUTOFF] * 3)

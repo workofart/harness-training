@@ -538,6 +538,11 @@ class LlmAgent:
                             continue
                         self._seen_oversized_call_cutoff = True
                         break
+                    else:
+                        enable_thinking = False
+                        self._thinking_disabled = True
+                        turn_messages = ActionParser.oversized_call_repair_messages()
+                        continue
                     if self.thinking_toggleable:
                         enable_thinking = False
                         self._thinking_disabled = True
