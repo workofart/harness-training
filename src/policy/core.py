@@ -18,7 +18,10 @@ Substrate code stays mechanism-free; rollout ownership lives in
 
 from __future__ import annotations
 
+import base64
+import inspect
 import json
+import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, TypeAlias, cast
@@ -58,10 +61,13 @@ def build_system_prompt() -> str:
         [
             "You are controlling a coding environment.",
             "Use run to execute shell commands in the environment.",
+            "Use read to view file contents.",
+            "run output is scratch: editing a file inside a `python` snippet or a here-doc that only prints does NOT persist your fix.",
             f"Each run command is terminated after its timeout_sec (default {COMMAND_TIMEOUT_SEC}s) and returns the output captured so far.",
             "Observation text may mask volatile tokens as <TIME>, <PID>, <BINARY_STDOUT>, and similar placeholders; treat them as framework redactions of unstable runtime data.",
+            "To change a file on disk, call write (create or overwrite a whole file) or replace (one exact old_text edit in an existing file); the on-disk state at submit is the only thing graded.",
             "Return one or more tool calls. They execute in order with no intermediate observation, then the resulting observation appears in the next turn.",
-            "Call submit when the solution is ready for the authoritative task judgment; submit ends the trial and the on-disk state of the environment at that point is what is graded.",
+            "Call submit when the solution is ready for the authoritative task judgment; submit ends the trial.",
         ]
     )
 
@@ -94,7 +100,7 @@ CONTEXT_OMITTED_NOTE_TEMPLATE = (
 # §2 Action space and tools
 
 COMMAND_TIMEOUT_SEC = 300
-ActionName: TypeAlias = Literal["run", "submit"]
+ActionName: TypeAlias = Literal["run", "submit", "replace", "read", "write"]
 
 
 class ToolArgs(BaseModel):
@@ -135,6 +141,117 @@ class RunArgs(ToolArgs):
     )
 
 
+FILE_TOOL_TIMEOUT_SEC = 30
+
+
+class ReadArgs(ToolArgs):
+    path: str = Field(
+        min_length=1,
+        description="File to read; relative paths resolve against the task working directory.",
+    )
+    offset: int = Field(
+        default=1,
+        ge=1,
+        description="1-based line number to start reading from.",
+    )
+    limit: int = Field(
+        default=250,
+        ge=1,
+        le=2000,
+        description="Maximum number of lines to return.",
+    )
+
+
+def build_read_command(args: ReadArgs) -> str:
+    qpath = shlex.quote(args.path)
+    end = args.offset + args.limit - 1
+    return (
+        f"sed -n '{args.offset},{end}p' < {qpath} && "
+        f"printf '(read: lines {args.offset}-{end}; file has %s lines total)\\n' "
+        f'"$(($(wc -l < {qpath})))"'
+    )
+
+
+class WriteArgs(ToolArgs):
+    path: str = Field(
+        min_length=1,
+        description=(
+            "File to create or overwrite; relative paths resolve against the task "
+            "working directory. Parent directories are created."
+        ),
+    )
+    content: str = Field(
+        description="Full file content, written to disk exactly as given."
+    )
+
+
+def build_write_command(args: WriteArgs) -> str:
+    qpath = shlex.quote(args.path)
+    blob = base64.b64encode(args.content.encode("utf-8")).decode("ascii")
+    return (
+        f'mkdir -p -- "$(dirname -- {qpath})" && '
+        f"printf '%s' '{blob}' | base64 -d > {qpath} && "
+        f"printf 'write: wrote %s bytes to %s\\n' \"$(($(wc -c < {qpath})))\" {qpath}"
+    )
+
+
+class ReplaceArgs(ToolArgs):
+    path: str = Field(
+        min_length=1,
+        description="File to edit; relative paths resolve against the task working directory.",
+    )
+    old_text: str = Field(
+        min_length=1,
+        description=(
+            "Exact existing text to replace, whitespace and indentation included; "
+            "must occur exactly once in the file."
+        ),
+    )
+    new_text: str = Field(description="Replacement text written in old_text's place.")
+
+
+def _replace_once(path, old_text, new_text):
+    import os
+    import sys
+
+    if not os.path.exists(path):
+        raise SystemExit("replace: file not found: " + path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    count = text.count(old_text)
+    if count == 0:
+        raise SystemExit("replace: old_text not found in " + path)
+    if count > 1:
+        raise SystemExit(
+            "replace: old_text matches %d locations in %s; extend old_text with "
+            "surrounding lines to make it unique" % (count, path)
+        )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text.replace(old_text, new_text, 1))
+    sys.stdout.write("replace: updated " + path + "\n")
+
+
+_REPLACE_SRC = inspect.getsource(_replace_once)
+
+
+def build_replace_command(args: ReplaceArgs) -> str:
+    payload = tuple(
+        base64.b64encode(text.encode("utf-8")).decode("ascii")
+        for text in (args.path, args.old_text, args.new_text)
+    )
+    script = _REPLACE_SRC + (
+        "\nimport base64\n"
+        "_replace_once(*[base64.b64decode(a).decode('utf-8') for a in (%r, %r, %r)])\n"
+        % payload
+    )
+    blob = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    inner = "import base64;exec(base64.b64decode('" + blob + "').decode())"
+    return (
+        'PYBIN=python3; command -v "$PYBIN" >/dev/null 2>&1 || PYBIN=python; '
+        '"$PYBIN" -c "' + inner + '"'
+    )
+
+
 class SubmitArgs(ToolArgs):
     pass
 
@@ -147,6 +264,46 @@ TOOLS: dict[ActionName, Tool] = {
             command=args.command,
             cwd=args.cwd,
             timeout_sec=args.timeout_sec,
+        ),
+    ),
+    "replace": Tool(
+        description=(
+            "Persist a code change to disk by replacing text in one file. "
+            "`old_text` must match the file exactly (whitespace and indentation "
+            "included) and occur exactly once; the call fails loudly when it is "
+            "missing or ambiguous -- extend old_text with surrounding lines to "
+            "disambiguate. To edit several places, return several replace calls."
+        ),
+        args_model=ReplaceArgs,
+        to_run=lambda args: RunAction(
+            command=build_replace_command(args),
+            cwd=None,
+            timeout_sec=FILE_TOOL_TIMEOUT_SEC,
+        ),
+    ),
+    "read": Tool(
+        description=(
+            "Read a window of one file as plain text. Defaults to the first 250 "
+            "lines; page through longer files with offset/limit."
+        ),
+        args_model=ReadArgs,
+        to_run=lambda args: RunAction(
+            command=build_read_command(args),
+            cwd=None,
+            timeout_sec=FILE_TOOL_TIMEOUT_SEC,
+        ),
+    ),
+    "write": Tool(
+        description=(
+            "Create or overwrite one file on disk with the given content (parent "
+            "directories are created). For a small targeted edit to an existing "
+            "file, prefer replace."
+        ),
+        args_model=WriteArgs,
+        to_run=lambda args: RunAction(
+            command=build_write_command(args),
+            cwd=None,
+            timeout_sec=FILE_TOOL_TIMEOUT_SEC,
         ),
     ),
     SUBMIT_ACTION_NAME: Tool(
@@ -444,8 +601,34 @@ def build_policy(
     )
 
 
-# Candidate interventions use these seams without changing the loop or trace contract.
-REMINDER_RULES: tuple[ReminderRule, ...] = ()
+# The agent cannot see the committed 110-step cap. This threshold is above every
+# currently-solved submit, so it only nudges trials otherwise likely to exhaust it.
+LATE_RUN_SUBMIT_REMINDER_STEP = 100
+
+
+def _late_run_submit_reminder(
+    _agent: "LlmAgent", step_index: int
+) -> list[dict[str, Any]]:
+    if step_index < LATE_RUN_SUBMIT_REMINDER_STEP:
+        return []
+    return [
+        {
+            "role": "user",
+            "content": (
+                "You are in the final steps of this run, which ends automatically very "
+                "soon. Only the files on disk at the moment you call submit are graded; "
+                "running more commands or re-checking a fix you already made does not "
+                "improve that grade. If your fix is already written to disk, call submit "
+                "now. Otherwise make your single most important remaining edit and then "
+                "submit -- a run that ends without a submit scores nothing."
+            ),
+        }
+    ]
+
+
+REMINDER_RULES: tuple[ReminderRule, ...] = (
+    ReminderRule(name="late_run_submit", build=_late_run_submit_reminder),
+)
 ACTION_GUARDS: tuple[ActionGuard, ...] = ()
 
 

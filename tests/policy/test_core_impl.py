@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -23,6 +24,7 @@ from src.env.base import (
 from src.env.base import StepResult
 from src.policy import core
 from src.policy.core import (
+    FILE_TOOL_TIMEOUT_SEC,
     TOOLS,
     Action,
     ActionGuard,
@@ -31,15 +33,21 @@ from src.policy.core import (
     FailedStep,
     LlmAgent,
     NoValidActionError,
+    ReadArgs,
     ReminderRule,
+    ReplaceArgs,
     RepeatedLengthCutoffError,
     RunArgs,
     SubmitArgs,
     Trajectory,
+    WriteArgs,
     _ContextWindow,
     _RequestBuilder,
     build_env_action,
+    build_read_command,
+    build_replace_command,
     build_tool_specs,
+    build_write_command,
 )
 from src.llm.backend import (
     Completion,
@@ -63,9 +71,24 @@ _TRUNCATED_ARGS_LENGTH_CUTOFF = Completion(
 def test_build_tool_specs_cover_action_space_and_embed_pydantic_schemas() -> None:
     by_name = {s["function"]["name"]: s for s in build_tool_specs()}
 
-    assert set(by_name) == set(TOOLS) == {"run", "submit"}
+    assert (
+        set(by_name)
+        == set(TOOLS)
+        == {
+            "run",
+            "submit",
+            "replace",
+            "read",
+            "write",
+        }
+    )
     assert by_name["run"]["function"]["parameters"] == RunArgs.model_json_schema()
     assert by_name["submit"]["function"]["parameters"] == SubmitArgs.model_json_schema()
+    assert (
+        by_name["replace"]["function"]["parameters"] == ReplaceArgs.model_json_schema()
+    )
+    assert by_name["read"]["function"]["parameters"] == ReadArgs.model_json_schema()
+    assert by_name["write"]["function"]["parameters"] == WriteArgs.model_json_schema()
     assert by_name["run"]["function"]["parameters"]["required"] == ["command"]
     assert by_name["run"]["function"]["parameters"]["additionalProperties"] is False
     assert RunArgs(command="pytest").timeout_sec == COMMAND_TIMEOUT_SEC
@@ -83,6 +106,93 @@ def test_build_env_action_passes_through_run_fields() -> None:
     assert build_env_action(action) == RunAction(
         command="pytest", cwd="/repo", timeout_sec=31
     )
+
+
+def test_build_env_action_renders_file_tools_as_bounded_runs() -> None:
+    replace = ReplaceArgs(path="pkg/mod.py", old_text="old", new_text="new")
+    read = ReadArgs(path="pkg/mod.py", offset=10, limit=20)
+    write = WriteArgs(path="pkg/new.py", content="content\n")
+
+    assert build_env_action(Action(name="replace", args=replace)) == RunAction(
+        command=build_replace_command(replace),
+        timeout_sec=FILE_TOOL_TIMEOUT_SEC,
+    )
+    assert build_env_action(Action(name="read", args=read)) == RunAction(
+        command=build_read_command(read),
+        timeout_sec=FILE_TOOL_TIMEOUT_SEC,
+    )
+    assert build_env_action(Action(name="write", args=write)) == RunAction(
+        command=build_write_command(write),
+        timeout_sec=FILE_TOOL_TIMEOUT_SEC,
+    )
+
+
+def test_replace_and_write_commands_persist_exact_content(tmp_path: Path) -> None:
+    target = tmp_path / "pkg" / "mod.py"
+    target.parent.mkdir()
+    target.write_text("before\n", encoding="utf-8")
+
+    replace = subprocess.run(
+        build_replace_command(
+            ReplaceArgs(path="pkg/mod.py", old_text="before\n", new_text="after\n")
+        ),
+        shell=True,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    write = subprocess.run(
+        build_write_command(WriteArgs(path="pkg/new.py", content="a'$`\\b\n")),
+        shell=True,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert replace.returncode == 0, replace.stderr
+    assert write.returncode == 0, write.stderr
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert (tmp_path / "pkg" / "new.py").read_text(encoding="utf-8") == "a'$`\\b\n"
+
+
+def test_read_command_returns_requested_window_and_total(tmp_path: Path) -> None:
+    target = tmp_path / "quoted file.py"
+    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+    read = subprocess.run(
+        build_read_command(ReadArgs(path=target.name, offset=2, limit=2)),
+        shell=True,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert read.returncode == 0, read.stderr
+    assert read.stdout == "two\nthree\n(read: lines 2-3; file has 4 lines total)\n"
+
+
+@pytest.mark.parametrize(
+    ("old_text", "error"),
+    [("absent\n", "not found"), ("same\n", "2 locations")],
+)
+def test_replace_failure_is_atomic(tmp_path: Path, old_text: str, error: str) -> None:
+    target = tmp_path / "mod.py"
+    original = "same\nmiddle\nsame\n"
+    target.write_text(original, encoding="utf-8")
+
+    replace = subprocess.run(
+        build_replace_command(
+            ReplaceArgs(path=target.name, old_text=old_text, new_text="changed\n")
+        ),
+        shell=True,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert replace.returncode != 0
+    assert error in replace.stderr
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_build_env_action_rejects_submit():
@@ -1104,6 +1214,8 @@ def test_reminder_rules_trace_all_evaluations_and_inject_first_hit(
 def test_action_guards_trace_and_apply_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(core, "REMINDER_RULES", ())
+
     def passthrough(
         _agent: LlmAgent, actions: tuple[Action, ...]
     ) -> tuple[Action, ...]:
@@ -1152,7 +1264,11 @@ def test_action_guard_failure_is_not_repaired_as_model_output(
     assert len(llm.calls) == 1
 
 
-def test_policy_event_failure_propagates_without_model_output_repair() -> None:
+def test_policy_event_failure_propagates_without_model_output_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(core, "REMINDER_RULES", ())
+
     def broken_events(_event: str, **_fields: Any) -> None:
         raise RuntimeError("event callback bug")
 
@@ -1165,8 +1281,47 @@ def test_policy_event_failure_propagates_without_model_output_repair() -> None:
     assert len(llm.calls) == 1
 
 
+def _agent_at_step(
+    llm: CompletionBackend,
+    step_index: int,
+    events: Any = core.NOOP_AGENT_CALLBACK,
+) -> LlmAgent:
+    agent = _agent(llm, events=events)
+    filler = (
+        Action(name="run", args=RunArgs(command="true")),
+        RawEnvOutput(exit_code=0),
+    )
+    agent._trajectory = (filler,) * (step_index - 1)
+    return agent
+
+
+def test_shipped_late_submit_reminder_is_silent_before_final_band() -> None:
+    step_index = core.LATE_RUN_SUBMIT_REMINDER_STEP - 1
+    events = _RecordingEvents()
+    llm = _StubLlm([_SUBMIT_COMPLETION])
+    agent = _agent_at_step(llm, step_index, cast(Any, events))
+
+    asyncio.run(agent.act())
+
+    assert llm.calls[-1][-1]["role"] == "tool"
+    assert ("late_run_submit", False) in _rule_events(events)
+
+
+def test_shipped_late_submit_reminder_fires_at_final_band() -> None:
+    step_index = core.LATE_RUN_SUBMIT_REMINDER_STEP
+    events = _RecordingEvents()
+    llm = _StubLlm([_SUBMIT_COMPLETION])
+    agent = _agent_at_step(llm, step_index, cast(Any, events))
+
+    asyncio.run(agent.act())
+
+    assert llm.calls[-1][-1]["role"] == "user"
+    assert "submit" in llm.calls[-1][-1]["content"].lower()
+    assert ("late_run_submit", True) in _rule_events(events)
+
+
 def test_late_edited_trajectory_preserves_model_action() -> None:
-    assert core.REMINDER_RULES == ()
+    assert [rule.name for rule in core.REMINDER_RULES] == ["late_run_submit"]
     assert core.ACTION_GUARDS == ()
     llm = _StubLlm([_completion(_tool_call("run", command="ls"))])
     agent = _agent(llm)
