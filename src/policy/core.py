@@ -93,6 +93,15 @@ INVALID_TOOL_CALL_REPAIR_PROMPT = (
     "Emit a corrected JSON tool call this turn."
 )
 
+OVERSIZED_CALL_REPAIR_PROMPT = (
+    "Your last tool call was cut off at the output length limit before its JSON "
+    "finished, so its arguments could not be parsed -- the call is too large, not "
+    "malformed. Send a smaller call now: put no prose before the tool call, and to "
+    "write a large file split it across write calls (a first write, then write with "
+    "append=true) or have a script generate it instead of pasting the whole file "
+    "inline."
+)
+
 CONTEXT_OMITTED_NOTE_TEMPLATE = (
     "[{dropped} earlier step(s) omitted to fit the context window; "
     "continue from the steps below.]"
@@ -407,12 +416,14 @@ class LlmAgent:
     # Prevent one thinking runaway from recurring later in the rollout.
     _thinking_disabled: bool = field(init=False, default=False)
     _length_cutoff_missing_tool_calls: int = field(init=False, default=0)
+    _seen_oversized_call_cutoff: bool = field(init=False, default=False)
 
     def reset(self, raw_env_output: RawEnvOutput) -> None:
         self._initial_env_output = raw_env_output
         self._trajectory = ()
         self._thinking_disabled = False
         self._length_cutoff_missing_tool_calls = 0
+        self._seen_oversized_call_cutoff = False
         self._tools = build_tool_specs()
         self._request_builder = _RequestBuilder(
             token_counter=self.token_counter,
@@ -507,8 +518,12 @@ class LlmAgent:
                                 "repeated length-truncated model outputs"
                             ) from exc
                     elif self._thinking_disabled or not self.thinking_toggleable:
-                        # With thinking already off, length cutoff is payload
-                        # overflow; deterministic retries will match, so stop.
+                        if self._seen_oversized_call_cutoff and attempt_index == 0:
+                            turn_messages = (
+                                ActionParser.oversized_call_repair_messages()
+                            )
+                            continue
+                        self._seen_oversized_call_cutoff = True
                         break
                     if self.thinking_toggleable:
                         enable_thinking = False
@@ -1005,6 +1020,10 @@ class ActionParser:
     @staticmethod
     def _is_empty_invalid_call(call: ToolCall) -> bool:
         return call.name in TOOLS and call.arguments.strip() in {"", "{}"}
+
+    @staticmethod
+    def oversized_call_repair_messages() -> list[dict[str, Any]]:
+        return [{"role": "user", "content": OVERSIZED_CALL_REPAIR_PROMPT}]
 
     @classmethod
     def repair_messages(

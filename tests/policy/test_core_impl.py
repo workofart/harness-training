@@ -1223,6 +1223,41 @@ def test_llm_agent_non_toggleable_length_cutoff_stops_without_thinking_override(
     assert llm.thinking_overrides == [None]
 
 
+def test_llm_agent_first_oversized_cutoff_aborts_without_repair():
+    llm = _StubLlm([_TRUNCATED_ARGS_LENGTH_CUTOFF])
+    agent = _agent(llm)
+
+    with pytest.raises(NoValidActionError):
+        asyncio.run(agent.act())
+
+    assert len(llm.calls) == 1
+    assert all(
+        core.OVERSIZED_CALL_REPAIR_PROMPT not in content
+        for content in _string_contents(llm.calls[0])
+    )
+
+
+def test_llm_agent_repairs_oversized_call_after_later_recurrence():
+    llm = _StubLlm(
+        [
+            _TRUNCATED_ARGS_LENGTH_CUTOFF,
+            _TRUNCATED_ARGS_LENGTH_CUTOFF,
+            _SUBMIT_COMPLETION,
+        ]
+    )
+    agent = _agent(llm)
+
+    with pytest.raises(NoValidActionError):
+        asyncio.run(agent.act())
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
+
+    assert len(llm.calls) == 3
+    assert any(
+        core.OVERSIZED_CALL_REPAIR_PROMPT in content
+        for content in _string_contents(llm.calls[2])
+    )
+
+
 def test_llm_agent_retries_on_invalid_json_and_appends_correction():
     llm = _StubLlm(
         [
