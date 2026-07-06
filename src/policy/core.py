@@ -401,8 +401,8 @@ class ActionGuard:
 
 @dataclass(slots=True)
 class LlmAgent:
-    # Two full-budget truncations mean structural failure, observed as missing calls.
-    LENGTH_CUTOFF_ABORT_THRESHOLD: ClassVar[int] = 2
+    # Leave the cause-accurate recovery steer one attempt before aborting.
+    LENGTH_CUTOFF_ABORT_THRESHOLD: ClassVar[int] = 3
 
     llm: CompletionBackend
     max_context_length: int

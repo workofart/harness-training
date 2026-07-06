@@ -1196,13 +1196,13 @@ def test_llm_agent_later_step_runaway_gets_cause_accurate_steer():
     assert all(core.MISSING_TOOL_CALL_REPAIR_PROMPT not in text for text in recovery)
 
 
-def test_llm_agent_aborts_after_repeated_length_cutoffs():
+def test_llm_agent_aborts_after_third_length_cutoff():
     llm = _StubLlm(
         [
             Completion(content="runaway reasoning", finish_reason="length"),
             _completion(_tool_call("run", command="pwd")),
             Completion(content="runaway again", finish_reason="length"),
-            _SUBMIT_COMPLETION,
+            Completion(content="runaway still", finish_reason="length"),
         ]
     )
     agent = _agent(llm)
@@ -1213,7 +1213,24 @@ def test_llm_agent_aborts_after_repeated_length_cutoffs():
     with pytest.raises(RepeatedLengthCutoffError, match="length"):
         asyncio.run(agent.act())
 
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 4
+
+
+def test_llm_agent_second_nonconsecutive_runaway_gets_steer_before_abort():
+    llm = _StubLlm([Completion(finish_reason="length"), _SUBMIT_COMPLETION])
+    agent = _agent(llm, thinking_toggleable=True)
+    agent._length_cutoff_missing_tool_calls = 1
+    agent._thinking_disabled = True
+    agent._trajectory = (
+        (Action(name="run", args=RunArgs(command="ls")), RawEnvOutput(exit_code=0)),
+    )
+
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
+
+    assert any(
+        core.REASONING_RUNAWAY_REPAIR_PROMPT in text
+        for text in _string_contents(llm.calls[1])
+    )
 
 
 def test_llm_agent_keeps_output_budget_and_drops_thinking_on_truncated_args():

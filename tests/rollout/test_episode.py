@@ -399,6 +399,7 @@ _LOOP_END_CASES = {
             Completion(content="runaway reasoning", finish_reason="length"),
             _completion(_tool_call("run", command="pwd")),
             Completion(content="runaway again", finish_reason="length"),
+            Completion(content="runaway still", finish_reason="length"),
         ],
         {"max_steps": 10, "max_completion_tokens": 8192},
         (
@@ -411,6 +412,8 @@ _LOOP_END_CASES = {
                 "action_parse_failed",
                 "completion_received",
                 "step_completed",
+                "completion_received",
+                "action_parse_failed",
                 "completion_received",
                 "action_parse_failed",
             ],
