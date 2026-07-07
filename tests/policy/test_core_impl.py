@@ -1366,6 +1366,99 @@ def test_git_state_guard_replaces_mutation_after_edit(command: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("path", "root"),
+    [
+        ("test_repro/bar.py", "test_repro"),
+        ("docs/sample/_build/html/index.html", "docs/sample/_build"),
+        ("test_genindex/_buildclean/file.png", "test_genindex/_buildclean"),
+        ("pkg/_build.py", None),
+        ("tests/test_repro_case.py", None),
+    ],
+)
+def test_generated_artifact_root_classification(path: str, root: str | None) -> None:
+    assert core._generated_artifact_root(path) == root
+
+
+def test_generated_artifact_cleanup_removes_only_added_artifacts(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    source = tmp_path / "source.py"
+    source.write_text("keep\n", encoding="utf-8")
+    artifact = tmp_path / "test_repro" / "scratch.py"
+    artifact.parent.mkdir()
+    artifact.write_text("remove\n", encoding="utf-8")
+
+    cleanup = subprocess.run(
+        core.GENERATED_ARTIFACT_CLEANUP_COMMAND,
+        shell=True,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert source.read_text(encoding="utf-8") == "keep\n"
+    assert not artifact.parent.exists()
+
+
+def test_generated_artifact_cleanup_composes_with_forced_finalize() -> None:
+    trajectory: Trajectory = (
+        _edit_step("sphinx/util/docfields.py"),
+        _run_step("sphinx-build -b html test_issue test_issue/_build/html"),
+        *(_run_step() for _ in range(core.FORCED_FINALIZE_STEP - 3)),
+    )
+    agent = _agent_with_trajectory(trajectory)
+    forced = core._forced_finalize_guard(
+        agent, (Action(name="run", args=RunArgs(command="pytest")),)
+    )
+
+    assert core._generated_artifact_cleanup_guard(agent, forced) == (
+        Action(
+            name="run",
+            args=RunArgs(
+                command=core.GENERATED_ARTIFACT_CLEANUP_COMMAND, timeout_sec=30
+            ),
+        ),
+        Action(name="submit", args=SubmitArgs()),
+    )
+
+
+def test_generated_artifact_cleanup_fires_once_and_only_for_single_submit() -> None:
+    touched: Trajectory = (
+        _edit_step("pkg/a.py"),
+        _run_step("mkdir -p test_repro && touch test_repro/bar.py"),
+    )
+    agent = _agent_with_trajectory(touched)
+    multi = (Action(name="run", args=RunArgs(command="pytest")), *_SUBMIT_ACTIONS)
+
+    assert core._generated_artifact_cleanup_guard(agent, multi) is multi
+    untouched = _agent_with_trajectory(
+        (_edit_step("pkg/a.py"), _run_step("pytest tests/test_a.py"))
+    )
+    assert (
+        core._generated_artifact_cleanup_guard(untouched, _SUBMIT_ACTIONS)
+        is _SUBMIT_ACTIONS
+    )
+
+    cleaned = _agent_with_trajectory(
+        (*touched, _run_step(core.GENERATED_ARTIFACT_CLEANUP_COMMAND))
+    )
+    assert (
+        core._generated_artifact_cleanup_guard(cleaned, _SUBMIT_ACTIONS)
+        is _SUBMIT_ACTIONS
+    )
+
+    too_late = _agent_with_trajectory(
+        (*touched, *(_run_step() for _ in range(core.FORCED_FINALIZE_STEP - 1)))
+    )
+    assert (
+        core._generated_artifact_cleanup_guard(too_late, _SUBMIT_ACTIONS)
+        is _SUBMIT_ACTIONS
+    )
+
+
 def test_multifile_submit_review_delays_first_midrun_submit_once() -> None:
     trajectory: Trajectory = (
         _edit_step("pkg/a.py"),
@@ -1535,6 +1628,7 @@ def test_late_edited_trajectory_preserves_model_action() -> None:
         "git_state_guard",
         "multifile_submit_review",
         "forced_finalize",
+        "generated_artifact_cleanup",
     ]
     llm = _StubLlm([_completion(_tool_call("run", command="ls"))])
     agent = _agent(llm)

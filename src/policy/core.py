@@ -676,6 +676,61 @@ GIT_STATE_GUARD_COMMAND = (
     "git diff --stat --; "
     "git diff --check --"
 )
+GENERATED_ARTIFACT_CLEANUP_COMMAND = (
+    'PYBIN=python3; command -v "$PYBIN" >/dev/null 2>&1 || PYBIN=python; '
+    "\"$PYBIN\" - <<'PY'\n"
+    "import os\n"
+    "import shutil\n"
+    "import subprocess\n"
+    "\n"
+    "def artifact_root(path):\n"
+    "    parts = [part for part in path.replace('\\\\', '/').split('/') if part]\n"
+    "    for index, part in enumerate(parts):\n"
+    "        is_build = part.startswith('_build') and '.' not in part\n"
+    "        if part == 'test_repro' or is_build:\n"
+    "            return '/'.join(parts[: index + 1])\n"
+    "    return None\n"
+    "\n"
+    "def git_z(args):\n"
+    "    proc = subprocess.run(\n"
+    "        args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL\n"
+    "    )\n"
+    "    if proc.returncode != 0:\n"
+    "        return []\n"
+    "    return [p.decode() for p in proc.stdout.split(b'\\0') if p]\n"
+    "\n"
+    "paths = set(git_z(('git', 'ls-files', '--others', '--exclude-standard', '-z')))\n"
+    "paths.update(\n"
+    "    git_z(('git', 'diff', '--name-only', '--diff-filter=A', '-z', '--'))\n"
+    ")\n"
+    "targets = sorted(path for path in paths if artifact_root(path))\n"
+    "roots = sorted({artifact_root(path) for path in targets})\n"
+    "for path in sorted(targets, reverse=True):\n"
+    "    if os.path.isdir(path) and not os.path.islink(path):\n"
+    "        shutil.rmtree(path, ignore_errors=True)\n"
+    "    else:\n"
+    "        try:\n"
+    "            os.remove(path)\n"
+    "        except FileNotFoundError:\n"
+    "            pass\n"
+    "for root in sorted(roots, reverse=True):\n"
+    "    subprocess.run(\n"
+    "        ('git', 'reset', '-q', '--', root),\n"
+    "        stdout=subprocess.DEVNULL,\n"
+    "        stderr=subprocess.DEVNULL,\n"
+    "    )\n"
+    "    for current, dirnames, filenames in os.walk(root, topdown=False):\n"
+    "        if not dirnames and not filenames:\n"
+    "            try:\n"
+    "                os.rmdir(current)\n"
+    "            except OSError:\n"
+    "                pass\n"
+    "message = ', '.join(roots) if roots else 'nothing to remove'\n"
+    "print('generated artifact cleanup: ' + message)\n"
+    "PY\n"
+    "git diff --stat --; "
+    "git diff --check --"
+)
 GIT_STATE_MUTATION_MARKERS = (
     "git stash",
     "git checkout --",
@@ -707,6 +762,50 @@ def _persisted_edit_paths(trajectory: Trajectory) -> frozenset[str]:
 
 def _trajectory_has_persisted_edit(trajectory: Trajectory) -> bool:
     return bool(_persisted_edit_paths(trajectory))
+
+
+def _generated_artifact_root(path: str) -> str | None:
+    parts = [part for part in path.replace("\\", "/").split("/") if part]
+    for index, part in enumerate(parts):
+        if part == "test_repro" or (part.startswith("_build") and "." not in part):
+            return "/".join(parts[: index + 1])
+    return None
+
+
+def _action_touches_generated_artifacts(action: "Action") -> bool:
+    if action.name == "run":
+        command = cast(RunArgs, action.args).command
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            words = command.split()
+        return any(_generated_artifact_root(word) for word in words)
+    return any(
+        _generated_artifact_root(path) for path in _edit_paths_in_actions((action,))
+    )
+
+
+def _trajectory_touches_generated_artifacts(trajectory: Trajectory) -> bool:
+    for step in trajectory:
+        if isinstance(step, FailedStep):
+            continue
+        action, _ = step
+        if _action_touches_generated_artifacts(action):
+            return True
+    return False
+
+
+def _trajectory_has_generated_artifact_cleanup(trajectory: Trajectory) -> bool:
+    for step in trajectory:
+        if isinstance(step, FailedStep):
+            continue
+        action, _ = step
+        if (
+            action.name == "run"
+            and cast(RunArgs, action.args).command == GENERATED_ARTIFACT_CLEANUP_COMMAND
+        ):
+            return True
+    return False
 
 
 def _trajectory_has_multifile_submit_review(trajectory: Trajectory) -> bool:
@@ -782,10 +881,32 @@ def _forced_finalize_guard(
     return (Action(name=SUBMIT_ACTION_NAME, args=SubmitArgs()),)
 
 
+def _generated_artifact_cleanup_guard(
+    agent: "LlmAgent", actions: tuple["Action", ...]
+) -> tuple["Action", ...]:
+    step_index = len(agent._trajectory) + 1
+    if step_index > FORCED_FINALIZE_STEP:
+        return actions
+    if len(actions) != 1 or actions[0].name != SUBMIT_ACTION_NAME:
+        return actions
+    if _trajectory_has_generated_artifact_cleanup(agent._trajectory):
+        return actions
+    if not _trajectory_touches_generated_artifacts(agent._trajectory):
+        return actions
+    cleanup = Action(
+        name="run",
+        args=RunArgs(command=GENERATED_ARTIFACT_CLEANUP_COMMAND, timeout_sec=30),
+    )
+    return cleanup, actions[0]
+
+
 ACTION_GUARDS: tuple[ActionGuard, ...] = (
     ActionGuard(name="git_state_guard", apply=_git_state_guard),
     ActionGuard(name="multifile_submit_review", apply=_multifile_submit_review_guard),
     ActionGuard(name="forced_finalize", apply=_forced_finalize_guard),
+    ActionGuard(
+        name="generated_artifact_cleanup", apply=_generated_artifact_cleanup_guard
+    ),
 )
 
 
