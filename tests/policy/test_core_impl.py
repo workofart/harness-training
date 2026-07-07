@@ -1330,6 +1330,42 @@ def _trajectory_of_length(length: int, *, with_edit: bool) -> Trajectory:
     return tuple(steps[:length])
 
 
+def test_git_state_guard_is_noop_before_edit_and_allows_inspection() -> None:
+    mutation = (Action(name="run", args=RunArgs(command="git stash")),)
+    inspection = (Action(name="run", args=RunArgs(command="git diff --stat --")),)
+
+    assert (
+        core._git_state_guard(_agent_with_trajectory((_run_step(),)), mutation)
+        is mutation
+    )
+    assert (
+        core._git_state_guard(_agent_with_trajectory((_edit_step(),)), inspection)
+        is inspection
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd /testbed && git stash && pytest",
+        "cd /testbed && git stash pop",
+        "git checkout -- package/module.py",
+        "git restore package/module.py",
+        "git reset --hard HEAD",
+        "git clean -fd",
+    ],
+)
+def test_git_state_guard_replaces_mutation_after_edit(command: str) -> None:
+    actions = (Action(name="run", args=RunArgs(command=command)),)
+
+    assert core._git_state_guard(_agent_with_trajectory((_edit_step(),)), actions) == (
+        Action(
+            name="run",
+            args=RunArgs(command=core.GIT_STATE_GUARD_COMMAND, timeout_sec=30),
+        ),
+    )
+
+
 def test_multifile_submit_review_delays_first_midrun_submit_once() -> None:
     trajectory: Trajectory = (
         _edit_step("pkg/a.py"),
@@ -1496,6 +1532,7 @@ def test_late_edited_trajectory_preserves_model_action() -> None:
         "no_edit_progress",
     ]
     assert [guard.name for guard in core.ACTION_GUARDS] == [
+        "git_state_guard",
         "multifile_submit_review",
         "forced_finalize",
     ]

@@ -669,6 +669,20 @@ MULTIFILE_SUBMIT_REVIEW_COMMAND = (
     "git diff --stat --; "
     "git diff --check --"
 )
+GIT_STATE_GUARD_COMMAND = (
+    "printf '%s\\n' 'git state mutation skipped: an edit is already on disk.'; "
+    "printf '%s\\n' 'Keep the working tree patch in place; inspect it with git diff "
+    "or read, run tests against the edited tree, then submit when ready.'; "
+    "git diff --stat --; "
+    "git diff --check --"
+)
+GIT_STATE_MUTATION_MARKERS = (
+    "git stash",
+    "git checkout --",
+    "git restore",
+    "git reset --hard",
+    "git clean",
+)
 
 
 def _edit_paths_in_actions(actions: tuple["Action", ...]) -> frozenset[str]:
@@ -706,6 +720,29 @@ def _trajectory_has_multifile_submit_review(trajectory: Trajectory) -> bool:
         ):
             return True
     return False
+
+
+def _is_git_state_mutation(action: "Action") -> bool:
+    if action.name != "run":
+        return False
+    command = cast(RunArgs, action.args).command
+    return any(marker in command for marker in GIT_STATE_MUTATION_MARKERS)
+
+
+def _git_state_guard(
+    agent: "LlmAgent", actions: tuple["Action", ...]
+) -> tuple["Action", ...]:
+    if not _trajectory_has_persisted_edit(agent._trajectory):
+        return actions
+    if not any(_is_git_state_mutation(action) for action in actions):
+        return actions
+    guard = Action(
+        name="run",
+        args=RunArgs(command=GIT_STATE_GUARD_COMMAND, timeout_sec=30),
+    )
+    return tuple(
+        guard if _is_git_state_mutation(action) else action for action in actions
+    )
 
 
 def _multifile_submit_review_guard(
@@ -746,6 +783,7 @@ def _forced_finalize_guard(
 
 
 ACTION_GUARDS: tuple[ActionGuard, ...] = (
+    ActionGuard(name="git_state_guard", apply=_git_state_guard),
     ActionGuard(name="multifile_submit_review", apply=_multifile_submit_review_guard),
     ActionGuard(name="forced_finalize", apply=_forced_finalize_guard),
 )
