@@ -1297,11 +1297,13 @@ def _agent_at_step(
     events: Any = core.NOOP_AGENT_CALLBACK,
 ) -> LlmAgent:
     agent = _agent(llm, events=events)
-    filler = (
+    run_filler = (
         Action(name="run", args=RunArgs(command="true")),
         RawEnvOutput(exit_code=0),
     )
-    agent._trajectory = (filler,) * (step_index - 1)
+    steps: list[Any] = [_edit_step()] if step_index >= 2 else []
+    steps += [run_filler] * (step_index - 1 - len(steps))
+    agent._trajectory = tuple(steps)
     return agent
 
 
@@ -1362,6 +1364,35 @@ def test_forced_finalize_preserves_existing_submit_and_skips_failed_steps() -> N
     )
 
 
+def test_no_edit_reminder_uses_progress_band_and_persisted_edit_state() -> None:
+    empty = _agent_with_trajectory(
+        _trajectory_of_length(core.NO_EDIT_REMINDER_STEP - 1, with_edit=False)
+    )
+    edited = _agent_with_trajectory(
+        _trajectory_of_length(core.NO_EDIT_REMINDER_STEP - 1, with_edit=True)
+    )
+
+    messages = core._no_edit_reminder(empty, core.NO_EDIT_REMINDER_STEP)
+    assert messages and messages[0]["role"] == "user"
+    body = messages[0]["content"].lower()
+    assert "write" in body and "replace" in body and "disk" in body
+    assert core._no_edit_reminder(empty, core.NO_EDIT_REMINDER_STEP - 1) == []
+    assert core._no_edit_reminder(edited, core.NO_EDIT_REMINDER_STEP) == []
+    assert core._no_edit_reminder(empty, core.LATE_RUN_SUBMIT_REMINDER_STEP) == []
+
+
+def test_no_edit_reminder_ignores_failed_steps_when_finding_an_edit() -> None:
+    agent = _agent_with_trajectory(
+        (
+            _edit_step(),
+            FailedStep(attempts=3, error="missing tool call"),
+            *(_run_step() for _ in range(core.NO_EDIT_REMINDER_STEP)),
+        )
+    )
+
+    assert core._no_edit_reminder(agent, core.NO_EDIT_REMINDER_STEP) == []
+
+
 def test_shipped_late_submit_reminder_is_silent_before_final_band() -> None:
     step_index = core.LATE_RUN_SUBMIT_REMINDER_STEP - 1
     events = _RecordingEvents()
@@ -1388,7 +1419,10 @@ def test_shipped_late_submit_reminder_fires_at_final_band() -> None:
 
 
 def test_late_edited_trajectory_preserves_model_action() -> None:
-    assert [rule.name for rule in core.REMINDER_RULES] == ["late_run_submit"]
+    assert [rule.name for rule in core.REMINDER_RULES] == [
+        "late_run_submit",
+        "no_edit_progress",
+    ]
     assert [guard.name for guard in core.ACTION_GUARDS] == ["forced_finalize"]
     llm = _StubLlm([_completion(_tool_call("run", command="ls"))])
     agent = _agent(llm)

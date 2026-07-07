@@ -628,8 +628,34 @@ def _late_run_submit_reminder(
     ]
 
 
+NO_EDIT_REMINDER_STEP = 70
+
+
+def _no_edit_reminder(agent: "LlmAgent", step_index: int) -> list[dict[str, Any]]:
+    if not (NO_EDIT_REMINDER_STEP <= step_index < LATE_RUN_SUBMIT_REMINDER_STEP):
+        return []
+    if _trajectory_has_persisted_edit(agent._trajectory):
+        return []
+    return [
+        {
+            "role": "user",
+            "content": (
+                "You have taken many steps without writing any change to a file on disk. "
+                "Only the on-disk state when you call submit is graded -- exploring, "
+                "reproducing, or running commands does not by itself change any file, and "
+                "a run that ends with no edit on disk scores nothing. If you have already "
+                "identified the fix, apply it now with write or replace. If you have not, "
+                "stop broadening the investigation and narrow in on the exact file and "
+                "lines to change, leaving yourself enough remaining steps to verify the "
+                "edit before this run ends."
+            ),
+        }
+    ]
+
+
 REMINDER_RULES: tuple[ReminderRule, ...] = (
     ReminderRule(name="late_run_submit", build=_late_run_submit_reminder),
+    ReminderRule(name="no_edit_progress", build=_no_edit_reminder),
 )
 
 # Last-resort compulsion inside the 110-step horizon. It only preserves an
