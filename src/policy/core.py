@@ -738,6 +738,9 @@ GIT_STATE_MUTATION_MARKERS = (
     "git reset --hard",
     "git clean",
 )
+PYTEST_TAIL_PIPE = "| tail"
+PYTEST_PIPEFAIL_PREFIX = "bash -o pipefail -c "
+SHELL_COMMAND_SEPARATORS = {"&&", "||", ";"}
 
 
 def _edit_paths_in_actions(actions: tuple["Action", ...]) -> frozenset[str]:
@@ -821,6 +824,67 @@ def _trajectory_has_multifile_submit_review(trajectory: Trajectory) -> bool:
     return False
 
 
+def _is_pytest_tail_pipeline(command: str) -> bool:
+    if PYTEST_TAIL_PIPE not in command or "pipefail" in command:
+        return False
+    segments = command.split("|")
+    return any(
+        segment.lstrip().startswith("tail")
+        and _segment_invokes_pytest(segments[index - 1])
+        for index, segment in enumerate(segments[1:], start=1)
+    )
+
+
+def _segment_invokes_pytest(segment: str) -> bool:
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        words = segment.split()
+    return any(
+        (
+            _word_starts_command(words, index)
+            and (word == "pytest" or word.endswith("/pytest"))
+        )
+        or (
+            _word_starts_command(words, index)
+            and word.rsplit("/", 1)[-1] in {"python", "python3"}
+            and words[index + 1 : index + 3] == ["-m", "pytest"]
+        )
+        for index, word in enumerate(words)
+    )
+
+
+def _word_starts_command(words: list[str], index: int) -> bool:
+    return index == 0 or words[index - 1] in SHELL_COMMAND_SEPARATORS
+
+
+def _pytest_tail_pipefail_guard(
+    _agent: "LlmAgent", actions: tuple["Action", ...]
+) -> tuple["Action", ...]:
+    guarded: list[Action] = []
+    changed = False
+    for action in actions:
+        if action.name != "run":
+            guarded.append(action)
+            continue
+        args = cast(RunArgs, action.args)
+        if not _is_pytest_tail_pipeline(args.command):
+            guarded.append(action)
+            continue
+        guarded.append(
+            Action(
+                name="run",
+                args=RunArgs(
+                    command=PYTEST_PIPEFAIL_PREFIX + shlex.quote(args.command),
+                    cwd=args.cwd,
+                    timeout_sec=args.timeout_sec,
+                ),
+            )
+        )
+        changed = True
+    return tuple(guarded) if changed else actions
+
+
 def _is_git_state_mutation(action: "Action") -> bool:
     if action.name != "run":
         return False
@@ -901,6 +965,7 @@ def _generated_artifact_cleanup_guard(
 
 
 ACTION_GUARDS: tuple[ActionGuard, ...] = (
+    ActionGuard(name="pytest_tail_pipefail", apply=_pytest_tail_pipefail_guard),
     ActionGuard(name="git_state_guard", apply=_git_state_guard),
     ActionGuard(name="multifile_submit_review", apply=_multifile_submit_review_guard),
     ActionGuard(name="forced_finalize", apply=_forced_finalize_guard),

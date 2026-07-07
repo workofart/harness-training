@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import re
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -1330,6 +1331,50 @@ def _trajectory_of_length(length: int, *, with_edit: bool) -> Trajectory:
     return tuple(steps[:length])
 
 
+def test_pytest_tail_pipefail_wraps_pipeline_and_preserves_run_contract() -> None:
+    original = Action(
+        name="run",
+        args=RunArgs(
+            command="cd /testbed && python -m pytest tests -v 2>&1 | tail -40",
+            cwd="/work",
+            timeout_sec=77,
+        ),
+    )
+
+    assert core._pytest_tail_pipefail_guard(
+        _agent_with_trajectory((_run_step(),)), (original,)
+    ) == (
+        Action(
+            name="run",
+            args=RunArgs(
+                command=core.PYTEST_PIPEFAIL_PREFIX
+                + shlex.quote(cast(RunArgs, original.args).command),
+                cwd="/work",
+                timeout_sec=77,
+            ),
+        ),
+    )
+
+
+def test_pytest_tail_pipefail_avoids_false_positive_and_double_wrap() -> None:
+    actions = (
+        Action(name="run", args=RunArgs(command="python -m pytest tests -q")),
+        Action(name="run", args=RunArgs(command="grep -r pytest . | tail -20")),
+    )
+    wrapped = (
+        Action(
+            name="run",
+            args=RunArgs(
+                command="bash -o pipefail -c 'python -m pytest -q 2>&1 | tail -20'"
+            ),
+        ),
+    )
+    agent = _agent_with_trajectory((_run_step(),))
+
+    assert core._pytest_tail_pipefail_guard(agent, actions) is actions
+    assert core._pytest_tail_pipefail_guard(agent, wrapped) is wrapped
+
+
 def test_git_state_guard_is_noop_before_edit_and_allows_inspection() -> None:
     mutation = (Action(name="run", args=RunArgs(command="git stash")),)
     inspection = (Action(name="run", args=RunArgs(command="git diff --stat --")),)
@@ -1625,6 +1670,7 @@ def test_late_edited_trajectory_preserves_model_action() -> None:
         "no_edit_progress",
     ]
     assert [guard.name for guard in core.ACTION_GUARDS] == [
+        "pytest_tail_pipefail",
         "git_state_guard",
         "multifile_submit_review",
         "forced_finalize",
