@@ -49,7 +49,7 @@ from src.policy.base import (
     NOOP_AGENT_CALLBACK,
     AgentCallback,
     NoValidActionError,
-    RepeatedLengthCutoffError,
+    RepeatedLengthCutoffError as RepeatedLengthCutoffError,
     SUBMIT_ACTION_NAME,
 )
 
@@ -369,8 +369,8 @@ class ActionGuard:
 
 @dataclass(slots=True)
 class LlmAgent:
-    # Two full-budget truncations mean structural failure, observed as missing calls.
-    LENGTH_CUTOFF_ABORT_THRESHOLD: ClassVar[int] = 2
+    # Repeated whole-budget thinking runaways disable thinking for later steps.
+    LENGTH_CUTOFF_THINKING_OFF_THRESHOLD: ClassVar[int] = 2
 
     llm: CompletionBackend
     max_context_length: int
@@ -480,22 +480,24 @@ class LlmAgent:
                     detail=str(exc),
                 )
                 if completion.finish_reason == "length":
+                    # A thinking-off retry will decode identically on deterministic
+                    # endpoints, so stop this step instead of spending another attempt.
+                    if enable_thinking is False:
+                        break
                     if isinstance(exc, MissingToolCall):
                         self._length_cutoff_missing_tool_calls += 1
                         if (
                             self._length_cutoff_missing_tool_calls
-                            >= self.LENGTH_CUTOFF_ABORT_THRESHOLD
+                            >= self.LENGTH_CUTOFF_THINKING_OFF_THRESHOLD
+                            and self.thinking_toggleable
                         ):
-                            raise RepeatedLengthCutoffError(
-                                "repeated length-truncated model outputs"
-                            ) from exc
-                    elif self._thinking_disabled or not self.thinking_toggleable:
-                        # With thinking already off, length cutoff is payload
-                        # overflow; deterministic retries will match, so stop.
+                            self._thinking_disabled = True
+                    elif not self.thinking_toggleable:
                         break
                     if self.thinking_toggleable:
+                        # One runaway only affects this step; repeated missing calls
+                        # arm the rollout-wide breaker above.
                         enable_thinking = False
-                        self._thinking_disabled = True
                 turn_messages = ActionParser.repair_messages(completion, exc)
             else:
                 return self._guard_actions(actions, step_index=step_index)

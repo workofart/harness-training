@@ -394,28 +394,6 @@ _LOOP_END_CASES = {
             * 2,
         ),
     ),
-    "repeated-length-cutoff": (
-        [
-            Completion(content="runaway reasoning", finish_reason="length"),
-            _completion(_tool_call("run", command="pwd")),
-            Completion(content="runaway again", finish_reason="length"),
-        ],
-        {"max_steps": 10, "max_completion_tokens": 8192},
-        (
-            "no_valid_action",
-            "repeated length-truncated model outputs",
-            {"steps_used": 1},
-            ["pwd"],
-            [
-                "completion_received",
-                "action_parse_failed",
-                "completion_received",
-                "step_completed",
-                "completion_received",
-                "action_parse_failed",
-            ],
-        ),
-    ),
     # Real work before the final invalid turn still exhausts the work budget.
     "work-then-invalid-turn": (
         [
@@ -491,6 +469,46 @@ def test_provider_rejected_first_attempt_counts_as_invalid(tmp_path: Path) -> No
         if row["event"] == "completion_received"
     ]
     assert (received["step_index"], received["attempt_index"]) == (1, 1)
+
+
+def test_run_rollout_degrades_repeated_length_cutoff_and_can_still_grade(
+    tmp_path: Path,
+) -> None:
+    telemetry = _telemetry(tmp_path)
+    llm = _FakeLlm(
+        [
+            Completion(content="runaway reasoning", finish_reason="length"),
+            _completion(_tool_call("run", command="pwd")),
+            Completion(content="runaway again", finish_reason="length"),
+            _completion(_tool_call("submit")),
+        ]
+    )
+    env = _FakeEnv()
+
+    result = _run_rollout(
+        tmp_path,
+        llm,
+        env,
+        config=_rollout_config(max_steps=10, max_completion_tokens=8192),
+        telemetry=telemetry,
+    )
+
+    assert result.failure_mode == "solved"
+    assert result.error is None
+    assert result.metrics["steps_used"] == 2
+    assert env.exec_calls == ["pwd"]
+    assert env.verify_calls == 1
+    _assert_closed(env, llm)
+    assert _trace_events(telemetry.trace_path) == [
+        "completion_received",
+        "action_parse_failed",
+        "completion_received",
+        "step_completed",
+        "completion_received",
+        "action_parse_failed",
+        "completion_received",
+        "step_completed",
+    ]
 
 
 def test_completion_step_labels_track_loop_steps_across_failed_turns(

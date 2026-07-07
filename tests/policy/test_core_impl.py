@@ -990,7 +990,7 @@ def test_llm_agent_retries_on_missing_tool_call_and_appends_repair_prompt():
     assert llm.thinking_overrides == [None, None]
 
 
-def test_llm_agent_drops_thinking_for_rest_of_rollout_after_truncated_output():
+def test_llm_agent_recovers_thinking_after_one_truncated_output():
     llm = _StubLlm(
         [
             Completion(finish_reason="length"),
@@ -1007,14 +1007,14 @@ def test_llm_agent_drops_thinking_for_rest_of_rollout_after_truncated_output():
     assert llm.thinking_overrides == [None, False]
 
     asyncio.run(agent.act())
-    assert llm.thinking_overrides == [None, False, False]
+    assert llm.thinking_overrides == [None, False, None]
 
     agent.reset(RawEnvOutput(instruction="do", working_dir="/w"))
     asyncio.run(agent.act())
-    assert llm.thinking_overrides == [None, False, False, None]
+    assert llm.thinking_overrides == [None, False, None, None]
 
 
-def test_llm_agent_aborts_after_repeated_length_cutoffs():
+def test_llm_agent_degrades_after_repeated_length_cutoffs_without_aborting():
     llm = _StubLlm(
         [
             Completion(content="runaway reasoning", finish_reason="length"),
@@ -1023,15 +1023,23 @@ def test_llm_agent_aborts_after_repeated_length_cutoffs():
             _SUBMIT_COMPLETION,
         ]
     )
-    agent = _agent(llm)
+    agent = _agent(llm, thinking_toggleable=True)
 
     assert asyncio.run(agent.act()) == (
         Action(name="run", args=RunArgs(command="pwd")),
     )
-    with pytest.raises(RepeatedLengthCutoffError, match="length"):
-        asyncio.run(agent.act())
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
 
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 4
+    assert llm.thinking_overrides == [None, False, None, False]
+
+    llm._completions.append(_SUBMIT_COMPLETION)
+    assert asyncio.run(agent.act()) == _SUBMIT_ACTIONS
+    assert llm.thinking_overrides[-1] is False
+
+
+def test_repeated_length_cutoff_error_remains_importable() -> None:
+    assert issubclass(RepeatedLengthCutoffError, Exception)
 
 
 def test_llm_agent_keeps_output_budget_and_drops_thinking_on_truncated_args():
