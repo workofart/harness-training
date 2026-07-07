@@ -661,16 +661,75 @@ REMINDER_RULES: tuple[ReminderRule, ...] = (
 # Last-resort compulsion inside the 110-step horizon. It only preserves an
 # existing on-disk edit; trials with nothing to grade remain untouched.
 FORCED_FINALIZE_STEP = 109
+MULTIFILE_SUBMIT_REVIEW_STEP = 60
+MULTIFILE_SUBMIT_REVIEW_COMMAND = (
+    "printf '%s\\n' 'pre-submit review: first submit for a multi-file patch.'; "
+    "printf '%s\\n' 'Keep the production diff minimal; do not rely on test-only "
+    "changes, broad shared-code edits, or unrelated cleanup to make the grade pass.'; "
+    "git diff --stat --; "
+    "git diff --check --"
+)
 
 
-def _trajectory_has_persisted_edit(trajectory: Trajectory) -> bool:
+def _edit_paths_in_actions(actions: tuple["Action", ...]) -> frozenset[str]:
+    paths: set[str] = set()
+    for action in actions:
+        if action.name == "write":
+            paths.add(cast(WriteArgs, action.args).path)
+        elif action.name == "replace":
+            paths.add(cast(ReplaceArgs, action.args).path)
+    return frozenset(paths)
+
+
+def _persisted_edit_paths(trajectory: Trajectory) -> frozenset[str]:
+    paths: set[str] = set()
     for step in trajectory:
         if isinstance(step, FailedStep):
             continue
         action, _ = step
-        if action.name in ("write", "replace"):
+        paths.update(_edit_paths_in_actions((action,)))
+    return frozenset(paths)
+
+
+def _trajectory_has_persisted_edit(trajectory: Trajectory) -> bool:
+    return bool(_persisted_edit_paths(trajectory))
+
+
+def _trajectory_has_multifile_submit_review(trajectory: Trajectory) -> bool:
+    for step in trajectory:
+        if isinstance(step, FailedStep):
+            continue
+        action, _ = step
+        if (
+            action.name == "run"
+            and cast(RunArgs, action.args).command == MULTIFILE_SUBMIT_REVIEW_COMMAND
+        ):
             return True
     return False
+
+
+def _multifile_submit_review_guard(
+    agent: "LlmAgent", actions: tuple["Action", ...]
+) -> tuple["Action", ...]:
+    step_index = len(agent._trajectory) + 1
+    if not (MULTIFILE_SUBMIT_REVIEW_STEP <= step_index < LATE_RUN_SUBMIT_REMINDER_STEP):
+        return actions
+    if not any(action.name == SUBMIT_ACTION_NAME for action in actions):
+        return actions
+    if _trajectory_has_multifile_submit_review(agent._trajectory):
+        return actions
+    edit_paths = _persisted_edit_paths(agent._trajectory) | _edit_paths_in_actions(
+        actions
+    )
+    if len(edit_paths) < 2:
+        return actions
+    review = Action(
+        name="run",
+        args=RunArgs(command=MULTIFILE_SUBMIT_REVIEW_COMMAND, timeout_sec=30),
+    )
+    return tuple(
+        review if action.name == SUBMIT_ACTION_NAME else action for action in actions
+    )
 
 
 def _forced_finalize_guard(
@@ -687,6 +746,7 @@ def _forced_finalize_guard(
 
 
 ACTION_GUARDS: tuple[ActionGuard, ...] = (
+    ActionGuard(name="multifile_submit_review", apply=_multifile_submit_review_guard),
     ActionGuard(name="forced_finalize", apply=_forced_finalize_guard),
 )
 

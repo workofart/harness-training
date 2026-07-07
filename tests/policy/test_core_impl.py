@@ -1330,6 +1330,78 @@ def _trajectory_of_length(length: int, *, with_edit: bool) -> Trajectory:
     return tuple(steps[:length])
 
 
+def test_multifile_submit_review_delays_first_midrun_submit_once() -> None:
+    trajectory: Trajectory = (
+        _edit_step("pkg/a.py"),
+        _edit_step("pkg/b.py"),
+        *(_run_step() for _ in range(core.MULTIFILE_SUBMIT_REVIEW_STEP - 3)),
+    )
+    agent = _agent_with_trajectory(trajectory)
+
+    assert core._multifile_submit_review_guard(agent, _SUBMIT_ACTIONS) == (
+        Action(
+            name="run",
+            args=RunArgs(command=core.MULTIFILE_SUBMIT_REVIEW_COMMAND, timeout_sec=30),
+        ),
+    )
+
+    reviewed = _agent_with_trajectory(
+        (*trajectory, _run_step(core.MULTIFILE_SUBMIT_REVIEW_COMMAND))
+    )
+    assert (
+        core._multifile_submit_review_guard(reviewed, _SUBMIT_ACTIONS)
+        is _SUBMIT_ACTIONS
+    )
+
+
+def test_multifile_submit_review_counts_current_batch_edit() -> None:
+    trajectory: Trajectory = (
+        _edit_step("pkg/a.py"),
+        *(_run_step() for _ in range(core.MULTIFILE_SUBMIT_REVIEW_STEP - 2)),
+    )
+    edit = Action(
+        name="replace",
+        args=ReplaceArgs(path="pkg/b.py", old_text="a", new_text="b"),
+    )
+    submit = Action(name="submit", args=SubmitArgs())
+
+    assert core._multifile_submit_review_guard(
+        _agent_with_trajectory(trajectory), (edit, submit)
+    ) == (
+        edit,
+        Action(
+            name="run",
+            args=RunArgs(command=core.MULTIFILE_SUBMIT_REVIEW_COMMAND, timeout_sec=30),
+        ),
+    )
+
+
+def test_multifile_submit_review_requires_two_paths_and_midrun_band() -> None:
+    single_path: Trajectory = (
+        _edit_step("pkg/a.py"),
+        _edit_step("pkg/a.py"),
+        *(_run_step() for _ in range(core.MULTIFILE_SUBMIT_REVIEW_STEP - 3)),
+    )
+    late: Trajectory = (
+        _edit_step("pkg/a.py"),
+        _edit_step("pkg/b.py"),
+        *(_run_step() for _ in range(core.LATE_RUN_SUBMIT_REMINDER_STEP - 3)),
+    )
+
+    assert (
+        core._multifile_submit_review_guard(
+            _agent_with_trajectory(single_path), _SUBMIT_ACTIONS
+        )
+        is _SUBMIT_ACTIONS
+    )
+    assert (
+        core._multifile_submit_review_guard(
+            _agent_with_trajectory(late), _SUBMIT_ACTIONS
+        )
+        is _SUBMIT_ACTIONS
+    )
+
+
 def test_forced_finalize_compels_submit_at_cap_only_after_persisted_edit() -> None:
     actions = (Action(name="run", args=RunArgs(command="pytest")),)
     before = _agent_with_trajectory(
@@ -1423,7 +1495,10 @@ def test_late_edited_trajectory_preserves_model_action() -> None:
         "late_run_submit",
         "no_edit_progress",
     ]
-    assert [guard.name for guard in core.ACTION_GUARDS] == ["forced_finalize"]
+    assert [guard.name for guard in core.ACTION_GUARDS] == [
+        "multifile_submit_review",
+        "forced_finalize",
+    ]
     llm = _StubLlm([_completion(_tool_call("run", command="ls"))])
     agent = _agent(llm)
     agent._trajectory = tuple(
