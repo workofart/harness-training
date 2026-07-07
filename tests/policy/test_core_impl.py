@@ -1179,6 +1179,8 @@ def test_llm_agent_observe_replays_action_raw_env_output_history():
 def test_reminder_rules_trace_all_evaluations_and_inject_first_hit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(core, "ACTION_GUARDS", ())
+
     def silent(_agent: LlmAgent, _step_index: int) -> list[dict[str, Any]]:
         return []
 
@@ -1295,6 +1297,63 @@ def _agent_at_step(
     return agent
 
 
+def _agent_with_trajectory(trajectory: Trajectory) -> LlmAgent:
+    agent = _agent(_StubLlm([]))
+    agent._trajectory = trajectory
+    return agent
+
+
+def _run_step(command: str = "true") -> tuple[Action, RawEnvOutput]:
+    return Action(name="run", args=RunArgs(command=command)), RawEnvOutput(exit_code=0)
+
+
+def _edit_step(path: str = "m.py") -> tuple[Action, RawEnvOutput]:
+    return (
+        Action(name="replace", args=ReplaceArgs(path=path, old_text="a", new_text="b")),
+        RawEnvOutput(exit_code=0),
+    )
+
+
+def _trajectory_of_length(length: int, *, with_edit: bool) -> Trajectory:
+    steps = [_edit_step() if with_edit else _run_step()]
+    steps += [_run_step() for _ in range(length - 1)]
+    return tuple(steps[:length])
+
+
+def test_forced_finalize_compels_submit_at_cap_only_after_persisted_edit() -> None:
+    actions = (Action(name="run", args=RunArgs(command="pytest")),)
+    before = _agent_with_trajectory(
+        _trajectory_of_length(core.FORCED_FINALIZE_STEP - 2, with_edit=True)
+    )
+    at_cap = _agent_with_trajectory(
+        _trajectory_of_length(core.FORCED_FINALIZE_STEP - 1, with_edit=True)
+    )
+    no_edit = _agent_with_trajectory(
+        _trajectory_of_length(core.FORCED_FINALIZE_STEP - 1, with_edit=False)
+    )
+
+    assert core._forced_finalize_guard(before, actions) is actions
+    assert core._forced_finalize_guard(at_cap, actions) == _SUBMIT_ACTIONS
+    assert core._forced_finalize_guard(no_edit, actions) is actions
+
+
+def test_forced_finalize_preserves_existing_submit_and_skips_failed_steps() -> None:
+    trajectory: Trajectory = (
+        _edit_step(),
+        FailedStep(attempts=3, error="missing tool call"),
+        *(_run_step() for _ in range(core.FORCED_FINALIZE_STEP - 3)),
+    )
+    agent = _agent_with_trajectory(trajectory)
+
+    assert core._forced_finalize_guard(agent, _SUBMIT_ACTIONS) is _SUBMIT_ACTIONS
+    assert (
+        core._forced_finalize_guard(
+            agent, (Action(name="run", args=RunArgs(command="pytest")),)
+        )
+        == _SUBMIT_ACTIONS
+    )
+
+
 def test_shipped_late_submit_reminder_is_silent_before_final_band() -> None:
     step_index = core.LATE_RUN_SUBMIT_REMINDER_STEP - 1
     events = _RecordingEvents()
@@ -1322,7 +1381,7 @@ def test_shipped_late_submit_reminder_fires_at_final_band() -> None:
 
 def test_late_edited_trajectory_preserves_model_action() -> None:
     assert [rule.name for rule in core.REMINDER_RULES] == ["late_run_submit"]
-    assert core.ACTION_GUARDS == ()
+    assert [guard.name for guard in core.ACTION_GUARDS] == ["forced_finalize"]
     llm = _StubLlm([_completion(_tool_call("run", command="ls"))])
     agent = _agent(llm)
     agent._trajectory = tuple(

@@ -629,7 +629,38 @@ def _late_run_submit_reminder(
 REMINDER_RULES: tuple[ReminderRule, ...] = (
     ReminderRule(name="late_run_submit", build=_late_run_submit_reminder),
 )
-ACTION_GUARDS: tuple[ActionGuard, ...] = ()
+
+# Last-resort compulsion inside the 110-step horizon. It only preserves an
+# existing on-disk edit; trials with nothing to grade remain untouched.
+FORCED_FINALIZE_STEP = 109
+
+
+def _trajectory_has_persisted_edit(trajectory: Trajectory) -> bool:
+    for step in trajectory:
+        if isinstance(step, FailedStep):
+            continue
+        action, _ = step
+        if action.name in ("write", "replace"):
+            return True
+    return False
+
+
+def _forced_finalize_guard(
+    agent: "LlmAgent", actions: tuple["Action", ...]
+) -> tuple["Action", ...]:
+    step_index = len(agent._trajectory) + 1
+    if step_index < FORCED_FINALIZE_STEP:
+        return actions
+    if any(action.name == SUBMIT_ACTION_NAME for action in actions):
+        return actions
+    if not _trajectory_has_persisted_edit(agent._trajectory):
+        return actions
+    return (Action(name=SUBMIT_ACTION_NAME, args=SubmitArgs()),)
+
+
+ACTION_GUARDS: tuple[ActionGuard, ...] = (
+    ActionGuard(name="forced_finalize", apply=_forced_finalize_guard),
+)
 
 
 # §4 Request assembly and context window
