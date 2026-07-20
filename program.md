@@ -1,115 +1,57 @@
 # program.md
 
-Operating policy for the autonomous harness-search loop.
+Operating policy for the harness training loop. Two fresh agents read this file each cycle: the **proposer** owns steps 1-2, the **diagnoser** owns step 4, and the outer-loop driver runs step 3 between them. The driver's prompt says which steps are yours and names the editable files — this file never names them; each step below is written as instructions to its owner, and the other role's steps are context. This is policy, read the in-scope files yourself, and if this file and the code disagree, the code wins.
 
 ## Objective
 
-Improve the harness within the current experiment.
-Treat Harbor tasks as black-box evaluations.
-Increase aggregate solved-task count on the train panel while preserving task-level evidence about improvements and regressions.
+Improve the harness — the editable policy surface your prompt names — so the agent solves more tasks in a given environment over time. Solving more tasks is the goal. When two candidates solve the same set, the driver breaks the tie on secondary signals — progress toward a solve, then a valid tool call on the first try, then fewer steps — so a correct change that does not yet flip a task can still promote. These are tie-breakers, not targets. Make ONE bounded, measurable change per cycle — one mechanism, never several bundled (a bundled win cannot be attributed). A flat result is information, not failure. Make sure to confirm the change's trigger actually fired.
 
-This is a narrow mechanism-search loop, not a broad repo-wide self-improvement loop.
-If this file and code disagree, code is source of truth.
+## What the proposer may edit
 
-## Source-of-truth boundary
+Exactly the files your prompt names: the editable policy surface (a candidate MUST change it) and its companion test file (cover your change). All of the surface is tunable. The measurement-integrity contract is **frozen** and lives outside it. The driver rejects any patch touching any other file, so the boundary is structural, not just a rule. The measurement protocol (task panel, model, step caps, timeouts, rollout count) is committed config: read it, but changing it is a new baseline, the user's job.
 
-Main behavior surface, and the only files you may edit:
+## Reward-safety (non-negotiable)
 
-- `src/harness/core.py` — the harness mechanism
-- `tests/harness/test_core.py` — its contract test
+The verifier/tests are final grading. A candidate must NOT:
 
-The candidate patch must produce a behavioral change in `src/harness/core.py`.
+- run the final verifier mid-solve, or more than once;
+- show verifier output / reward / diagnostics to the solving agent before the score;
+- make failed final verification retryable;
+- depend on hidden tests, verifier internals, task ids, gold patches, or benchmark-specific constants.
 
-Every other file visible in your workspace is read-only context. The measurement
-protocol — the task panels, model/provider, step caps, timeouts, concurrency,
-retry budgets, and trial count — lives in committed config that is **not** in your
-view: you neither see nor edit it. Because the protocol is in the committed tree,
-the supervisor uses the commit hash as its fingerprint; changing the protocol is
-the user's job, not a candidate's.
+Stay task-agnostic: generic state/action/policy only. You may *read* task-specific evidence to diagnose; the change it motivates may not *encode* it.
 
-Do not hand-edit supervisor state. The experiment record
-(`experiments/<id>/experiment.json`), the decision record
-(`experiments/<id>/loop.json`), and git refs are all supervisor-owned. The
-supervisor assigns the `experiment_id`, commits the candidate, manages its refs,
-and launches every run.
+## One cycle (proposer: steps 1-2; driver: step 3; diagnoser: step 4)
+1. **Propose.** Read `experiments/learning.md` and the last run's `experiment.json` plus the traces it points to. If `runs.jsonl` records runs newer than the memo covers, the memo is stale — diagnose those runs from their artifacts yourself (per "Diagnostic principles" below) before trusting its leads. The last run may be a rejected candidate: weigh it against the baseline and recent runs, not in isolation. Then pick ONE bounded change and be able to say which tasks it could convert and why. Use the memo's mechanism ledger to steer the search: prefer an untried mechanism or part of the surface over another variation on a spent one, though revisiting or recombining a flat mechanism is fair game. Before re-targeting anything a recent cycle already targeted, attribute that cycle's failure first (per "Diagnostic principles"); never spend a cycle on a variant of an unattributed rejection — record the finding and pick a different lever.
 
-To name a candidate, write a single-line mechanism label to `.candidate_focus` in
-the workspace root during prelaunch. It is git-excluded — never committed — and is
-how the supervisor captures the candidate's `focus_name`.
+2. **Patch.** Edit the named files; run `uv run python -m pytest` (exactly this form — plain `pytest` imports the wrong checkout in a worktree) and keep the whole suite green before stopping. Your checkout holds every test your change can break; the suite was green before your patch, so any failure is your patch's doing, and since only the named files are editable the fix always goes through them. The driver re-runs the same suite from a trusted checkout and rejects a red candidate. Treat the frozen tests, especially `test_core_contracts.py`, as the machine-checked spec of what your change must preserve. Don't run git — the driver commits once the patch clears the guardrails. Comments state only lasting constraints the code cannot show — never per-cycle evidence (panel statistics, solve-safety proofs, target tasks), which fossilizes and misleads later cycles. Pin no-op guarantees as tests; put panel evidence in your proposal summary for the memo.
 
-## Benchmark protocol boundary
+3. **Driver.** Commits the candidate, runs the repo test suite from a trusted checkout (a red suite rejects the candidate before measurement, with the failing output in the rejection), runs the deterministic experiment against the baseline, and promotes if it solves more tasks with no regression, else if it wins the secondary tie-break; otherwise it rolls back (the rollback lands after Step 4's turn concludes).
 
-Verifier/tests are final grading. Do not:
+4. **Diagnose.** The diagnoser — a *separate* agent from the proposer, in a fresh turn after the run concludes — rewrites `experiments/learning.md`: the deliverable is specced in "The learning memo" below, the method in "Diagnostic principles". Condense, never append, within the driver's line budget. During this turn the candidate's commit is still checked out (`git show HEAD` is its patch); change nothing outside the memo draft.
 
-- run final verifier/tests mid-solve or more than once
-- show verifier output/reward/diagnostics to the agent before score
-- make failed final verification retryable
-- expose/reverse-engineer hidden tests, verifier scripts, or reward logic
+## The learning memo (the diagnoser's deliverable)
 
-Single-step TB/Harbor: agent phase, then one final score. Multi-step: only
-task-declared step checks.
+The memo carries three things, each cited to artifacts and kept revisable:
 
-## Promotion
+- the **current bottleneck** — what stays unsolved across runs, with the causally-attributed reason per blocker;
+- the **mechanism ledger** — one entry per failure mechanism (not per cycle): interventions tried, what each changed and aimed to fix, its attributed result, and status (open / palliated / spent / load-bearing);
+- the **research leads** — the next levers, including recombinations, each with the signal that would confirm it.
 
-A candidate is evaluated against the frozen active baseline on pooled per-trial solves, stratified by task. Per-task two-sided Fisher exact verdicts at alpha = 0.05 are still computed as task-level evidence for diagnosis and self-improvement; they do not directly keep or discard a promotion panel.
+Three further duties:
 
-1. A per-trial infrastructure failure is retried within the trial on a bounded internal budget. If it still fails, the trial concludes as a terminal `crash`, excluded from all evidence, with no effect on the run status or other trials (and it is not re-run). Experiment-level failures still make the run `crash`: setup, task resolution, evaluation, or a run that produced zero valid trials across the whole panel. A baseline run that crashes is not installed; the next `uv run auto` reruns it.
-2. If there is no baseline at the current commit, `uv run auto` first runs all configured tasks as a kept baseline, then starts candidate search.
-3. Otherwise the promotion panel returns `keep` only if both hold; else `discard`:
-   - the stratified solve delta over the train panel is strictly positive (the candidate out-solves each task's own pooled expectation, summed over tasks with trials in both arms — raw pooled rates are confounded by the deterministic-tier single-trial budget);
-   - a one-sided Cochran-Mantel-Haenszel test, stratified by task, is significant at alpha = 0.10.
-   If the frozen baseline has no panel samples at all (a pure frontier), a higher majority-solved task count is the bar instead of the stratified test.
-4. Per-task verdicts (`improvement`, `regression`, `unchanged`, `uncompared`) label task-level evidence for the self-improving agent. They are diagnostic signal, not the promotion trigger. A candidate that still majority-solves a task is never labelled a regression on it (the still-solving floor).
-5. A regression-veto panel runs only after a promotion `keep`; it can only block. It discards iff the candidate's aggregate solved-task count drops below the baseline's.
+- **Friction, not coaching** — for agent-side failures, look for distribution mismatch: places where the model's habitual output collides with what the harness expects (schema strictness, output budget, feedback the model ignores and re-emits against). Quantify each collision in steps lost; prefer removing the collision over coaching around it.
+- **Account for the frontier** — when a rejected run's artifacts prove something the baseline does not (a task demonstrably convertible, a gain the gate discarded), that is a first-class bottleneck entry with its number attached.
+- **Escalate measurement faults** — when artifacts show the measurement itself decided an outcome (infra event scored as regression, cache drift, latency flipping a task), the finding is the measurement fault, written for the user; a policy workaround is the wrong move, and the fault stands until the user changes the protocol.
 
-The candidate is kept only if the promotion panel keeps **and** the veto panel does not block. There is no mean-reward promotion rule. No family-wise correction is applied to diagnostic per-task verdicts.
+## Diagnostic principles (govern Step 4 and any run-reading in Step 1)
 
-## Panel changes
-
-The task panels are fixed by default and are not yours to change. If the user edits
-a panel and commits it, the commit moves, so the active baseline no longer matches
-the current commit and the next `uv run auto` reruns the full configured set as a
-new baseline before candidate search continues.
+- **Artifacts, not labels.** Diagnose from what the agent actually produced, never from failure-mode labels or counts. Many failures emit no error event — read what the task was doing when it ended. A task is substrate-bound only when its diff shows the agent never understood the fix; "unsolved across runs" is not "unsolvable."
+- **Attribute causally before concluding.** For any regression, unconverted task, or solved-to-unsolved flip: diff the candidate's trajectory against the baseline as the agent actually saw it — each trace row's `request_messages` is exactly that rendering — find the first diverging step, and confirm the change's own mechanism fired there. If the mechanism never executed on that task, or the divergence is on an unrelated path, it's an incidental fork (or infra) — record it as "this diff perturbed task X," not as a verdict on the mechanism. A rejection not caused by the mechanism is evidence about the measurement, not the mechanism.
+- **No mechanism is closed by a flat result.** Record flat/negative outcomes as "tried this shape, got this result." The same mechanism may still convert tasks when recombined with another change — recombination toward a global optimum is where later wins often come from.
 
 ## Evidence
 
-Use:
+Read each run's `experiment.json` — and one example task end-to-end — before re-deriving anything from traces. `crash` is infra noise — exclude it; everything else (incl. `no_valid_action`) is a scorable unsolved attempt. `verify_timeout` is unsolved for scoring, but because the grade itself never completed the gate invalidates the run (`invalid_infra`) instead when the verdict would hinge on it.
 
-- task instructions
-- normal command stdout/stderr
-- the remaining wall-clock budget: every environment state carries `time_remaining_sec` (stamped by the executor; `None` means unbounded)
-- `agent/steps.jsonl`
-- `agent/metrics.json`
-- `agent/exec.log`
-- verifier stdout captured in task artifacts
-- the experiment record `experiments/<id>/experiment.json` (run status + per-task trial results)
-- the decision record `experiments/<id>/loop.json` (the gate's keep/discard + per-task verdicts)
-- preserved failed candidate refs (`refs/experiments/failed/<id>`)
-- `experiments/learning.md`
-- repo-local code and git history
-
-Do not use hidden tests, verifier implementation details, or reverse-engineered reward logic.
-
-Diagnosis may read task-specific evidence. Harness code and tests must remain task-agnostic: no hard-coded task ids, dataset/repo names, expected answers, commit hashes, task filenames, README phrases, or benchmark-instance constants. Encode only generic state/action/policy mechanisms.
-
-## Prelaunch Process
-
-1. Read `program.md`, `experiments/learning.md`, and the evidence artifacts the supervisor surfaces.
-2. Review `experiments/learning.md` sections `Current bottleneck`, `Exhausted mechanisms`, and `Research leads`.
-3. Choose one small mechanism-scoped hypothesis that is structurally different from recently discarded candidates. Treat unsolved baseline train tasks as the frontier.
-4. Before changing `src/harness/core.py`, write one neutral lifecycle-contract test in `tests/harness/test_core.py` that fails before the change and passes only for the generic contract.
-5. Write a short mechanism label to `.candidate_focus` in the workspace root.
-6. Run the focused lifecycle-contract test and directly affected tests.
-7. Stop when the candidate is ready for tracked launch. The supervisor commits and launches.
-
-The supervisor enforces every rule above and will reject candidates that violate them.
-
-## Post-Run Diagnosis
-
-1. Read the concluded experiment record (`experiment.json`), its decision record (`loop.json`), the surfaced evidence artifacts, and `experiments/learning.md`.
-2. Use trace evidence (`agent/steps.jsonl`, `agent/metrics.json`) to reason about whether the candidate's mechanism reached its intended state transitions. Start with `metrics.json.rule_fires` (mechanism instrumentation) and `metrics.json.failure_mode` (per-trial terminal-state bucket: `solved | verified_rejected | never_verified | hit_step_cap | hit_timeout | no_valid_action | interrupted | crash`, where `crash` is an infra failure that exhausted internal retries and `interrupted` is a trial stopped from the outside by Ctrl-C or a supervisor restart -- both excluded from evidence).
-3. Root-cause at least one still-unsolved frontier task mechanistically before drawing any frontier conclusion. Read its instruction and the agent's trace; name the exact criterion that failed; decide whether that criterion was stated in, or derivable from, the instruction and the files the task provides; and check whether the agent's own pre-submit validation actually covered it. Separate "the agent could not have known" (the task withheld the information) from "the agent had the information but did not enforce it" (a validation/policy gap a harness mechanism may close). Diagnosis is task-specific and mechanistic; the harness change it motivates stays task-agnostic.
-4. Write the raw per-cycle diagnosis to the `diagnosis.md` path the supervisor gives you (write-only, immutable, one per cycle -- the durable log). Then emit a full rewritten curated memo to the `learning.draft.md` path: the supervisor validates it (non-empty, within the enforced length budget) and atomically swaps it over `experiments/learning.md`; an over-budget draft is rejected and reported. Rewrite and condense; do not append. Record only transferable, generic knowledge: what each mechanism does, why it fired or stayed inert, and durable frontier root-causes from step 3. Do not record per-cycle solve-count deltas or cross-experiment "variance"/"mean-reversion" narration -- each iteration is a different harness, so cross-run rate comparisons are confounded and are not valid signal. An "exhausted"/"closed" claim must cite the evidence behind it and stays revisable, not a permanent rule.
-5. Stop when `diagnosis.md` and a valid `learning.draft.md` are written.
-
-Unexpected blockers should fail normally; the supervisor handles runtime errors.
+Determinism: the model is a deterministic function of its *rendered* input, but the environment is not — a volatile token (timing, seed, address) can slip past the scrubber and fork a trajectory. Before grounding a proposal in a solved-to-unsolved flip, attribute it causally first (per "Diagnostic principles"); a flip whose first diverging step the change's mechanism never touched is not the change's work.

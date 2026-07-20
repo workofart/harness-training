@@ -6,27 +6,35 @@ build-backend = "uv_build"
 name = "harness-experiment"
 description = "An experimental project that explores the possibility of agent-driven self-improving harness."
 version = "0.1.0"
-requires-python = ">=3.13"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Henry (Hanxiang) Pan", email = "hanxiangp@gmail.com" },
+]
+requires-python = ">=3.13,<3.14"
 dependencies = [
   "pydantic==2.12.5",
-  "harbor==0.8.0",
   "httpx==0.28.1",
+  "openai==2.41.1",
+  "docker==7.1.0",
+  "gitpython==3.1.50",
   "python-dotenv==1.2.2",
-  "openrouter==0.9.1",
-  # SWE-bench-Verified substrate (src/env/swe.py): task rows + offline grading.
+  "psutil==7.2.2",
+  # SWE-bench task rows + offline grading.
   "swebench==4.1.0",
   "datasets==4.8.5",
+  "tenacity==9.1.4",
+  "tokenizers==0.23.1",
+  "pyyaml==6.0.3",
 ]
-
-[project.scripts]
-exp = "src.cli:main_exp"
-auto = "src.cli:main_auto"
 
 [dependency-groups]
 dev = [
   "coverage>=7.13.5",
   "pytest>=9.0.2",
   "pytest-cov>=7.1.0",
+  "pytest-xdist>=3.8.0",
   "ruff>=0.13,<0.14",
 ]
 
@@ -39,6 +47,12 @@ exclude-newer = "7 days"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The default run is the fast unit suite; integration tests (real Docker + live
+# network) are opt-in via `pytest -m integration`.
+addopts = "-m 'not integration' -n 4 --dist loadgroup"
+markers = [
+  "integration: needs real Docker and/or live network; excluded from the default unit run",
+]
 norecursedirs = [
   ".git",
   ".venv",
@@ -47,3 +61,21 @@ norecursedirs = [
   "notes",
   "annotations",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["."]
+omit = [
+  "tests/*",
+  ".venv/*",
+  "build/*",
+  "dist/*",
+  ".worktrees/*",
+  "experiments/*",
+  "evals/*",
+  "archived_experiments/*",
+  "tmp/*",
+]
+
+[tool.coverage.report]
+show_missing = true

@@ -1,0 +1,29 @@
+schema_version: 13
+$extends:
+- llm/local.yaml
+environment:
+  kind: terminal_bench
+  task_names:
+  - fix-git
+  - regex-log
+  host_netcache: true
+training_target:
+  module: src.policy.core
+  extra_patch_paths:
+  - tests/policy/test_core_impl.py
+  proposer_visible:
+  - /src/
+  - '!/src/trainer/'
+  - '!/src/**/README.md'
+  - /tests/
+  - '!/tests/trainer/'
+  - '!/tests/test_evaluate.py'
+  - /config/
+  - /program.md
+  - /pyproject.toml
+  - /.gitignore
+max_steps: 50
+max_rollout_concurrency: 2
+agent_timeout_multiplier: 1.5
+plugins:
+  execution: replay # this means to use cache for LLM and Env step execution. See src/plugins/README.md for details

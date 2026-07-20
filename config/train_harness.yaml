@@ -1,0 +1,24 @@
+schema_version: 13
+$extends:
+- llm/qwen35_local.yaml
+environment:
+  $include: task_panels/terminal_bench.yaml
+training_target:
+  module: src.policy.core
+  extra_patch_paths:
+  - tests/policy/test_core_impl.py
+  proposer_visible:
+  - /src/
+  - '!/src/trainer/'
+  - '!/src/**/README.md'
+  - /tests/
+  - '!/tests/trainer/'
+  - '!/tests/test_evaluate.py'
+  - /config/
+  - /program.md
+  - /pyproject.toml
+  - /.gitignore
+max_steps: 1000000
+agent_timeout_multiplier: 1.5
+plugins:
+  execution: replay
