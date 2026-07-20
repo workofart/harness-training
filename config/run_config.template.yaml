@@ -1,0 +1,54 @@
+# Loadable, annotated example config; copy it and edit the fields you need.
+
+schema_version: 13
+
+# LLM/provider settings merge first. Run-config fields are declared directly below.
+$extends:
+- llm/qwen35_local.yaml
+
+# The module selects the policy for training and evaluation. The remaining
+# fields define the training-only candidate patch surface and proposer
+# checkout.
+training_target:
+  module: src.policy.core
+  extra_patch_paths:
+  - tests/policy/test_core_impl.py
+  proposer_visible:
+  - /src/
+  - '!/src/trainer/'
+  - '!/src/**/README.md'
+  - /tests/
+  - '!/tests/trainer/'
+  - '!/tests/test_evaluate.py'
+  - /config/
+  - /program.md
+  - /pyproject.toml
+  - /.gitignore
+
+# Environment = backend + its task panel in one block. Each task-panel
+# fragment carries its own "kind" ("swe" = SWE-bench-Verified instance ids,
+# "terminal_bench" = Terminal-Bench 2.1 task names), so switching benchmarks
+# is this one include. Terminal-Bench host_netcache defaults true and starts
+# the host Docker network-cache services independently of plugins.execution;
+# set it false in the included task-panel file to skip that startup. Examples:
+# - "task_panels/swebench.yaml"
+# - "task_panels/swebench_full.yaml"
+# - "task_panels/terminal_bench.yaml"
+environment:
+  $include: task_panels/swebench.yaml
+
+# Maximum policy/environment steps per task rollout.
+max_steps: 60
+
+# Scale each task's agent wall-clock budget; 1.0 preserves benchmark timing.
+agent_timeout_multiplier: 1.0
+
+# Optional plugins. llm_cache defaults true and caches deterministic provider
+# completions. execution "eager" only disables step/verify replay; it does not
+# disable llm_cache or environment.host_netcache. execution "replay" enables
+# the step/verify caches plus determinism audit and requires host_netcache for
+# Terminal-Bench. To run an eager evaluation without configured caches, set
+# llm_cache false here and host_netcache false in its environment/task panel.
+plugins:
+  llm_cache: true
+  execution: eager

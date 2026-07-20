@@ -1,0 +1,12 @@
+llm_provider_config:
+  model_name: Qwen/Qwen3.5-4B
+  base_url: http://127.0.0.1:8080/v1
+  api_key_env: LOCAL_LLM_API_KEY
+  max_context_length: 32768
+  tokenizer_name: Qwen/Qwen3.5-4B
+  temperature: 1.0
+  top_p: 0.95
+  seed: 12345
+  max_tokens: 8192
+  enable_thinking: true
+  thinking_budget_tokens: 6144

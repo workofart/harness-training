@@ -1,288 +1,200 @@
-"""SWE-bench-Verified `HarnessEnv` adapter.
-
-Wraps one SWE-bench-Verified task in the `HarnessEnv` contract so the existing
-`run_trial` / `run_task_loop` drive it unchanged. Validated as a higher-SNR
-substrate for the self-improving loop (see plan.md "Phase 2 — EXECUTED": a
-char-200 crippled scaffold tanks graded reward by +0.520, p≈5e-7, where Terminal
-Bench showed +0.024 non-significant).
-
-Firewall (one-shot hidden verifier). The instance image has the repo at
-`base_commit` WITHOUT the held-out test_patch (the F2P tests). The agent sees
-only the pre-existing (P2P) tests it may legitimately run. The held-out tests
-are injected by `verify()` (terminal, once) via swebench's `eval_script`, which
-the agent never sees. Containers run `--network none`, so the agent cannot fetch
-the upstream fix, a fixed package version, or the held-out test — the verifier
-stays the single, authoritative, one-shot judgment. `--network none` also makes
-grading deterministic and matches offline production grading; only tasks that
-grade gold->1.0 offline belong in a panel (the gold pre-screen is the filter).
-"""
+"""SWE-bench-Verified Docker-shell env."""
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import json
-import logging
-import os
-import tempfile
-import uuid
+import hashlib
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from swebench.harness.constants import FAIL_TO_PASS, PASS_TO_PASS
-from swebench.harness.grading import get_eval_tests_report, get_logs_eval
-from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
+from src import determinism
+from src.config import EnvironmentConfig
+from src.env.docker_shell import DockerShellSession
+from src.env.base import (
+    DockerTaskEnv,
+    MODEL_PATCH_INFO_KEY,
+    RawEnvOutput,
+    TaskSet,
+    VerifyOutcome,
+    VerifyVerdict,
+    VerifyWrapper,
+)
+from src.rollout.metrics import GENERIC_SECONDARY_METRICS, SecondaryRewardMetric
+from src.rollout.records import ExperimentResult, solved_task_ids
+from src.env import swebench_verify
 
-from src.contracts import EnvExecWorkload, RawState
-from src.env import docker as docker_utils
-
-logger = logging.getLogger(__name__)
-
-
-class VerifierCorruptError(RuntimeError):
-    """A verify() run swebench could not grade -- a failed held-out test-patch
-    apply, repo reset failure, test-runner error/timeout, or missing output
-    markers.
-
-    Raised (rather than scored 0.0) so `run_trial` records the trial as infra
-    with `error` set and EXCLUDES it from the graded gate, instead of charging
-    verifier corruption to the agent as a `verified_rejected` failure.
-    """
-
-
-def _as_list(v) -> list[str]:
-    return v if isinstance(v, list) else json.loads(v)
-
-
-def _score_report(report: dict) -> tuple[float, bool]:
-    """Reward + resolution from a swebench eval report (pure, unit-tested).
-
-    reward = fraction of (F2P + P2P) tests passing; resolution = every F2P now
-    passes AND every P2P still passes (computed directly, not via the enum
-    string). P2P is a high floor that cancels in a per-task differential.
-    """
-    passed = sum(len(report[k]["success"]) for k in (FAIL_TO_PASS, PASS_TO_PASS))
-    total = sum(
-        len(report[k]["success"]) + len(report[k]["failure"])
-        for k in (FAIL_TO_PASS, PASS_TO_PASS)
-    )
-    reward = passed / total if total else 0.0
-    resolved = (
-        len(report[FAIL_TO_PASS]["failure"]) == 0
-        and len(report[FAIL_TO_PASS]["success"]) > 0
-        and len(report[PASS_TO_PASS]["failure"]) == 0
-    )
-    return reward, resolved
+_TASK_WORKDIR = "/testbed"
+_F2P_PASSED_KEY = "fail_to_pass_passed"
+_P2P_FAILED_KEY = "pass_to_pass_failed"
+# Binary artifacts make the whole SWE-bench patch unappliable; include tracked and
+# intent-to-add text diffs and exclude numstat binary paths.
+_MODEL_PATCH_COMMAND = (
+    "set -e; git add -N .; binary_paths=(); "
+    "while IFS=$'\\t' read -r -d '' added deleted path; do "
+    "old_path=; "
+    "if [[ -z $path ]]; then "
+    "IFS= read -r -d '' old_path; IFS= read -r -d '' path; "
+    "fi; "
+    "if [[ $added == - && $deleted == - ]]; then "
+    '[[ -z $old_path ]] || binary_paths+=(":(top,exclude,literal)$old_path"); '
+    'binary_paths+=(":(top,exclude,literal)$path"); '
+    "fi; "
+    "done < <(git -c core.fileMode=false diff --numstat -z HEAD --); "
+    'git -c core.fileMode=false diff HEAD -- . "${binary_paths[@]}"'
+)
+_SWE_ENV_FINGERPRINT = hashlib.sha256(
+    f"{determinism.PINS_FINGERPRINT}\0{_MODEL_PATCH_COMMAND}".encode()
+).hexdigest()[:12]
 
 
-def _grade_log(
+@dataclass(frozen=True, slots=True)
+class SweBenchTask:
+    instruction: str
+    spec: Any
+    # SWE-bench defines no agent budget.
+    agent_timeout_sec: float | None = None
+    replay_id: str = _SWE_ENV_FINGERPRINT
+
+
+async def load_tasks(
     *,
-    spec: TestSpec,
-    output: str,
-    f2p: list[str],
-    p2p: list[str],
-    artifacts_dir: str,
-) -> tuple[float, bool]:
-    """Grade a raw verifier log, failing fast on a corrupt run.
-
-    `output` is swebench's `eval_script` output, with the Start/End test-output
-    markers already emitted in order (the script runs under `set -x` and we merge
-    its streams). We persist it AS-IS and let `get_logs_eval` parse it -- we do
-    NOT re-wrap it in fresh markers. Fabricating those markers is exactly what
-    hides a corrupt run: `get_logs_eval` returns `ok=False` when the held-out
-    test patch failed to apply, the repo reset failed, the test runner
-    errored/timed out, or the markers are absent -- and injecting markers would
-    mask all of those as a clean, all-failing zero. Corruption is infra, not an
-    agent rejection, so we raise instead of scoring it (see `VerifierCorruptError`).
-    """
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".txt", dir=artifacts_dir, delete=False
-    ) as fh:
-        fh.write(output)
-        log_fp = fh.name
-    try:
-        status_map, ok = get_logs_eval(spec, log_fp)
-    finally:
-        os.unlink(log_fp)
-    if not ok:
-        raise VerifierCorruptError(
-            f"verifier log not gradable (swebench ok=False) for {spec.instance_id}"
-        )
-    report = get_eval_tests_report(status_map, {FAIL_TO_PASS: f2p, PASS_TO_PASS: p2p})
-    return _score_report(report)
-
-
-def load_rows(instance_ids: list[str]) -> dict[str, dict]:
-    """Map SWE-bench-Verified instance ids -> dataset rows (the task source for a
-    SWE-backed panel).
-
-    Loaded once per experiment and indexed by id. Raises on any unknown id so a
-    mistyped panel fails fast rather than silently dropping a task. The dataset
-    is fetched on the host (cached by `datasets`); the firewall is the container,
-    not this lookup.
-    """
+    task_ids: Sequence[str],
+    environment: EnvironmentConfig,
+    verify_wrapper: VerifyWrapper | None = None,
+) -> TaskSet[SweBenchTask]:
+    # Defer heavy datasets/swebench imports until task loading.
     from datasets import load_dataset
+    from swebench.harness.test_spec.test_spec import make_test_spec
 
-    ds = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
-    by_id = {r["instance_id"]: r for r in ds}
-    missing = [i for i in instance_ids if i not in by_id]
+    # SWE-bench Verified publishes a single "test" split.
+    dataset = load_dataset(
+        "princeton-nlp/SWE-bench_Verified",
+        revision="c104f840cc67f8b6eec6f759ebc8b2693d585d4a",
+        split="test",
+    )
+    rows_by_id = {row["instance_id"]: row for row in dataset}
+    missing = [task_id for task_id in task_ids if task_id not in rows_by_id]
     if missing:
         raise KeyError(f"unknown SWE-bench-Verified instance ids: {missing}")
-    return {i: by_id[i] for i in instance_ids}
+    tasks = {
+        task_id: SweBenchTask(
+            instruction=rows_by_id[task_id]["problem_statement"],
+            spec=make_test_spec(rows_by_id[task_id], namespace="swebench"),
+        )
+        for task_id in task_ids
+    }
+
+    return TaskSet(
+        kind=environment.kind,
+        tasks=tasks,
+        env_factory=lambda task, rollout_dir: SweEnv(
+            task=task,
+            artifacts_dir=rollout_dir,
+            verify_wrapper=verify_wrapper,
+        ),
+    )
 
 
-class SweEnv:
-    """One SWE-bench-Verified task behind the `HarnessEnv` protocol.
+class SweEnv(DockerTaskEnv[SweBenchTask]):
+    """One SWE-bench-Verified task behind the `TaskEnv` protocol.
 
-    `row` is a dataset row (from `princeton-nlp/SWE-bench_Verified`);
-    `artifacts_dir` is the host directory the trial writes its trace/metrics/
-    verifier artifacts into (exposed as `trial_dir`). `heavy_semaphore`, when
-    provided, is shared across trials to bound concurrent heavyweight container
-    CPU work (reset/startup, the agent's `run`, verify) -- the runner's
-    `max_heavy_action_concurrency` tier -- independently of how many trials are
-    in flight.
+    `task` is a SWE-bench-Verified instruction plus official test spec. The env
+    manages the solve container and calls the official SWE-bench grader on submit.
     """
+
+    _task_workdir = _TASK_WORKDIR
 
     def __init__(
         self,
         *,
-        row: dict,
-        artifacts_dir: str,
-        heavy_semaphore: asyncio.Semaphore | None = None,
+        task: SweBenchTask,
+        artifacts_dir: Path,
+        verify_wrapper: VerifyWrapper | None = None,
     ) -> None:
-        self._row = row
-        self._spec = make_test_spec(row, namespace="swebench")
-        self._image = self._spec.instance_image_key
-        self._f2p = _as_list(row[FAIL_TO_PASS])
-        self._p2p = _as_list(row[PASS_TO_PASS])
-        # Unique container name -> no cross-trial collisions, easy bulk cleanup.
-        self._container = f"swe_env_{uuid.uuid4().hex[:12]}"
-        self._artifacts_dir = artifacts_dir
-        os.makedirs(self._artifacts_dir, exist_ok=True)
-        self._verifier_stdout_path: str | None = None
-        self._started = False
-        self._heavy_semaphore = heavy_semaphore
+        # None grades live; replay injects a caching wrapper around the grader.
+        self._verify_wrapper = verify_wrapper
+        super().__init__(
+            task=task,
+            artifacts_dir=artifacts_dir,
+            verify_timeout_sec=float(swebench_verify.OFFICIAL_EVAL_TIMEOUT_SEC),
+        )
 
-    def _gate(self, workload: EnvExecWorkload):
-        """Acquire the heavy-action gate for heavy work; no-op for light."""
-        if workload == "light" or self._heavy_semaphore is None:
-            return contextlib.nullcontext()
-        return self._heavy_semaphore
+    def _build_solve_env(self, task: SweBenchTask) -> DockerShellSession:
+        # Omitted network mode keeps solving offline and deterministic.
+        return DockerShellSession(
+            image=task.spec.instance_image_key,
+        )
 
-    # --- HarnessEnv protocol -------------------------------------------------
+    async def verify(self) -> VerifyOutcome:
+        """Terminal submit: capture the patch, run official SWE-bench, and end."""
+        await self.provision()
+        # Official grader takes a patch string, not the live container.
+        patch_result = await self._solve_env.run(
+            command=_MODEL_PATCH_COMMAND,
+            cwd=_TASK_WORKDIR,
+            timeout=120,
+            lossless=True,
+        )
+        patch = "" if patch_result.exit_code != 0 else patch_result.stdout
+        await self._solve_env.close()
 
-    @property
-    def trial_dir(self) -> str | None:
-        return self._artifacts_dir
+        spec = self._task.spec
+        grader = swebench_verify.verify
+        if self._verify_wrapper is not None:
+            grader = self._verify_wrapper(grader)
+        verify_result = await grader(
+            spec=spec,
+            patch=patch,
+            rollout_artifact_dir=self._artifacts_dir,
+        )
+        metrics: dict[str, int | float] = {}
+        if verify_result.fail_to_pass_passed is not None:
+            metrics[_F2P_PASSED_KEY] = verify_result.fail_to_pass_passed
+        if verify_result.pass_to_pass_failed is not None:
+            metrics[_P2P_FAILED_KEY] = verify_result.pass_to_pass_failed
+        return VerifyOutcome(
+            reward=verify_result.reward,
+            output=RawEnvOutput(stdout=verify_result.stdout),
+            info={MODEL_PATCH_INFO_KEY: patch, "instance_id": spec.instance_id},
+            metrics=metrics,
+            verdict=VerifyVerdict(
+                completed=verify_result.completed,
+                passed=verify_result.passed,
+                error=verify_result.error,
+            ),
+        )
 
-    @property
-    def verifier_stdout_path(self) -> str | None:
-        return self._verifier_stdout_path
 
-    async def reset(self) -> RawState:
-        # `--network none`: airtight firewall + deterministic offline grading.
-        # A daemon blip fails the ping before the container exists, so a retried
-        # `docker run` safely re-uses the same --name.
-        async with self._gate("heavy"):
-            rc, _out, err = await docker_utils.run_docker_cli(
-                "docker",
-                "run",
-                "-d",
-                "--platform",
-                "linux/amd64",
-                "--network",
-                "none",
-                "--name",
-                self._container,
-                self._image,
-                "sleep",
-                "infinity",
-                timeout=600,
-                retry=True,
-                logger=logger,
+class F2pProgressMetric(SecondaryRewardMetric):
+    # First unsolved-run tiebreaker: F2P fixed minus P2P broken.
+    name = "f2p_progress"
+    higher_is_better = True
+
+    def values(
+        self, *, baseline: ExperimentResult, candidate: ExperimentResult
+    ) -> tuple[int, int]:
+        # Non-scorable outcomes drop out symmetrically instead of losing progress.
+        scope = self._contested(baseline) & self._contested(candidate)
+        return self._progress(baseline, scope), self._progress(candidate, scope)
+
+    def _contested(self, experiment: ExperimentResult) -> set[str]:
+        solved = solved_task_ids(experiment)
+        return {
+            task_id
+            for task_id, rollout in experiment.tasks.items()
+            if task_id not in solved and self._scorable(rollout)
+        }
+
+    def _progress(self, experiment: ExperimentResult, task_ids: set[str]) -> int:
+        total = 0
+        for task_id in task_ids:
+            rollout = experiment.tasks[task_id]
+            assert rollout is not None
+            total += rollout.metrics.get(_F2P_PASSED_KEY, 0) - rollout.metrics.get(
+                _P2P_FAILED_KEY, 0
             )
-        if rc != 0:
-            raise RuntimeError(f"container start failed ({rc}): {err[:500]}")
-        self._started = True
-        return RawState(
-            instruction=self._row["problem_statement"],
-            working_dir="/testbed",
-        )
+        return total
 
-    async def exec(
-        self,
-        *,
-        command: str,
-        cwd: str | None = None,
-        timeout_sec: int | None = None,
-        workload: EnvExecWorkload = "heavy",
-    ) -> RawState:
-        workdir = cwd or "/testbed"
-        # Light actions (ls/find/read/search/edit) bypass the gate; only the
-        # agent's `run` (emulated pytest/python) counts against heavy CPU work.
-        async with self._gate(workload):
-            rc, out, err = await docker_utils.run_docker_cli(
-                "docker",
-                "exec",
-                "-w",
-                workdir,
-                self._container,
-                "bash",
-                "-lc",
-                command,
-                timeout=timeout_sec,
-            )
-        return RawState(return_code=rc, stdout=out, stderr=err)
 
-    async def verify(self) -> RawState:
-        """Terminal, one-shot judgment: inject held-out tests, grade, score."""
-        async with self._gate("heavy"):
-            output = await self._run_eval_script()
-        # Persist what the verifier saw (parity with the Harbor env's artifact).
-        self._verifier_stdout_path = os.path.join(
-            self._artifacts_dir, "verifier_stdout.txt"
-        )
-        with open(self._verifier_stdout_path, "w") as fh:
-            fh.write(output)
-        reward, resolved = _grade_log(
-            spec=self._spec,
-            output=output,
-            f2p=self._f2p,
-            p2p=self._p2p,
-            artifacts_dir=self._artifacts_dir,
-        )
-        return RawState(reward=reward, passed=resolved, stdout=output)
-
-    async def close(self) -> None:
-        if self._started:
-            await docker_utils.run_docker_cli(
-                "docker", "rm", "-f", self._container, timeout=120
-            )
-            self._started = False
-
-    # --- internals -----------------------------------------------------------
-
-    async def _run_eval_script(self) -> str:
-        # docker cp is robust against the slim image's missing shell tools.
-        fd, host = tempfile.mkstemp(dir=self._artifacts_dir)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(self._spec.eval_script)
-        await docker_utils.run_docker_cli(
-            "docker", "cp", host, f"{self._container}:/eval.sh"
-        )
-        os.unlink(host)
-        # Merge streams IN ORDER inside the container: `set -x` echoes the
-        # Start/End markers to stderr; separate capture reorders them and breaks
-        # marker extraction. Retried so a daemon blip here is not misread as a
-        # corrupt log -- its signature is on docker's own stderr channel, which a
-        # real non-zero test run leaves clean, so retry never masks a failure.
-        _rc, out, _err = await docker_utils.run_docker_cli(
-            "docker",
-            "exec",
-            self._container,
-            "bash",
-            "-lc",
-            "bash /eval.sh 2>&1",
-            timeout=1800,
-            retry=True,
-            logger=logger,
-        )
-        return out
+SECONDARY_METRICS = (F2pProgressMetric(), *GENERIC_SECONDARY_METRICS)

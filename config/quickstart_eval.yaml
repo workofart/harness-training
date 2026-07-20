@@ -1,0 +1,16 @@
+schema_version: 13
+$extends:
+- llm/local.yaml
+training_target:
+  module: src.policy.core
+environment:
+  kind: terminal_bench
+  task_names:
+  - openssl-selfsigned-cert
+  - gcode-to-text
+  host_netcache: true
+max_steps: 50
+max_rollout_concurrency: 2
+agent_timeout_multiplier: 1.5
+plugins:
+  execution: replay # this means to use cache for LLM and Env step execution. See src/plugins/README.md for details

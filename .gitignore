@@ -2,8 +2,12 @@
 tmp/
 **/.DS_Store
 experiments/
+evals/
 archived_experiments/
+.worktrees/
 AGENTS.md
+CLAUDE.md
+cache
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -50,6 +54,8 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+# Cross-run LLM completion cache (src/plugins/caching/); local, never committed.
+/cache/
 nosetests.xml
 coverage.xml
 *.cover

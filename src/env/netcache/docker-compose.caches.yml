@@ -1,0 +1,147 @@
+# Setup probes each service and falls back upstream when absent; ports remain
+# loopback-only because these caches are unauthenticated. Once probed, uv treats
+# the mirror as authoritative and fails rather than falling back upstream.
+# What this stack is for, and how to stop it: src/env/netcache/README.md.
+
+name: framework-caches
+
+services:
+  pypi-cache:
+    image: epicwink/proxpi@sha256:7f8dce8778b7d4634c1e35d6f8d99f366e83dc60721ffc8f45893d19afcc5a90
+    container_name: framework-pypi-cache
+    restart: always
+    labels:
+      org.harness-experiment.cache: pypi
+    ports:
+      # Avoid macOS AirPlay on host :5000; bind PyPI cache to :3141.
+      - "127.0.0.1:3141:5000"
+    # One worker avoids cache-dir races; extra threads prevent large wheel
+    # misses from stalling trials and leaking pip retry WARNINGs.
+    command:
+      ["--bind", "0.0.0.0:5000", "--threads", "16", "--no-control-socket"]
+    environment:
+      PROXPI_CACHE_DIR: /var/cache/proxpi
+      # Hold a full ML dependency set (torch + CUDA across versions) without
+      # evicting; proxpi defaults to 5GB, which the CUDA wheels alone exceed.
+      PROXPI_CACHE_SIZE: "21474836480"
+      # Freeze package indexes for the container lifetime; restart re-snapshots
+      # on first fetch, but catch-up installs avoid mid-run upstream drift.
+      PROXPI_INDEX_TTL: "31536000"
+    volumes:
+      - pypi-cache:/var/cache/proxpi
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  uv-python-mirror:
+    image: python@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+    container_name: framework-uv-python-mirror
+    restart: always
+    labels:
+      org.harness-experiment.cache: uv-python
+    ports:
+      - "127.0.0.1:3143:8000"
+    volumes:
+      - ./uv_python_mirror.py:/opt/uv_python_mirror.py:ro
+      - uv-python-mirror:/var/cache/uv-python-mirror
+    command: ["python", "/opt/uv_python_mirror.py"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  https-cache:
+    # Pin mitmproxy because addon APIs change across majors.
+    image: mitmproxy/mitmproxy@sha256:00b77b5d8804c8ad18cb6caefbf9d5849e895e8986c5ce011f4ae30f4385962f
+    container_name: framework-https-cache
+    restart: always
+    labels:
+      org.harness-experiment.cache: https
+    ports:
+      - "127.0.0.1:3144:8080"
+    environment:
+      FRAMEWORK_DEBIAN_MIRROR_HOST: debian.osuosl.org
+    volumes:
+      # Directory mount preserves reloads across atomic file replacement; a file
+      # bind pins the old inode.
+      - .:/opt/framework-scripts:ro
+      - https-cache:/var/cache/framework-https-cache
+      - https-cache-certs:/home/mitmproxy/.mitmproxy
+    # Prevent cache hits from dialing origins for certificate discovery.
+    command:
+      [
+        "sh",
+        "-c",
+        "chmod 0777 /var/cache/framework-https-cache /home/mitmproxy/.mitmproxy && exec mitmdump --listen-host 0.0.0.0 --listen-port 8080 --set confdir=/home/mitmproxy/.mitmproxy --set upstream_cert=false --set connection_strategy=lazy --set proxyauth=any -s /opt/framework-scripts/mitm_https_cache.py",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1', 8080), 2); s.close()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  https-cache-ca:
+    image: python@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+    container_name: framework-https-cache-ca
+    restart: always
+    labels:
+      org.harness-experiment.cache: https-ca
+    ports:
+      - "127.0.0.1:3145:8000"
+    volumes:
+      - https-cache-certs:/var/lib/mitmproxy:ro
+    # Serve the certificate from a copy in an otherwise-empty dir: the
+    # mitmproxy confdir also holds the CA *private key*, which must never be
+    # fetchable by task containers.
+    command:
+      [
+        "sh",
+        "-c",
+        "while [ ! -f /var/lib/mitmproxy/mitmproxy-ca-cert.pem ]; do sleep 1; done; mkdir -p /var/run/framework-ca; cp /var/lib/mitmproxy/mitmproxy-ca-cert.pem /var/run/framework-ca/mitmproxy-ca-cert.pem; python -m http.server 8000 -d /var/run/framework-ca",
+      ]
+    depends_on:
+      - https-cache
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/mitmproxy-ca-cert.pem', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  # Explicit names match the volumes the retired setup-*.sh scripts created,
+  # so existing cache contents carry over.
+  pypi-cache:
+    name: framework-pypi-cache
+  uv-python-mirror:
+    name: framework-uv-python-mirror
+  https-cache:
+    name: framework-https-cache
+  https-cache-certs:
+    name: framework-https-cache-certs
